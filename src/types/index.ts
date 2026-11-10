@@ -1,8 +1,11 @@
 export type PropertyCategory =
   | 'appartement'
+  | 'studio'
+  | 'maison'
   | 'villa'
   | 'chambre'
   | 'garage'
+  | 'parking'
   | 'commerce'
   | 'bureau'
   | 'terrain'
@@ -24,6 +27,8 @@ export type UserRole = 'visiteur' | 'particulier' | 'professionnel' | 'admin';
 
 export interface User {
   id: string;
+  firstName?: string;
+  lastName?: string;
   name: string;
   email: string;
   phone: string;
@@ -33,6 +38,8 @@ export interface User {
   city?: string;
   avatar?: string;
   verified?: boolean;
+  emailVerified?: boolean;
+  favorites?: string[];
   createdAt: string;
 }
 
@@ -46,6 +53,8 @@ export interface ListingContact {
   showEmail: boolean;
   showWhatsApp: boolean;
   showExactAddress: boolean;
+  showMapLocation?: boolean;
+  phoneConsentAccepted?: boolean;
 }
 
 export interface Listing {
@@ -81,6 +90,8 @@ export interface Listing {
   updatedAt: string;
   availableFrom: string;
   legalConsentAccepted: boolean;
+  isDemo?: boolean;
+  flaggedForContactInText?: boolean;
 }
 
 export interface ListingFilter {
@@ -130,3 +141,9 @@ export interface ChatMessage {
 export type ChatRoleType = 'legal' | 'advisor' | 'estimate';
 
 export type Language = 'fr' | 'ar' | 'en';
+
+export type PendingAction =
+  | { type: 'contact'; listingId: string }
+  | { type: 'favorite'; listingId: string }
+  | { type: 'post_ad' }
+  | null;

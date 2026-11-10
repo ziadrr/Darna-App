@@ -2,5 +2,7 @@
   "name": "Darna - Location Immobilière Maroc",
   "description": "Plateforme moderne de location immobilière au Maroc : annonces d'appartements, villas, bureaux et commerces avec recherche géolocalisée, contact direct et IA d'assistance.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

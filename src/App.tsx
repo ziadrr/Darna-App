@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   Home,
   Heart,
@@ -6,24 +6,29 @@ import {
   User as UserIcon,
   Plus,
   Bell,
-  SlidersHorizontal,
   MapPin,
   Building,
-  Sparkles,
   Bot,
   Shield,
-  Scale,
   Search,
-  Globe,
   CheckCircle,
-  HelpCircle,
-  ChevronRight,
-  Filter
+  LogIn
 } from 'lucide-react';
-import { Listing, ListingFilter, User, UserRole, Language, ListingReport } from './types';
+import {
+  Listing,
+  ListingFilter,
+  User,
+  UserRole,
+  Language,
+  ListingReport,
+  PendingAction
+} from './types';
 import { INITIAL_LISTINGS, INITIAL_USERS, INITIAL_REPORTS } from './data/mockListings';
-import { MOROCCAN_CITIES, CATEGORIES_CONFIG } from './data/moroccoLocations';
-import { filterAndSortListings, formatMAD } from './utils/rentalLogic';
+import { MOROCCAN_CITIES } from './data/moroccoLocations';
+import {
+  filterAndSortListings,
+  sanitizeListingForVisitor
+} from './utils/rentalLogic';
 import { TRANSLATIONS } from './data/translations';
 import { ListingCard } from './components/ListingCard';
 import { ListingDetailModal } from './components/ListingDetailModal';
@@ -35,16 +40,26 @@ import { LegalAndCndpModal } from './components/LegalAndCndpModal';
 import { ReportListingModal } from './components/ReportListingModal';
 import { FilterBar } from './components/FilterBar';
 import { MoroccoMap } from './components/MoroccoMap';
+import { AuthModal } from './components/AuthModal';
 
 export default function App() {
-  // Global Data State
-  const [listings, setListings] = useState<Listing[]>(INITIAL_LISTINGS);
-  const [users, setUsers] = useState<User[]>(INITIAL_USERS);
+  // Global Data State: Visitor default listings have all phone numbers/WhatsApp/emails stripped
+  const [listings, setListings] = useState<Listing[]>(() =>
+    INITIAL_LISTINGS.map(sanitizeListingForVisitor)
+  );
+  const [users] = useState<User[]>(INITIAL_USERS);
   const [reports, setReports] = useState<ListingReport[]>(INITIAL_REPORTS);
-  const [favorites, setFavorites] = useState<string[]>(['darna-casa-01']);
+  const [favorites, setFavorites] = useState<string[]>([]);
 
-  // Current User Session (Mock Auth with instant role switcher)
-  const [currentUser, setCurrentUser] = useState<User>(INITIAL_USERS[0]);
+  // Auth Session State: Visitor (null) by default
+  const [authToken, setAuthToken] = useState<string | null>(() =>
+    localStorage.getItem('darna_token')
+  );
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
+  const [authReasonMessage, setAuthReasonMessage] = useState<string | undefined>(undefined);
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
 
   // Language & RTL State
   const [lang, setLang] = useState<Language>('fr');
@@ -66,12 +81,18 @@ export default function App() {
 
   // Modal Dialogs State
   const [selectedListing, setSelectedListing] = useState<Listing | null>(null);
+  const [editingListing, setEditingListing] = useState<Listing | null>(null);
   const [isPostWizardOpen, setIsPostWizardOpen] = useState(false);
   const [isChatbotOpen, setIsChatbotOpen] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
   const [isLegalModalOpen, setIsLegalModalOpen] = useState(false);
   const [reportingListing, setReportingListing] = useState<Listing | null>(null);
-  const [showNotificationToast, setShowNotificationToast] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, []);
 
   // Sync RTL with document body
   useEffect(() => {
@@ -79,17 +100,135 @@ export default function App() {
     document.documentElement.lang = lang;
   }, [lang]);
 
-  // Fetch listings from server on load
-  useEffect(() => {
-    fetch('/api/listings')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success && data.listings) {
-          setListings(data.listings);
-        }
-      })
-      .catch((err) => console.log('Using local seed listings:', err));
+  // Fetch listings (sanitized by server based on authToken)
+  const fetchListings = useCallback(async (token?: string | null) => {
+    try {
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      const res = await fetch('/api/listings', { headers });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.listings)) {
+        setListings(data.listings);
+        return data.listings as Listing[];
+      }
+    } catch (err) {
+      console.warn('Fallback to sanitized local listings:', err);
+    }
+    return null;
   }, []);
+
+  // Restore session on mount if token exists
+  useEffect(() => {
+    if (authToken) {
+      fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.success && data.user) {
+            setCurrentUser(data.user);
+            setFavorites(data.user.favorites || []);
+            fetchListings(authToken);
+          } else {
+            localStorage.removeItem('darna_token');
+            setAuthToken(null);
+            setCurrentUser(null);
+            fetchListings(null);
+          }
+        })
+        .catch(() => {
+          fetchListings(null);
+        });
+    } else {
+      fetchListings(null);
+    }
+  }, [authToken, fetchListings]);
+
+  // Open listing from URL query parameter ?annonce=id if present
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const annonceId = params.get('annonce');
+    if (annonceId && listings.length > 0 && !selectedListing) {
+      const found = listings.find((l) => l.id === annonceId);
+      if (found) setSelectedListing(found);
+    }
+  }, [listings, selectedListing]);
+
+  // Keep selectedListing synchronized when listings update (e.g. after login reveals contact info)
+  useEffect(() => {
+    if (selectedListing) {
+      const updated = listings.find((l) => l.id === selectedListing.id);
+      if (updated) {
+        setSelectedListing(updated);
+      }
+    }
+  }, [listings, selectedListing]);
+
+  // Require authentication helper
+  const requireAuth = (action: PendingAction, customReason?: string) => {
+    setPendingAction(action);
+    setAuthInitialMode('login');
+    setAuthReasonMessage(customReason);
+    setIsAuthModalOpen(true);
+  };
+
+  // Handle successful login or registration and return user to pendingAction
+  const handleAuthSuccess = async (user: User, token: string) => {
+    localStorage.setItem('darna_token', token);
+    setAuthToken(token);
+    setCurrentUser(user);
+    setFavorites(user.favorites || []);
+    setIsAuthModalOpen(false);
+
+    const updatedListings = await fetchListings(token);
+
+    if (pendingAction) {
+      if (pendingAction.type === 'post_ad') {
+        setEditingListing(null);
+        setIsPostWizardOpen(true);
+      } else if (pendingAction.type === 'contact') {
+        const target =
+          (updatedListings || listings).find((l) => l.id === pendingAction.listingId) || null;
+        if (target) {
+          setSelectedListing(target);
+        }
+      } else if (pendingAction.type === 'favorite') {
+        const id = pendingAction.listingId;
+        setFavorites((prev) => (prev.includes(id) ? prev : [...prev, id]));
+        fetch('/api/auth/favorites', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ listingId: id }),
+        }).catch(() => {});
+        showToast('Annonce enregistrée dans vos favoris !');
+      }
+      setPendingAction(null);
+    } else {
+      showToast(`Bienvenue sur Darna, ${user.firstName || user.name} !`);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (authToken) {
+      fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      }).catch(() => {});
+    }
+    localStorage.removeItem('darna_token');
+    setAuthToken(null);
+    setCurrentUser(null);
+    setFavorites([]);
+    setIsProfileModalOpen(false);
+    if (currentView === 'admin') setCurrentView('home');
+    await fetchListings(null);
+    showToast('Vous êtes déconnecté.');
+  };
 
   // Filtered Listings
   const filteredListings = useMemo(() => {
@@ -109,42 +248,142 @@ export default function App() {
   // Handlers
   const handleToggleFavorite = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
+    if (!currentUser) {
+      requireAuth(
+        { type: 'favorite', listingId: id },
+        'Connectez-vous pour sauvegarder vos annonces favorites dans votre espace personnel.'
+      );
+      return;
+    }
     setFavorites((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
+    if (authToken) {
+      fetch('/api/auth/favorites', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ listingId: id }),
+      }).catch(() => {});
+    }
   };
 
-  const handleCreateListing = async (newListingData: Partial<Listing>) => {
+  const handleOpenPostAd = () => {
+    if (!currentUser) {
+      requireAuth(
+        { type: 'post_ad' },
+        'Un compte vérifié est requis pour publier et gérer vos annonces immobilières.'
+      );
+      return;
+    }
+    setEditingListing(null);
+    setIsPostWizardOpen(true);
+  };
+
+  const handleSaveListing = async (listingData: Partial<Listing>, editingId?: string) => {
+    if (!currentUser || !authToken) {
+      requireAuth({ type: 'post_ad' });
+      return;
+    }
+
     try {
-      const res = await fetch('/api/listings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...newListingData,
-          userId: currentUser.id,
-        }),
+      if (editingId) {
+        const res = await fetch(`/api/listings/${editingId}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify(listingData),
+        });
+        const data = await res.json();
+        if (data.success && data.listing) {
+          setListings((prev) =>
+            prev.map((l) => (l.id === editingId ? data.listing : l))
+          );
+          showToast('Votre annonce a été mise à jour avec succès !');
+        }
+      } else {
+        const res = await fetch('/api/listings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify(listingData),
+        });
+        const data = await res.json();
+        if (data.success && data.listing) {
+          setListings((prev) => [data.listing, ...prev]);
+          showToast('Votre annonce a été publiée avec succès !');
+        }
+      }
+      setEditingListing(null);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleToggleListingStatus = async (listing: Listing) => {
+    if (!currentUser || !authToken) return;
+    const nextStatus = listing.status === 'publiee' ? 'masquee' : 'publiee';
+    try {
+      const res = await fetch(`/api/listings/${listing.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ status: nextStatus }),
       });
       const data = await res.json();
       if (data.success && data.listing) {
-        setListings((prev) => [data.listing, ...prev]);
-      } else {
-        // Fallback local
-        const localListing: Listing = {
-          ...(newListingData as Listing),
-          id: `darna-${Date.now()}`,
-          slug: (newListingData.title || 'annonce').toLowerCase().replace(/\s+/g, '-'),
-          viewsCount: 0,
-          favoritesCount: 0,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          status: 'en_attente',
-        };
-        setListings((prev) => [localListing, ...prev]);
+        setListings((prev) =>
+          prev.map((l) => (l.id === listing.id ? data.listing : l))
+        );
+        showToast(
+          nextStatus === 'publiee'
+            ? 'Annonce réactivée et visible par le public.'
+            : 'Annonce désactivée temporairement.'
+        );
       }
-      setShowNotificationToast(true);
-      setTimeout(() => setShowNotificationToast(false), 4000);
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleDeleteListing = async (id: string) => {
+    if (!currentUser || !authToken) return;
+    try {
+      const res = await fetch(`/api/listings/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        setListings((prev) => prev.filter((l) => l.id !== id));
+        showToast('Annonce supprimée définitivement.');
+      }
+    } catch (err) {
+      console.warn(err);
+    }
+  };
+
+  const handleVerifyEmail = async () => {
+    if (!authToken) return;
+    try {
+      const res = await fetch('/api/auth/verify-email', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json();
+      if (data.success && data.user) {
+        setCurrentUser(data.user);
+        showToast('Votre adresse e-mail est désormais vérifiée !');
+      }
+    } catch (err) {
+      console.warn(err);
     }
   };
 
@@ -218,46 +457,40 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newReport),
       });
+      showToast('Merci. Votre signalement a été transmis à notre équipe.');
     } catch (err) {
       console.warn('API report error:', err);
     }
   };
 
-  const handleDeleteListing = async (id: string) => {
-    setListings((prev) => prev.filter((l) => l.id !== id));
-    try {
-      await fetch(`/api/listings/${id}`, { method: 'DELETE' });
-    } catch (err) {
-      console.warn(err);
-    }
-  };
-
   const handleSwitchUserRole = (newRole: UserRole) => {
-    const updated = {
+    if (!currentUser) return;
+    const updated: User = {
       ...currentUser,
       role: newRole,
       advertiserType: newRole === 'professionnel' ? 'professionnel' : 'particulier',
     };
-    setCurrentUser(updated as User);
+    setCurrentUser(updated);
     if (newRole === 'admin') {
       setCurrentView('admin');
+      setIsProfileModalOpen(false);
     }
   };
 
   return (
     <div className="min-h-screen flex flex-col bg-[#FAF7F2] text-stone-800 pb-20 sm:pb-8 selection:bg-[#C15C3D]/20 selection:text-[#C15C3D]">
       {/* Toast Notification Banner */}
-      {showNotificationToast && (
+      {toastMessage && (
         <div className="fixed top-4 right-4 z-50 bg-[#1E3D34] text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3 border border-emerald-500/30 animate-fade-in text-xs sm:text-sm font-semibold">
           <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
-          <span>Votre annonce a été soumise avec succès ! Elle est transmise à l'équipe de modération.</span>
+          <span>{toastMessage}</span>
         </div>
       )}
 
       {/* TOP NAVBAR */}
       <header className="sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-stone-200/80 px-4 sm:px-8 py-3.5 transition-all">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          {/* Logo matching the phone mockup: terracotta house icon + "Darna" in Playfair serif */}
+          {/* Logo */}
           <div
             onClick={() => setCurrentView('home')}
             className="flex items-center gap-2 cursor-pointer select-none group"
@@ -297,7 +530,9 @@ export default function App() {
               <button
                 onClick={() => setLang('fr')}
                 className={`px-2 py-1 rounded-lg transition-colors ${
-                  lang === 'fr' ? 'bg-white text-stone-900 shadow-2xs font-bold' : 'text-stone-500 hover:text-stone-800'
+                  lang === 'fr'
+                    ? 'bg-white text-stone-900 shadow-2xs font-bold'
+                    : 'text-stone-500 hover:text-stone-800'
                 }`}
               >
                 FR
@@ -305,7 +540,9 @@ export default function App() {
               <button
                 onClick={() => setLang('ar')}
                 className={`px-2 py-1 rounded-lg transition-colors ${
-                  lang === 'ar' ? 'bg-white text-[#C15C3D] shadow-2xs font-bold' : 'text-stone-500 hover:text-stone-800'
+                  lang === 'ar'
+                    ? 'bg-white text-[#C15C3D] shadow-2xs font-bold'
+                    : 'text-stone-500 hover:text-stone-800'
                 }`}
               >
                 عر
@@ -313,50 +550,52 @@ export default function App() {
               <button
                 onClick={() => setLang('en')}
                 className={`px-2 py-1 rounded-lg transition-colors ${
-                  lang === 'en' ? 'bg-white text-stone-900 shadow-2xs font-bold' : 'text-stone-500 hover:text-stone-800'
+                  lang === 'en'
+                    ? 'bg-white text-stone-900 shadow-2xs font-bold'
+                    : 'text-stone-500 hover:text-stone-800'
                 }`}
               >
                 EN
               </button>
             </div>
 
-            {/* Role Demo Pill */}
+            {/* CTA "+ Déposer une annonce" */}
             <button
-              onClick={() => setIsProfileModalOpen(true)}
-              className="hidden lg:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-900 border border-amber-200 hover:bg-amber-100 transition-colors"
-              title="Changer de rôle pour tester (Visiteur, Particulier, Agence, Admin)"
-            >
-              <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-              <span>Rôle : <strong>{currentUser.role}</strong></span>
-            </button>
-
-            {/* Notification bell matching mockup */}
-            <button
-              onClick={() => setShowNotificationToast(true)}
-              className="p-2 text-stone-600 hover:text-stone-900 rounded-full hover:bg-stone-100 transition-colors relative"
-              title="Notifications"
-            >
-              <Bell className="w-5 h-5" />
-              <span className="w-2 h-2 rounded-full bg-[#C15C3D] absolute top-1.5 right-1.5"></span>
-            </button>
-
-            {/* CTA "+ Déposer une annonce" in warm terracotta pill */}
-            <button
-              onClick={() => setIsPostWizardOpen(true)}
+              onClick={handleOpenPostAd}
               className="hidden sm:flex items-center gap-2 px-4 py-2.5 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-full text-xs font-bold shadow-md hover:shadow-lg transition-all active:scale-95"
             >
               <Plus className="w-4 h-4 stroke-[3]" />
               <span>{t.postAd}</span>
             </button>
 
-            {/* Profile Avatar */}
-            <button
-              onClick={() => setIsProfileModalOpen(true)}
-              className="w-9 h-9 rounded-full bg-stone-200 text-stone-700 flex items-center justify-center font-bold text-xs border border-stone-300 hover:ring-2 hover:ring-[#C15C3D] transition-all"
-              title="Mon Compte Darna"
-            >
-              {currentUser.name.charAt(0)}
-            </button>
+            {/* Auth / Profile Button */}
+            {currentUser ? (
+              <button
+                onClick={() => setIsProfileModalOpen(true)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-800 text-xs font-bold border border-stone-300 transition-all"
+                title="Mon espace personnel Darna"
+              >
+                <div className="w-6 h-6 rounded-full bg-[#1E3D34] text-white flex items-center justify-center text-[11px] font-bold">
+                  {currentUser.name.charAt(0)}
+                </div>
+                <span className="hidden sm:inline max-w-[110px] truncate">
+                  {currentUser.firstName || currentUser.name}
+                </span>
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  setPendingAction(null);
+                  setAuthReasonMessage(undefined);
+                  setAuthInitialMode('login');
+                  setIsAuthModalOpen(true);
+                }}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all"
+              >
+                <LogIn className="w-3.5 h-3.5 text-[#C15C3D]" />
+                <span>Se connecter</span>
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -366,7 +605,7 @@ export default function App() {
         {/* VIEW 1: HOME VIEW */}
         {currentView === 'home' && (
           <div className="space-y-8 animate-fade-in">
-            {/* Hero Section matching the phone mockup: "Trouvez votre prochain chez-vous" */}
+            {/* Hero Section */}
             <div className="pt-2 sm:pt-4 space-y-2">
               <h1 className="text-3xl sm:text-5xl font-serif-title font-bold text-[#1E3D34] tracking-tight max-w-xl leading-tight">
                 {t.tagline}
@@ -376,14 +615,16 @@ export default function App() {
               </p>
             </div>
 
-            {/* Search Bar & Category Pills matching Mockup */}
+            {/* Search Bar & Category Pills */}
             <FilterBar
               filters={filters}
               onChangeFilters={(newFilters) => {
                 setFilters(newFilters);
                 setCurrentView('search');
               }}
-              onResetFilters={() => setFilters({ category: 'all', priceMax: 50000 })}
+              onResetFilters={() =>
+                setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+              }
               viewMode={viewMode}
               onChangeViewMode={setViewMode}
               isFilterDrawerOpen={isFilterDrawerOpen}
@@ -395,7 +636,9 @@ export default function App() {
             <div className="space-y-4 pt-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-xl sm:text-2xl font-bold text-stone-900">
-                  {viewMode === 'map' ? 'Carte interactive des annonces au Maroc' : t.recentAds}
+                  {viewMode === 'map'
+                    ? 'Carte interactive des annonces au Maroc'
+                    : t.recentAds}
                 </h2>
                 <div className="flex items-center gap-3">
                   <button
@@ -404,7 +647,9 @@ export default function App() {
                     className="px-3.5 py-1.5 rounded-xl bg-white border border-stone-200 hover:border-[#C15C3D] text-xs font-bold text-[#1E3D34] flex items-center gap-1.5 shadow-2xs transition-colors"
                   >
                     <MapPin className="w-3.5 h-3.5 text-[#C15C3D]" />
-                    <span>{viewMode === 'map' ? 'Afficher en grille' : 'Voir sur la carte'}</span>
+                    <span>
+                      {viewMode === 'map' ? 'Afficher en grille' : 'Voir sur la carte'}
+                    </span>
                   </button>
                   <button
                     type="button"
@@ -424,8 +669,12 @@ export default function App() {
                   center={
                     filters.city
                       ? [
-                          MOROCCAN_CITIES.find((c) => c.name.toLowerCase() === filters.city?.toLowerCase())?.lat || 32.2,
-                          MOROCCAN_CITIES.find((c) => c.name.toLowerCase() === filters.city?.toLowerCase())?.lng || -6.8,
+                          MOROCCAN_CITIES.find(
+                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
+                          )?.lat || 32.2,
+                          MOROCCAN_CITIES.find(
+                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
+                          )?.lng || -6.8,
                         ]
                       : [32.2, -6.8]
                   }
@@ -446,10 +695,10 @@ export default function App() {
               )}
             </div>
 
-            {/* Mobile Prominent CTA button matching mockup: "+ Déposer une annonce" in large terracotta button */}
+            {/* Mobile Prominent CTA button */}
             <div className="pt-2 sm:hidden">
               <button
-                onClick={() => setIsPostWizardOpen(true)}
+                onClick={handleOpenPostAd}
                 className="w-full py-4 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-2xl font-bold text-base flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all"
               >
                 <Plus className="w-5 h-5 stroke-[2.5]" />
@@ -463,13 +712,13 @@ export default function App() {
                 <div className="space-y-2">
                   <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/10 text-amber-300 text-xs font-bold border border-white/10">
                     <Shield className="w-3.5 h-3.5" />
-                    <span>L'immobilier marocain en toute transparence</span>
+                    <span>Location immobilière en toute prudence</span>
                   </div>
                   <h3 className="text-lg sm:text-xl font-bold">
-                    Direct propriétaire et agences certifiées, sans mauvaises surprises
+                    Mise en relation directe entre particuliers et professionnels au Maroc
                   </h3>
                   <p className="text-xs text-stone-300 max-w-2xl leading-relaxed">
-                    Darna applique la législation marocaine du bail d'habitation (loi 67-12) et les recommandations de la CNDP. Contactez directement les annonceurs par WhatsApp marocain sans commission intermédiaire.
+                    Darna protège les coordonnées des annonceurs conformément à la loi 09-08 (CNDP) et informe sur la législation marocaine du bail (loi 67-12). Rappel de prudence : ne versez jamais d'argent avant d'avoir visité le bien et vérifié les justificatifs.
                   </p>
                 </div>
 
@@ -506,13 +755,15 @@ export default function App() {
                 </p>
               </div>
 
-              {/* View toggle button */}
               <div className="flex items-center gap-2">
                 <button
                   onClick={() => setViewMode(viewMode === 'list' ? 'map' : 'list')}
                   className="px-4 py-2 bg-white border border-stone-200 text-stone-700 hover:border-[#1E3D34] rounded-xl text-xs font-bold shadow-xs flex items-center gap-2 transition-all"
                 >
-                  <span>Basculer sur : <strong>{viewMode === 'list' ? 'Carte du Maroc' : 'Liste'}</strong></span>
+                  <span>
+                    Basculer sur :{' '}
+                    <strong>{viewMode === 'list' ? 'Carte du Maroc' : 'Liste'}</strong>
+                  </span>
                 </button>
               </div>
             </div>
@@ -521,7 +772,9 @@ export default function App() {
             <FilterBar
               filters={filters}
               onChangeFilters={setFilters}
-              onResetFilters={() => setFilters({ category: 'all', priceMax: 50000 })}
+              onResetFilters={() =>
+                setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+              }
               viewMode={viewMode}
               onChangeViewMode={setViewMode}
               isFilterDrawerOpen={isFilterDrawerOpen}
@@ -539,8 +792,12 @@ export default function App() {
                   center={
                     filters.city
                       ? [
-                          MOROCCAN_CITIES.find((c) => c.name.toLowerCase() === filters.city?.toLowerCase())?.lat || 31.7917,
-                          MOROCCAN_CITIES.find((c) => c.name.toLowerCase() === filters.city?.toLowerCase())?.lng || -7.0926,
+                          MOROCCAN_CITIES.find(
+                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
+                          )?.lat || 31.7917,
+                          MOROCCAN_CITIES.find(
+                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
+                          )?.lng || -7.0926,
                         ]
                       : [31.7917, -7.0926]
                   }
@@ -553,9 +810,13 @@ export default function App() {
                   <div className="p-16 text-center bg-white rounded-3xl border border-stone-200 space-y-3">
                     <Building className="w-12 h-12 text-stone-300 mx-auto" />
                     <h3 className="text-base font-bold text-stone-800">{t.noResults}</h3>
-                    <p className="text-xs text-stone-500 max-w-md mx-auto">{t.noResultsSub}</p>
+                    <p className="text-xs text-stone-500 max-w-md mx-auto">
+                      {t.noResultsSub}
+                    </p>
                     <button
-                      onClick={() => setFilters({ category: 'all', priceMax: 50000 })}
+                      onClick={() =>
+                        setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+                      }
                       className="px-4 py-2 bg-[#C15C3D] text-white rounded-xl text-xs font-bold hover:bg-[#a94f33]"
                     >
                       {t.resetFilters}
@@ -585,11 +846,41 @@ export default function App() {
             <div>
               <h1 className="text-2xl font-bold text-stone-900">Mes Annonces Favorites</h1>
               <p className="text-xs text-stone-500 mt-0.5">
-                Retrouvez facilement les biens que vous avez sauvegardés
+                Retrouvez facilement les biens que vous avez sauvegardés dans votre compte
               </p>
             </div>
 
-            {favoriteListingsList.length === 0 ? (
+            {!currentUser ? (
+              <div className="p-12 text-center bg-white rounded-3xl border border-stone-200 space-y-3">
+                <Heart className="w-12 h-12 text-stone-300 mx-auto" />
+                <h3 className="text-base font-bold text-stone-800">
+                  Créez un compte ou connectez-vous pour continuer.
+                </h3>
+                <p className="text-xs text-stone-500 max-w-md mx-auto">
+                  Enregistrez vos annonces coup de cœur de façon permanente pour les retrouver sur tous vos appareils.
+                </p>
+                <div className="flex justify-center gap-3 pt-2">
+                  <button
+                    onClick={() => {
+                      setAuthInitialMode('register');
+                      setIsAuthModalOpen(true);
+                    }}
+                    className="px-4 py-2.5 bg-[#C15C3D] text-white rounded-xl text-xs font-bold"
+                  >
+                    Créer un compte
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAuthInitialMode('login');
+                      setIsAuthModalOpen(true);
+                    }}
+                    className="px-4 py-2.5 bg-[#1E3D34] text-white rounded-xl text-xs font-bold"
+                  >
+                    Se connecter
+                  </button>
+                </div>
+              </div>
+            ) : favoriteListingsList.length === 0 ? (
               <div className="p-16 text-center bg-white rounded-3xl border border-stone-200 space-y-3">
                 <Heart className="w-12 h-12 text-stone-300 mx-auto" />
                 <h3 className="text-base font-bold text-stone-800">Aucun favori enregistré</h3>
@@ -620,7 +911,7 @@ export default function App() {
         )}
 
         {/* VIEW 4: ADMIN CONSOLE */}
-        {currentView === 'admin' && (
+        {currentView === 'admin' && currentUser?.role === 'admin' && (
           <AdminDashboard
             listings={listings}
             reports={reports}
@@ -648,8 +939,7 @@ export default function App() {
         </button>
       </div>
 
-      {/* BOTTOM MOBILE NAVIGATION BAR matching the mockup image */}
-      {/* (Accueil, Favoris, Messages, Profil) */}
+      {/* BOTTOM MOBILE NAVIGATION BAR */}
       <nav className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-stone-200 px-6 py-2.5 flex items-center justify-between">
         <button
           onClick={() => setCurrentView('home')}
@@ -680,15 +970,33 @@ export default function App() {
         </button>
 
         <button
-          onClick={() => setIsProfileModalOpen(true)}
+          onClick={() => {
+            if (currentUser) {
+              setIsProfileModalOpen(true);
+            } else {
+              setPendingAction(null);
+              setIsAuthModalOpen(true);
+            }
+          }}
           className="flex flex-col items-center gap-1 text-stone-400 hover:text-[#1E3D34] transition-colors"
         >
           <UserIcon className="w-5 h-5" />
-          <span className="text-[10px]">{t.profile}</span>
+          <span className="text-[10px]">{currentUser ? t.profile : 'Connexion'}</span>
         </button>
       </nav>
 
       {/* ALL MODALS */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => {
+          setIsAuthModalOpen(false);
+          setPendingAction(null);
+        }}
+        initialMode={authInitialMode}
+        reasonMessage={authReasonMessage}
+        onAuthSuccess={handleAuthSuccess}
+      />
+
       <ListingDetailModal
         listing={selectedListing}
         isOpen={!!selectedListing}
@@ -699,31 +1007,53 @@ export default function App() {
           setSelectedListing(null);
           setReportingListing(listing);
         }}
+        currentUser={currentUser}
+        onRequireAuth={(action) =>
+          requireAuth(
+            action,
+            'Connectez-vous ou créez un compte gratuit pour afficher le numéro de téléphone ou contacter cet annonceur.'
+          )
+        }
+        allListings={listings}
+        onSelectListing={(listing) => setSelectedListing(listing)}
       />
 
       <PostListingWizard
         isOpen={isPostWizardOpen}
-        onClose={() => setIsPostWizardOpen(false)}
-        onSubmit={handleCreateListing}
+        onClose={() => {
+          setIsPostWizardOpen(false);
+          setEditingListing(null);
+        }}
+        onSubmit={handleSaveListing}
         currentUser={currentUser}
+        editingListing={editingListing}
       />
 
-      <DarnaChatbot
-        isOpen={isChatbotOpen}
-        onClose={() => setIsChatbotOpen(false)}
-      />
+      <DarnaChatbot isOpen={isChatbotOpen} onClose={() => setIsChatbotOpen(false)} />
 
-      <UserProfileModal
-        isOpen={isProfileModalOpen}
-        onClose={() => setIsProfileModalOpen(false)}
-        currentUser={currentUser}
-        onSwitchRole={handleSwitchUserRole}
-        myListings={listings.filter((l) => l.userId === currentUser.id)}
-        favoriteListings={favoriteListingsList}
-        onOpenListing={(listing) => setSelectedListing(listing)}
-        onOpenCreateAd={() => setIsPostWizardOpen(true)}
-        onDeleteListing={handleDeleteListing}
-      />
+      {currentUser && (
+        <UserProfileModal
+          isOpen={isProfileModalOpen}
+          onClose={() => setIsProfileModalOpen(false)}
+          currentUser={currentUser}
+          onSwitchRole={handleSwitchUserRole}
+          myListings={listings.filter((l) => l.userId === currentUser.id)}
+          favoriteListings={favoriteListingsList}
+          onOpenListing={(listing) => setSelectedListing(listing)}
+          onOpenCreateAd={() => {
+            setEditingListing(null);
+            setIsPostWizardOpen(true);
+          }}
+          onEditListing={(listing) => {
+            setEditingListing(listing);
+            setIsPostWizardOpen(true);
+          }}
+          onToggleListingStatus={handleToggleListingStatus}
+          onDeleteListing={handleDeleteListing}
+          onVerifyEmail={handleVerifyEmail}
+          onLogout={handleLogout}
+        />
+      )}
 
       <LegalAndCndpModal
         isOpen={isLegalModalOpen}

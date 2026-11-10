@@ -6,9 +6,12 @@ import {
   buildWhatsAppLink,
   validateListingForm,
   filterAndSortListings,
-  sanitizeListingForPublic
+  sanitizeListingForPublic,
+  sanitizeListingForVisitor,
+  detectContactInPublicText,
+  getSimilarListings
 } from '../src/utils/rentalLogic.ts';
-import { Listing, ListingFilter } from '../src/types/index.ts';
+import { Listing } from '../src/types/index.ts';
 
 describe('Rental Logic & Moroccan Real Estate Suite', () => {
   it('formats prices correctly in Moroccan Dirhams (MAD)', () => {
@@ -33,7 +36,21 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
     assert.ok(link.includes(encodeURIComponent('Bel appartement Maarif')));
   });
 
-  it('validates mandatory fields and category-specific rules', () => {
+  it('detects phone numbers, emails, and links in public text fields', () => {
+    const clean = detectContactInPublicText('Bel appartement lumineux proche du tramway à Rabat Agdal.');
+    assert.equal(clean.hasContactInfo, false);
+
+    const withPhone = detectContactInPublicText('Appelez-moi vite au 06 61 23 45 67 pour visiter.');
+    assert.equal(withPhone.hasContactInfo, true);
+
+    const withEmail = detectContactInPublicText('Écrivez à proprietaire@gmail.com directement.');
+    assert.equal(withEmail.hasContactInfo, true);
+
+    const withUrl = detectContactInPublicText('Voir plus sur https://wa.me/212661234567');
+    assert.equal(withUrl.hasContactInfo, true);
+  });
+
+  it('validates mandatory fields, category-specific rules, and anti-leak rules', () => {
     // Incomplete form
     const invalidForm = {
       title: 'Abc',
@@ -61,12 +78,30 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
       price: 1200,
       surface: 18,
       description: 'Emplacement de parking privé en sous-sol avec badge magnétique.',
-      contact: { phone: '0661234567', name: 'Rachid', type: 'particulier', showPhone: true, showEmail: false, showWhatsApp: true, showExactAddress: false, email: '' },
+      contact: {
+        phone: '0661234567',
+        name: 'Rachid',
+        type: 'particulier',
+        showPhone: true,
+        showEmail: false,
+        showWhatsApp: true,
+        showExactAddress: false,
+        phoneConsentAccepted: true,
+        email: ''
+      },
       legalConsentAccepted: true
     };
 
     const garageErrors = validateListingForm(validGarage as unknown as Partial<Listing>);
     assert.equal(garageErrors.length, 0, 'Garage should have no validation errors without bedrooms');
+
+    // Public text leak should fail validation
+    const leakedGarage = {
+      ...validGarage,
+      description: 'Emplacement privé en sous-sol, contactez-moi au 0661234567 directement.'
+    };
+    const leakErrors = validateListingForm(leakedGarage as unknown as Partial<Listing>);
+    assert.ok(leakErrors.some(e => e.field === 'publicContactLeak'));
   });
 
   it('filters listings by city, category, and price correctly', () => {
@@ -146,7 +181,7 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
         title: 'Studio non validé',
         slug: 'studio-en-attente',
         description: 'En attente de validation',
-        category: 'appartement',
+        category: 'studio',
         city: 'Casablanca',
         district: 'Gauthier',
         price: 4500,
@@ -178,24 +213,25 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
       }
     ];
 
-    // Filter by city Casablanca
     const casaResults = filterAndSortListings(mockListings, { city: 'Casablanca' });
     assert.equal(casaResults.length, 1);
     assert.equal(casaResults[0].id, '1');
 
-    // Filter by price range
     const budgetResults = filterAndSortListings(mockListings, { priceMax: 10000 });
     assert.equal(budgetResults.length, 1);
     assert.equal(budgetResults[0].id, '1');
 
-    // Filter by amenity Piscine
     const poolResults = filterAndSortListings(mockListings, { amenities: ['Piscine'] });
     assert.equal(poolResults.length, 1);
     assert.equal(poolResults[0].id, '2');
+
+    const similar = getSimilarListings(mockListings[0], mockListings);
+    assert.equal(similar.length, 1);
+    assert.equal(similar[0].id, '2');
   });
 
-  it('sanitizes public contact info when advertiser opts to hide exact phone or street address', () => {
-    const privateListing: Listing = {
+  it('strictly masks all contact numbers for unauthenticated visitors and respects advertiser flags for authenticated users', () => {
+    const sampleListing: Listing = {
       id: '1',
       title: 'Bel appartement Racine',
       slug: 'bel-appartement-racine',
@@ -211,11 +247,13 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
         name: 'Karim',
         type: 'particulier',
         phone: '0661234567',
+        whatsapp: '0661234567',
         email: 'karim@test.com',
-        showPhone: false,
+        showPhone: true,
         showEmail: true,
-        showWhatsApp: false,
-        showExactAddress: false
+        showWhatsApp: true,
+        showExactAddress: false,
+        phoneConsentAccepted: true
       },
       userId: 'u1',
       status: 'publiee',
@@ -231,9 +269,27 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
       images: []
     };
 
-    const sanitized = sanitizeListingForPublic(privateListing);
-    assert.equal(sanitized.contact.phone, '', 'Phone must be masked when showPhone is false');
-    assert.equal(sanitized.address, 'Racine, Casablanca', 'Exact street address must be masked when showExactAddress is false');
-    assert.equal(sanitized.contact.email, 'karim@test.com', 'Email stays visible if selected');
+    // Unauthenticated visitor NEVER gets phone, whatsapp, email, or exact street address
+    const visitorView = sanitizeListingForVisitor(sampleListing);
+    assert.equal(visitorView.contact.phone, '');
+    assert.equal(visitorView.contact.whatsapp, undefined);
+    assert.equal(visitorView.contact.email, '');
+    assert.equal(visitorView.address, 'Racine, Casablanca');
+
+    // Authenticated user gets phone/whatsapp/email if advertiser enabled them, but still masks exact address when showExactAddress is false
+    const authView = sanitizeListingForPublic(sampleListing, true);
+    assert.equal(authView.contact.phone, '0661234567');
+    assert.equal(authView.contact.whatsapp, '0661234567');
+    assert.equal(authView.contact.email, 'karim@test.com');
+    assert.equal(authView.address, 'Racine, Casablanca');
+
+    // When advertiser disables showPhone, even authenticated users do not see the phone number
+    const hiddenPhoneListing: Listing = {
+      ...sampleListing,
+      contact: { ...sampleListing.contact, showPhone: false, showWhatsApp: false }
+    };
+    const hiddenPhoneAuthView = sanitizeListingForPublic(hiddenPhoneListing, true);
+    assert.equal(hiddenPhoneAuthView.contact.phone, '');
+    assert.equal(hiddenPhoneAuthView.contact.whatsapp, undefined);
   });
 });

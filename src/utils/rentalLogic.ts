@@ -49,6 +49,43 @@ export function buildWhatsAppLink(phone: string, listingTitle: string, listingUr
 }
 
 /**
+ * Detect phone numbers, email addresses or external links in public text fields
+ */
+export function detectContactInPublicText(text: string): {
+  hasContactInfo: boolean;
+  matches: string[];
+} {
+  if (!text) return { hasContactInfo: false, matches: [] };
+  const matches: string[] = [];
+
+  // Detect Moroccan or international phone numbers (e.g., 06 61 23 45 67, +212661234567, 0522-40-90-90)
+  const phoneRegex = /(?:\+212|00212|0)\s*[5-7](?:[\s.-]*\d){8}\b/g;
+  const foundPhones = text.match(phoneRegex);
+  if (foundPhones) {
+    matches.push(...foundPhones);
+  }
+
+  // Detect email addresses
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const foundEmails = text.match(emailRegex);
+  if (foundEmails) {
+    matches.push(...foundEmails);
+  }
+
+  // Detect external URLs / WhatsApp links
+  const urlRegex = /(?:https?:\/\/|www\.|wa\.me\/)[^\s]+/gi;
+  const foundUrls = text.match(urlRegex);
+  if (foundUrls) {
+    matches.push(...foundUrls);
+  }
+
+  return {
+    hasContactInfo: matches.length > 0,
+    matches
+  };
+}
+
+/**
  * Validate listing submission according to Moroccan real estate criteria
  */
 export interface ValidationError {
@@ -87,21 +124,40 @@ export function validateListingForm(data: Partial<Listing>): ValidationError[] {
     errors.push({ field: 'description', message: "La description doit contenir au moins 20 caractères" });
   }
 
+  // Prevent phone/email/links in public title & description
+  const titleLeak = detectContactInPublicText(data.title || '');
+  const descLeak = detectContactInPublicText(data.description || '');
+  if (titleLeak.hasContactInfo || descLeak.hasContactInfo) {
+    errors.push({
+      field: 'publicContactLeak',
+      message: "Pour votre sécurité et la confidentialité, n'incluez pas de numéro de téléphone, d'adresse e-mail ou de lien externe dans le titre ou la description publique."
+    });
+  }
+
   // Category specific validation
-  if (['appartement', 'villa', 'chambre'].includes(data.category as string)) {
+  if (['appartement', 'studio', 'maison', 'villa', 'chambre'].includes(data.category as string)) {
     if (data.bedrooms === undefined || data.bedrooms === null || data.bedrooms < 0) {
       errors.push({ field: 'bedrooms', message: "Le nombre de chambres est requis pour ce type de bien" });
     }
   }
 
-  if (['appartement', 'villa', 'bureau', 'chambre'].includes(data.category as string)) {
+  if (['appartement', 'studio', 'maison', 'villa', 'bureau', 'chambre'].includes(data.category as string)) {
     if (data.bathrooms === undefined || data.bathrooms === null || data.bathrooms < 0) {
       errors.push({ field: 'bathrooms', message: "Le nombre de salles de bain est requis" });
     }
   }
 
-  if (!data.contact?.phone || data.contact.phone.trim().length < 8) {
-    errors.push({ field: 'contact.phone', message: "Un numéro de téléphone marocain valide est requis" });
+  if ((data.contact?.showPhone || data.contact?.showWhatsApp) && (!data.contact?.phone || data.contact.phone.trim().length < 8)) {
+    errors.push({ field: 'contact.phone', message: "Un numéro de téléphone marocain valide est requis pour activer le contact téléphonique ou WhatsApp" });
+  } else if (!data.contact?.phone && !data.contact?.email) {
+    errors.push({ field: 'contact.phone', message: "Veuillez renseigner au moins un moyen de contact" });
+  }
+
+  if (data.contact?.showPhone && data.contact.phoneConsentAccepted === false) {
+    errors.push({
+      field: 'contact.phoneConsentAccepted',
+      message: "Vous devez donner votre accord explicite avant de rendre votre numéro de téléphone visible aux utilisateurs connectés"
+    });
   }
 
   if (!data.legalConsentAccepted) {
@@ -166,15 +222,15 @@ export function filterAndSortListings(listings: Listing[], filters: ListingFilte
       }
 
       // Price bounds
-      if (filters.priceMin !== undefined && filters.priceMin !== null) {
+      if (filters.priceMin !== undefined && filters.priceMin !== null && filters.priceMin > 0) {
         if (listing.price < filters.priceMin) return false;
       }
-      if (filters.priceMax !== undefined && filters.priceMax !== null) {
+      if (filters.priceMax !== undefined && filters.priceMax !== null && filters.priceMax > 0) {
         if (listing.price > filters.priceMax) return false;
       }
 
       // Surface
-      if (filters.surfaceMin !== undefined && filters.surfaceMin !== null) {
+      if (filters.surfaceMin !== undefined && filters.surfaceMin !== null && filters.surfaceMin > 0) {
         if (listing.surface < filters.surfaceMin) return false;
       }
 
@@ -222,12 +278,46 @@ export function filterAndSortListings(listings: Listing[], filters: ListingFilte
 }
 
 /**
- * Sanitize listing contact details for public privacy
+ * Strictly strip all contact numbers, WhatsApp, emails, and exact street addresses
+ * when sending listings to an unauthenticated visitor.
  */
-export function sanitizeListingForPublic(listing: Listing): Listing {
+export function sanitizeListingForVisitor(listing: Listing): Listing {
+  const sanitizedContact: ListingContact = {
+    name: listing.contact.name,
+    type: listing.contact.type,
+    phone: '',
+    whatsapp: undefined,
+    email: '',
+    showPhone: listing.contact.showPhone,
+    showEmail: listing.contact.showEmail,
+    showWhatsApp: listing.contact.showWhatsApp,
+    showExactAddress: listing.contact.showExactAddress,
+    showMapLocation: listing.contact.showMapLocation ?? true,
+    phoneConsentAccepted: listing.contact.phoneConsentAccepted ?? true
+  };
+
+  return {
+    ...listing,
+    contact: sanitizedContact,
+    address: `${listing.district}, ${listing.city}`,
+    latitude: listing.contact.showMapLocation === false ? 0 : listing.latitude,
+    longitude: listing.contact.showMapLocation === false ? 0 : listing.longitude
+  };
+}
+
+/**
+ * Sanitize listing contact details for authenticated users (or public if specified).
+ * Only reveals contact channels that the advertiser explicitly opted to share.
+ */
+export function sanitizeListingForPublic(listing: Listing, isAuthenticated: boolean = true): Listing {
+  if (!isAuthenticated) {
+    return sanitizeListingForVisitor(listing);
+  }
+
+  const allowPhone = Boolean(listing.contact.showPhone && listing.contact.phoneConsentAccepted !== false);
   const sanitizedContact: ListingContact = {
     ...listing.contact,
-    phone: listing.contact.showPhone ? listing.contact.phone : '',
+    phone: allowPhone ? listing.contact.phone : '',
     email: listing.contact.showEmail ? listing.contact.email : '',
     whatsapp: listing.contact.showWhatsApp ? listing.contact.whatsapp : undefined,
   };
@@ -235,7 +325,22 @@ export function sanitizeListingForPublic(listing: Listing): Listing {
   return {
     ...listing,
     contact: sanitizedContact,
-    // Hide exact street address if advertiser turned off showExactAddress
-    address: listing.contact.showExactAddress ? listing.address : `${listing.district}, ${listing.city}`
+    address: listing.contact.showExactAddress ? listing.address : `${listing.district}, ${listing.city}`,
+    latitude: listing.contact.showMapLocation === false ? 0 : listing.latitude,
+    longitude: listing.contact.showMapLocation === false ? 0 : listing.longitude
   };
+}
+
+/**
+ * Get similar published listings (same city or category, excluding the current listing)
+ */
+export function getSimilarListings(target: Listing, allListings: Listing[], limit: number = 3): Listing[] {
+  return allListings
+    .filter((l) => l.id !== target.id && l.status === 'publiee')
+    .sort((a, b) => {
+      const aScore = (a.city === target.city ? 2 : 0) + (a.category === target.category ? 2 : 0);
+      const bScore = (b.city === target.city ? 2 : 0) + (b.category === target.category ? 2 : 0);
+      return bScore - aScore;
+    })
+    .slice(0, limit);
 }

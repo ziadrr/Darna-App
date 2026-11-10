@@ -3,6 +3,8 @@ import { Listing, User, ListingReport } from '../types';
 export const INITIAL_USERS: User[] = [
   {
     id: 'user-part-1',
+    firstName: 'Karim',
+    lastName: 'Bennani',
     name: 'Karim Bennani',
     email: 'karim.bennani@gmail.com',
     phone: '0661123456',
@@ -10,11 +12,15 @@ export const INITIAL_USERS: User[] = [
     advertiserType: 'particulier',
     city: 'Casablanca',
     avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=200&q=80',
-    verified: true,
+    verified: false,
+    emailVerified: true,
+    favorites: ['darna-casa-01'],
     createdAt: '2026-01-15'
   },
   {
     id: 'user-pro-1',
+    firstName: 'Atlas Prestige',
+    lastName: 'Immobilier',
     name: 'Atlas Prestige Immobilier',
     email: 'contact@atlasprestige.ma',
     phone: '0522409090',
@@ -23,18 +29,24 @@ export const INITIAL_USERS: User[] = [
     companyName: 'Atlas Prestige SARL',
     city: 'Marrakech',
     avatar: 'https://images.unsplash.com/photo-1560250097-0b93528c311a?auto=format&fit=crop&w=200&q=80',
-    verified: true,
+    verified: false,
+    emailVerified: true,
+    favorites: [],
     createdAt: '2025-11-20'
   },
   {
     id: 'user-admin-1',
+    firstName: 'Équipe Modération',
+    lastName: 'Darna',
     name: 'Équipe Modération Darna',
     email: 'admin@darna.ma',
     phone: '0537707070',
     role: 'admin',
     city: 'Rabat',
     avatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&w=200&q=80',
-    verified: true,
+    verified: false,
+    emailVerified: true,
+    favorites: [],
     createdAt: '2025-01-01'
   }
 ];
@@ -76,7 +88,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: false
+      showExactAddress: false,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-1',
     status: 'publiee',
@@ -85,7 +99,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-02T11:30:00Z',
     updatedAt: '2026-05-02T11:30:00Z',
     availableFrom: 'Immédiate',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-kech-02',
@@ -123,7 +138,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: true
+      showExactAddress: true,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-pro-1',
     status: 'publiee',
@@ -132,7 +149,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-01T15:00:00Z',
     updatedAt: '2026-05-01T15:00:00Z',
     availableFrom: '1er Juin 2026',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-rabat-03',
@@ -169,7 +187,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: false
+      showExactAddress: false,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-2',
     status: 'publiee',
@@ -178,14 +198,15 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-03T09:15:00Z',
     updatedAt: '2026-05-03T09:15:00Z',
     availableFrom: 'Immédiate',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-tanger-04',
     title: 'Studio vue panoramique baie • Tanger Malabata',
     slug: 'studio-vue-panoramique-baie-tanger-malabata',
     description: 'Idéal pour cadre expatrié ou jeune professionnel, studio neuf avec vue spectaculaire et imprenable sur la baie de Tanger et le détroit de Gibraltar. Finitions luxueuses, cuisine américaine ouverte, balcon filant, accès direct à la promenade maritime. Résidence sécurisée avec piscine et salle de sport.',
-    category: 'appartement',
+    category: 'studio',
     price: 5200,
     period: 'mois',
     deposit: 10400,
@@ -215,7 +236,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: true
+      showExactAddress: true,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-pro-2',
     status: 'publiee',
@@ -224,7 +247,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-02T16:20:00Z',
     updatedAt: '2026-05-02T16:20:00Z',
     availableFrom: '15 Mai 2026',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-casa-comm-05',
@@ -257,7 +281,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: false,
       showWhatsApp: true,
-      showExactAddress: true
+      showExactAddress: true,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-3',
     status: 'publiee',
@@ -266,7 +292,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-01T18:00:00Z',
     updatedAt: '2026-05-01T18:00:00Z',
     availableFrom: 'Immédiate',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-casa-gar-06',
@@ -296,7 +323,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: false
+      showExactAddress: false,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-4',
     status: 'publiee',
@@ -305,7 +334,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-03T14:40:00Z',
     updatedAt: '2026-05-03T14:40:00Z',
     availableFrom: 'Immédiate',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-rabat-bur-07',
@@ -341,7 +371,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: true
+      showExactAddress: true,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-pro-3',
     status: 'publiee',
@@ -350,7 +382,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-02T10:00:00Z',
     updatedAt: '2026-05-02T10:00:00Z',
     availableFrom: '1er Juin 2026',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-kech-chamb-08',
@@ -386,7 +419,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: false
+      showExactAddress: false,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-5',
     status: 'publiee',
@@ -395,7 +430,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-04T08:30:00Z',
     updatedAt: '2026-05-04T08:30:00Z',
     availableFrom: 'Immédiate',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   },
   {
     id: 'darna-pending-09',
@@ -431,7 +467,9 @@ export const INITIAL_LISTINGS: Listing[] = [
       showPhone: true,
       showEmail: true,
       showWhatsApp: true,
-      showExactAddress: false
+      showExactAddress: false,
+      showMapLocation: true,
+      phoneConsentAccepted: true
     },
     userId: 'user-part-1',
     status: 'en_attente',
@@ -440,7 +478,8 @@ export const INITIAL_LISTINGS: Listing[] = [
     createdAt: '2026-05-04T12:00:00Z',
     updatedAt: '2026-05-04T12:00:00Z',
     availableFrom: '1er Juillet 2026',
-    legalConsentAccepted: true
+    legalConsentAccepted: true,
+    isDemo: true
   }
 ];
 

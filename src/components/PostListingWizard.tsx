@@ -1,37 +1,33 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   Check,
   ChevronRight,
   ChevronLeft,
-  Building,
-  Home,
-  Car,
-  Store,
-  Briefcase,
-  Trees,
-  KeyRound,
-  BedDouble,
   Upload,
   Sparkles,
-  MapPin,
-  Eye,
   AlertCircle,
+  Trash2,
   ShieldCheck,
-  Image as ImageIcon,
-  Trash2
+  AlertTriangle
 } from 'lucide-react';
-import { Listing, PropertyCategory, AdvertiserType, RentPeriod } from '../types';
+import { Listing, PropertyCategory, AdvertiserType, RentPeriod, User } from '../types';
 import { MOROCCAN_CITIES, CATEGORIES_CONFIG, AVAILABLE_AMENITIES } from '../data/moroccoLocations';
-import { validateListingForm, formatMAD, ValidationError } from '../utils/rentalLogic';
+import {
+  validateListingForm,
+  formatMAD,
+  ValidationError,
+  detectContactInPublicText
+} from '../utils/rentalLogic';
 import { AiImageStudioModal } from './AiImageStudioModal';
 import { SingleLocationMap } from './MoroccoMap';
 
 interface PostListingWizardProps {
   isOpen: boolean;
   onClose: () => void;
-  onSubmit: (listingData: Partial<Listing>) => Promise<void>;
-  currentUser?: { name: string; email: string; phone: string; role: string };
+  onSubmit: (listingData: Partial<Listing>, editingId?: string) => Promise<void>;
+  currentUser?: User | null;
+  editingListing?: Listing | null;
 }
 
 export const PostListingWizard: React.FC<PostListingWizardProps> = ({
@@ -39,6 +35,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   onClose,
   onSubmit,
   currentUser,
+  editingListing,
 }) => {
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -54,6 +51,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   const [address, setAddress] = useState('');
   const [customLat, setCustomLat] = useState<number>(33.5731);
   const [customLng, setCustomLng] = useState<number>(-7.5898);
+  const [showMapLocation, setShowMapLocation] = useState<boolean>(true);
   const [price, setPrice] = useState<number>(6500);
   const [period, setPeriod] = useState<RentPeriod>('mois');
   const [deposit, setDeposit] = useState<number>(13000);
@@ -74,20 +72,68 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
   // Contact & Privacy State
   const [advertiserType, setAdvertiserType] = useState<AdvertiserType>('particulier');
-  const [contactName, setContactName] = useState(currentUser?.name || 'Youssef El Amrani');
-  const [contactPhone, setContactPhone] = useState(currentUser?.phone || '0661998877');
-  const [contactEmail, setContactEmail] = useState(currentUser?.email || 'youssef@darna.ma');
-  const [contactWhatsApp, setContactWhatsApp] = useState('0661998877');
+  const [contactName, setContactName] = useState(currentUser?.name || '');
+  const [contactPhone, setContactPhone] = useState(currentUser?.phone || '');
+  const [contactEmail, setContactEmail] = useState(currentUser?.email || '');
+  const [contactWhatsApp, setContactWhatsApp] = useState(currentUser?.phone || '');
   const [showPhone, setShowPhone] = useState(true);
-  const [showEmail, setShowEmail] = useState(true);
+  const [showEmail, setShowEmail] = useState(false);
   const [showWhatsApp, setShowWhatsApp] = useState(true);
   const [showExactAddress, setShowExactAddress] = useState(false);
+  const [phoneConsentAccepted, setPhoneConsentAccepted] = useState(true);
   const [legalConsentAccepted, setLegalConsentAccepted] = useState(true);
+
+  useEffect(() => {
+    if (editingListing) {
+      setStep(1);
+      setCategory(editingListing.category);
+      setTitle(editingListing.title);
+      setDescription(editingListing.description);
+      setCity(editingListing.city);
+      setDistrict(editingListing.district);
+      setAddress(editingListing.address || '');
+      setCustomLat(editingListing.latitude || 33.5731);
+      setCustomLng(editingListing.longitude || -7.5898);
+      setShowMapLocation(editingListing.contact?.showMapLocation !== false);
+      setPrice(editingListing.price);
+      setPeriod(editingListing.period);
+      setDeposit(editingListing.deposit || 0);
+      setSurface(editingListing.surface);
+      setBedrooms(editingListing.bedrooms ?? 2);
+      setBathrooms(editingListing.bathrooms ?? 1);
+      setFloor(editingListing.floor ?? 1);
+      setFurnished(editingListing.furnished ?? true);
+      setSelectedAmenities(editingListing.amenities || []);
+      setImages(editingListing.images || []);
+      setAvailableFrom(editingListing.availableFrom || 'Immédiate');
+      setAdvertiserType(editingListing.contact?.type || 'particulier');
+      setContactName(editingListing.contact?.name || currentUser?.name || '');
+      setContactPhone(editingListing.contact?.phone || currentUser?.phone || '');
+      setContactEmail(editingListing.contact?.email || currentUser?.email || '');
+      setContactWhatsApp(editingListing.contact?.whatsapp || editingListing.contact?.phone || '');
+      setShowPhone(editingListing.contact?.showPhone ?? true);
+      setShowEmail(editingListing.contact?.showEmail ?? false);
+      setShowWhatsApp(editingListing.contact?.showWhatsApp ?? true);
+      setShowExactAddress(editingListing.contact?.showExactAddress ?? false);
+      setPhoneConsentAccepted(editingListing.contact?.phoneConsentAccepted !== false);
+      setLegalConsentAccepted(true);
+    } else if (currentUser) {
+      setStep(1);
+      setContactName(currentUser.name || '');
+      setContactPhone(currentUser.phone || '');
+      setContactWhatsApp(currentUser.phone || '');
+      setContactEmail(currentUser.email || '');
+      setAdvertiserType(currentUser.advertiserType || 'particulier');
+    }
+  }, [editingListing, currentUser, isOpen]);
 
   if (!isOpen) return null;
 
   const currentCategoryConfig = CATEGORIES_CONFIG.find((c) => c.id === category);
   const currentCityData = MOROCCAN_CITIES.find((c) => c.name.toLowerCase() === city.toLowerCase());
+
+  const titleLeak = detectContactInPublicText(title);
+  const descLeak = detectContactInPublicText(description);
 
   const handleCityChange = (newCityName: string) => {
     setCity(newCityName);
@@ -156,16 +202,27 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
         showEmail,
         showWhatsApp,
         showExactAddress,
+        showMapLocation,
+        phoneConsentAccepted,
       },
       legalConsentAccepted,
     };
   };
 
   const handleNextStep = () => {
-    // Partial validations per step
     if (step === 1) {
       if (!title.trim() || title.trim().length < 5) {
         setValidationErrors([{ field: 'title', message: 'Le titre doit faire au moins 5 caractères.' }]);
+        return;
+      }
+      if (titleLeak.hasContactInfo) {
+        setValidationErrors([
+          {
+            field: 'title',
+            message:
+              'Pour votre sécurité, ne mettez pas de numéro de téléphone, e-mail ou lien dans le titre public.',
+          },
+        ]);
         return;
       }
       if (!city || !district) {
@@ -181,18 +238,45 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
         setValidationErrors([{ field: 'description', message: 'La description doit faire au moins 20 caractères.' }]);
         return;
       }
+      if (descLeak.hasContactInfo) {
+        setValidationErrors([
+          {
+            field: 'description',
+            message:
+              'Veuillez retirer les numéros de téléphone, adresses e-mail ou liens de la description publique.',
+          },
+        ]);
+        return;
+      }
     } else if (step === 3) {
       if (images.length === 0) {
         setValidationErrors([{ field: 'images', message: 'Veuillez ajouter au moins une photo.' }]);
         return;
       }
     } else if (step === 4) {
-      if (!contactPhone || contactPhone.trim().length < 8) {
-        setValidationErrors([{ field: 'contactPhone', message: 'Un numéro de téléphone marocain valide est requis.' }]);
+      if ((showPhone || showWhatsApp) && (!contactPhone || contactPhone.trim().length < 8)) {
+        setValidationErrors([
+          { field: 'contactPhone', message: 'Un numéro de téléphone marocain valide est requis.' },
+        ]);
+        return;
+      }
+      if ((showPhone || showWhatsApp) && !phoneConsentAccepted) {
+        setValidationErrors([
+          {
+            field: 'phoneConsent',
+            message:
+              'Vous devez donner votre accord explicite avant de rendre votre numéro visible aux utilisateurs connectés.',
+          },
+        ]);
         return;
       }
       if (!legalConsentAccepted) {
-        setValidationErrors([{ field: 'legal', message: 'Veuillez accepter les conditions et certifier votre autorisation.' }]);
+        setValidationErrors([
+          {
+            field: 'legal',
+            message: 'Veuillez accepter les conditions et certifier votre autorisation.',
+          },
+        ]);
         return;
       }
     }
@@ -212,10 +296,13 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
     setIsSubmitting(true);
     try {
-      await onSubmit({
-        ...payload,
-        status: asDraft ? 'brouillon' : 'en_attente',
-      });
+      await onSubmit(
+        {
+          ...payload,
+          status: asDraft ? 'brouillon' : 'publiee',
+        },
+        editingListing?.id
+      );
       onClose();
     } catch (err: any) {
       console.error(err);
@@ -230,8 +317,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
         {/* Wizard Header */}
         <div className="px-6 py-4 bg-[#FAF7F2] border-b border-stone-200 flex items-center justify-between">
           <div>
-            <h2 className="font-bold text-lg text-stone-900">Déposer une annonce sur Darna</h2>
-            <p className="text-xs text-stone-500">Mise en relation directe avec les locataires au Maroc</p>
+            <h2 className="font-bold text-lg text-stone-900">
+              {editingListing ? 'Modifier mon annonce' : 'Déposer une annonce sur Darna'}
+            </h2>
+            <p className="text-xs text-stone-500">
+              Mise en relation directe et sécurisée avec les locataires au Maroc
+            </p>
           </div>
           <button
             onClick={onClose}
@@ -247,7 +338,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
             { num: 1, label: 'Bien & Lieu' },
             { num: 2, label: 'Détails & Prix' },
             { num: 3, label: 'Photos & IA' },
-            { num: 4, label: 'Contact' },
+            { num: 4, label: 'Contact & Confidentialité' },
             { num: 5, label: 'Aperçu' },
           ].map((s) => {
             const isActive = step === s.num;
@@ -265,7 +356,11 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                 >
                   {isDone ? <Check className="w-3.5 h-3.5" /> : s.num}
                 </div>
-                <span className={`hidden sm:inline font-medium ${isActive ? 'text-[#C15C3D]' : 'text-stone-500'}`}>
+                <span
+                  className={`hidden sm:inline font-medium ${
+                    isActive ? 'text-[#C15C3D] font-bold' : 'text-stone-500'
+                  }`}
+                >
                   {s.label}
                 </span>
               </div>
@@ -294,7 +389,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                 <label className="block text-xs font-bold uppercase tracking-wider text-stone-700 mb-2">
                   1. Quel type de bien proposez-vous ?
                 </label>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {CATEGORIES_CONFIG.map((cat) => {
                     const isSelected = category === cat.id;
                     return (
@@ -302,14 +397,16 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                         key={cat.id}
                         type="button"
                         onClick={() => setCategory(cat.id)}
-                        className={`p-3 rounded-2xl border text-left transition-all ${
+                        className={`p-2.5 rounded-2xl border text-left transition-all ${
                           isSelected
                             ? 'bg-[#FAF7F2] border-[#C15C3D] text-[#C15C3D] ring-2 ring-[#C15C3D]/20 shadow-xs'
                             : 'bg-white border-stone-200 hover:border-stone-300 text-stone-700'
                         }`}
                       >
                         <div className="font-bold text-xs">{cat.label}</div>
-                        <div className="text-[10px] text-stone-500 line-clamp-1 mt-0.5">{cat.description}</div>
+                        <div className="text-[10px] text-stone-500 line-clamp-1 mt-0.5">
+                          {cat.description}
+                        </div>
                       </button>
                     );
                   })}
@@ -327,6 +424,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                   placeholder="Ex: Bel appartement 2 chambres meublé avec terrasse à Maârif"
                   className="w-full text-sm px-4 py-3 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D]"
                 />
+                {titleLeak.hasContactInfo && (
+                  <p className="text-xs text-red-600 font-medium mt-1 flex items-center gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    Attention : Ne mettez pas de numéro de téléphone ou d'e-mail dans le titre public.
+                  </p>
+                )}
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -367,7 +470,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                  Adresse exacte (facultative) :
+                  Adresse exacte (facultative et masquée par défaut) :
                 </label>
                 <input
                   type="text"
@@ -377,25 +480,38 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                   className="w-full text-sm px-4 py-3 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D]"
                 />
                 <p className="text-[11px] text-stone-500 mt-1">
-                  Vous pourrez choisir à l'étape suivante si vous souhaitez rendre cette adresse publique ou la garder confidentielle.
+                  L'adresse exacte n'est jamais affichée sans votre autorisation explicite. Seuls la ville et le quartier sont publics.
                 </p>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                  Position approximative sur la carte :
-                </label>
-                <SingleLocationMap
-                  latitude={customLat}
-                  longitude={customLng}
-                  title={title || `${district}, ${city}`}
-                  subtitle={`${district}, ${city} (${customLat.toFixed(4)}, ${customLng.toFixed(4)})`}
-                  interactivePicker={true}
-                  onChangeCoordinates={(lat, lng) => {
-                    setCustomLat(lat);
-                    setCustomLng(lng);
-                  }}
-                />
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-stone-700">
+                    Position approximative sur la carte :
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-stone-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={showMapLocation}
+                      onChange={(e) => setShowMapLocation(e.target.checked)}
+                      className="rounded text-[#C15C3D] focus:ring-[#C15C3D]"
+                    />
+                    <span>Afficher la carte approximative sur l'annonce</span>
+                  </label>
+                </div>
+                {showMapLocation && (
+                  <SingleLocationMap
+                    latitude={customLat}
+                    longitude={customLng}
+                    title={title || `${district}, ${city}`}
+                    subtitle={`${district}, ${city} (Position approximative)`}
+                    interactivePicker={true}
+                    onChangeCoordinates={(lat, lng) => {
+                      setCustomLat(lat);
+                      setCustomLng(lng);
+                    }}
+                  />
+                )}
               </div>
             </div>
           )}
@@ -524,7 +640,9 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                       <label
                         key={amenity}
                         className={`flex items-center gap-2 p-2.5 rounded-xl border text-xs cursor-pointer transition-colors ${
-                          isChecked ? 'bg-[#FAF7F2] border-[#C15C3D] text-[#C15C3D]' : 'bg-white border-stone-200'
+                          isChecked
+                            ? 'bg-[#FAF7F2] border-[#C15C3D] text-[#C15C3D]'
+                            : 'bg-white border-stone-200'
                         }`}
                       >
                         <input
@@ -542,7 +660,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                  Description détaillée du bien :
+                  Description détaillée du bien (sans coordonnées personnelles) :
                 </label>
                 <textarea
                   value={description}
@@ -551,6 +669,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                   placeholder="Décrivez l'état du bien, l'exposition, le voisinage, les transports à proximité, etc."
                   className="w-full text-sm p-4 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D]"
                 />
+                {descLeak.hasContactInfo && (
+                  <p className="text-xs text-red-600 font-medium mt-1 flex items-center gap-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    Pour éviter le démarchage abusif, les numéros de téléphone, e-mails et liens sont interdits dans la description publique.
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -562,7 +686,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                 <div>
                   <h3 className="font-bold text-sm text-stone-900">Photos de l'annonce</h3>
                   <p className="text-xs text-stone-500">
-                    Ajoutez au moins une photo lumineuse et représentative du bien.
+                    Ajoutez des photos nettes du bien (sans numéro de téléphone ni filigrane de contact sur l'image).
                   </p>
                 </div>
 
@@ -590,7 +714,10 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
               {/* Photo grid */}
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                 {images.map((img, idx) => (
-                  <div key={idx} className="relative rounded-2xl overflow-hidden aspect-[4/3] border border-stone-200 shadow-xs group">
+                  <div
+                    key={idx}
+                    className="relative rounded-2xl overflow-hidden aspect-[4/3] border border-stone-200 shadow-xs group"
+                  >
                     <img src={img} alt={`Photo ${idx + 1}`} className="w-full h-full object-cover" />
                     {idx === 0 && (
                       <span className="absolute top-2 left-2 bg-[#C15C3D] text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-xs">
@@ -627,8 +754,8 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                         : 'bg-white border-stone-200 text-stone-700'
                     }`}
                   >
-                    <div className="font-bold text-sm">Particulier / Propriétaire</div>
-                    <div className="text-xs text-stone-500">Pas de commission d'agence</div>
+                    <div className="font-bold text-sm">Particulier</div>
+                    <div className="text-xs text-stone-500">Propriétaire ou colocataire</div>
                   </button>
 
                   <button
@@ -640,8 +767,8 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                         : 'bg-white border-stone-200 text-stone-700'
                     }`}
                   >
-                    <div className="font-bold text-sm">Professionnel / Agence Immobilière</div>
-                    <div className="text-xs text-stone-500">Courtier ou agent certifié</div>
+                    <div className="font-bold text-sm">Professionnel</div>
+                    <div className="text-xs text-stone-500">Agence immobilière ou gestionnaire</div>
                   </button>
                 </div>
               </div>
@@ -649,7 +776,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                    Nom ou raison sociale :
+                    Nom affiché sur l'annonce :
                   </label>
                   <input
                     type="text"
@@ -678,9 +805,15 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
               {/* Privacy switches */}
               <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200 space-y-3">
-                <h4 className="font-bold text-xs uppercase tracking-wider text-stone-700">
-                  Préférences de confidentialité & visibilité :
-                </h4>
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-[#1E3D34]" />
+                  <h4 className="font-bold text-xs uppercase tracking-wider text-stone-700">
+                    Protection de vos coordonnées (visiteurs non connectés exclus) :
+                  </h4>
+                </div>
+                <p className="text-[11px] text-stone-500">
+                  Votre numéro n'est jamais visible pour les visiteurs non connectés. Choisissez ci-dessous ce que les membres connectés peuvent voir :
+                </p>
 
                 <label className="flex items-center gap-3 text-xs text-stone-700 cursor-pointer">
                   <input
@@ -689,7 +822,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     onChange={(e) => setShowPhone(e.target.checked)}
                     className="rounded text-[#C15C3D] focus:ring-[#C15C3D]"
                   />
-                  <span>Rendre mon numéro de téléphone visible aux visiteurs</span>
+                  <span>Autoriser l'affichage de mon numéro d'appel aux membres connectés</span>
                 </label>
 
                 <label className="flex items-center gap-3 text-xs text-stone-700 cursor-pointer">
@@ -699,7 +832,17 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     onChange={(e) => setShowWhatsApp(e.target.checked)}
                     className="rounded text-[#C15C3D] focus:ring-[#C15C3D]"
                   />
-                  <span>Activer le bouton de contact direct WhatsApp</span>
+                  <span>Autoriser le bouton de contact WhatsApp aux membres connectés</span>
+                </label>
+
+                <label className="flex items-center gap-3 text-xs text-stone-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showEmail}
+                    onChange={(e) => setShowEmail(e.target.checked)}
+                    className="rounded text-[#C15C3D] focus:ring-[#C15C3D]"
+                  />
+                  <span>Afficher mon adresse e-mail aux membres connectés</span>
                 </label>
 
                 <label className="flex items-center gap-3 text-xs text-stone-700 cursor-pointer">
@@ -709,9 +852,28 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     onChange={(e) => setShowExactAddress(e.target.checked)}
                     className="rounded text-[#C15C3D] focus:ring-[#C15C3D]"
                   />
-                  <span>Afficher l'adresse exacte (si décoché, seul le quartier et la ville sont affichés)</span>
+                  <span>
+                    Afficher l'adresse exacte (si décoché, seuls la ville et le quartier sont affichés)
+                  </span>
                 </label>
               </div>
+
+              {/* Explicit Phone Consent */}
+              {(showPhone || showWhatsApp) && (
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl text-xs text-amber-950">
+                  <label className="flex items-start gap-2.5 cursor-pointer font-medium">
+                    <input
+                      type="checkbox"
+                      checked={phoneConsentAccepted}
+                      onChange={(e) => setPhoneConsentAccepted(e.target.checked)}
+                      className="rounded text-[#C15C3D] focus:ring-[#C15C3D] mt-0.5"
+                    />
+                    <span>
+                      J'accepte explicitement que mon numéro de téléphone soit rendu visible uniquement aux utilisateurs connectés sur Darna afin qu'ils puissent me contacter au sujet de cette annonce.
+                    </span>
+                  </label>
+                </div>
+              )}
 
               {/* Legal confirmation */}
               <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl text-xs text-emerald-950 space-y-2">
@@ -723,7 +885,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     className="rounded text-emerald-700 focus:ring-emerald-600 mt-0.5"
                   />
                   <span>
-                    Je certifie sur l'honneur être propriétaire de ce bien ou détenir un mandat régulier de gestion/location, et j'accepte sans réserve les Conditions Générales d'Utilisation et la politique de protection des données CNDP de Darna.
+                    Je certifie sur l'honneur être autorisé à proposer ce bien à la location et j'accepte les Conditions Générales d'Utilisation et la politique de confidentialité de Darna.
                   </span>
                 </label>
               </div>
@@ -734,7 +896,9 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
           {step === 5 && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="font-bold text-sm text-stone-900">Prévisualisation de votre annonce :</h3>
+                <h3 className="font-bold text-sm text-stone-900">
+                  Prévisualisation de votre annonce :
+                </h3>
                 <span className="text-xs text-[#C15C3D] font-bold">Vérifiez avant publication</span>
               </div>
 
@@ -758,11 +922,17 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-4 text-xs text-stone-600 border-y border-stone-100 py-3">
+                <div className="flex items-center flex-wrap gap-4 text-xs text-stone-600 border-y border-stone-100 py-3">
                   <span>📐 {surface} m²</span>
-                  {bedrooms > 0 && <span>🛏️ {bedrooms} chambres</span>}
-                  {bathrooms > 0 && <span>🚿 {bathrooms} sdb</span>}
-                  <span>{furnished ? '🛋️ Meublé' : '📦 Vide'}</span>
+                  {currentCategoryConfig?.requiresBedrooms && bedrooms > 0 && (
+                    <span>🛏️ {bedrooms} chambres</span>
+                  )}
+                  {currentCategoryConfig?.requiresBathrooms && bathrooms > 0 && (
+                    <span>🚿 {bathrooms} sdb</span>
+                  )}
+                  {currentCategoryConfig?.canBeFurnished && (
+                    <span>{furnished ? '🛋️ Meublé' : '📦 Non meublé'}</span>
+                  )}
                 </div>
 
                 <p className="text-xs text-stone-700 whitespace-pre-line leading-relaxed">
@@ -817,7 +987,13 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                 className="px-6 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md transition-all active:scale-95 disabled:opacity-50"
               >
                 <Check className="w-4 h-4" />
-                <span>{isSubmitting ? 'Publication...' : 'Publier mon annonce'}</span>
+                <span>
+                  {isSubmitting
+                    ? 'Enregistrement...'
+                    : editingListing
+                    ? 'Enregistrer les modifications'
+                    : 'Publier mon annonce'}
+                </span>
               </button>
             )}
           </div>
