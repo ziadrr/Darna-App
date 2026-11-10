@@ -1,4 +1,104 @@
-import { Listing, User, ListingReport } from '../types';
+import { Listing, User, ListingReport, SubscriptionPlan, BoostOption } from '../types';
+
+export const INITIAL_SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
+  {
+    id: 'particulier',
+    name: 'Particulier',
+    price: 0,
+    period: 'mois',
+    maxListings: 3,
+    features: [
+      'Jusqu’à 3 annonces actives simultanées',
+      'Publication rapide avec photos HD',
+      'Contact direct par téléphone et WhatsApp',
+      'Protection des coordonnées visiteurs (CNDP)'
+    ]
+  },
+  {
+    id: 'starter',
+    name: 'Agence Starter',
+    price: 199,
+    period: 'mois',
+    maxListings: 15,
+    features: [
+      'Jusqu’à 15 annonces actives simultanées',
+      'Badge « Professionnel » sur vos annonces',
+      'Tableau de bord de gestion des biens',
+      'Support client prioritaire par e-mail'
+    ]
+  },
+  {
+    id: 'pro',
+    name: 'Agence Pro',
+    price: 499,
+    period: 'mois',
+    maxListings: 50,
+    popular: true,
+    features: [
+      'Jusqu’à 50 annonces actives simultanées',
+      'Badge « Professionnel » et vitrine agence',
+      'Statistiques de vues et de favoris détaillées',
+      'Visite guidée vocale IA incluse sur vos biens',
+      'Support téléphonique et WhatsApp dédié'
+    ]
+  },
+  {
+    id: 'business',
+    name: 'Agence Business',
+    price: 999,
+    period: 'mois',
+    maxListings: 150,
+    features: [
+      'Jusqu’à 150 annonces actives simultanées',
+      'Multi-collaborateurs et gestion de portefeuille',
+      'Génération d’images d’aménagement IA 4K',
+      'Priorité de modération express',
+      'Gestionnaire de compte dédié au Maroc'
+    ]
+  },
+  {
+    id: 'entreprise',
+    name: 'Entreprise',
+    price: null,
+    period: 'mois',
+    maxListings: 999,
+    isCustomQuote: true,
+    features: [
+      'Volume d’annonces sur mesure ou illimité',
+      'Promoteurs immobiliers, réseaux et grands comptes',
+      'Passerelle d’import automatique CRM / API',
+      'Facturation annuelle sur devis en Dirhams (MAD)',
+      'Accompagnement stratégique personnalisé'
+    ]
+  }
+];
+
+export const INITIAL_BOOST_OPTIONS: BoostOption[] = [
+  {
+    id: 'premium',
+    name: 'Annonce Premium',
+    description: 'Mention « Sponsorisé » avec encadré distinctif et priorité dans les résultats de recherche de votre ville.',
+    price: 49,
+    durationDays: 7,
+    badgeLabel: 'Sponsorisé'
+  },
+  {
+    id: 'top',
+    name: 'Annonce Top',
+    description: 'Remontée en tête de liste dans les résultats filtrés avec badge « Sponsorisé » haute visibilité.',
+    price: 99,
+    durationDays: 15,
+    badgeLabel: 'Sponsorisé'
+  },
+  {
+    id: 'homepage',
+    name: 'Mise en avant sur la page d’accueil',
+    description: 'Exposition maximale dès la page d’accueil Darna et en tête des recherches compatibles avec mention « Sponsorisé ».',
+    price: 199,
+    durationDays: 30,
+    badgeLabel: 'Sponsorisé'
+  }
+];
 
 export const INITIAL_USERS: User[] = [
   {
@@ -15,6 +115,14 @@ export const INITIAL_USERS: User[] = [
     verified: false,
     emailVerified: true,
     favorites: ['darna-casa-01'],
+    subscription: {
+      planId: 'particulier',
+      planName: 'Particulier',
+      status: 'active',
+      maxListings: 3,
+      startedAt: '2026-01-15T00:00:00Z',
+      expiresAt: '2027-01-15T00:00:00Z'
+    },
     createdAt: '2026-01-15'
   },
   {
@@ -32,6 +140,14 @@ export const INITIAL_USERS: User[] = [
     verified: false,
     emailVerified: true,
     favorites: [],
+    subscription: {
+      planId: 'particulier',
+      planName: 'Particulier (Gratuit)',
+      status: 'active',
+      maxListings: 3,
+      startedAt: '2025-11-20T00:00:00Z',
+      expiresAt: '2026-11-20T00:00:00Z'
+    },
     createdAt: '2025-11-20'
   },
   {

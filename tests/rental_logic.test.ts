@@ -9,9 +9,16 @@ import {
   sanitizeListingForPublic,
   sanitizeListingForVisitor,
   detectContactInPublicText,
-  getSimilarListings
+  getSimilarListings,
+  calculateDistanceKm,
+  findNearestMoroccanCity,
+  isListingBoostActive,
+  calculateRevenueSummary,
+  getUserListingQuota
 } from '../src/utils/rentalLogic.ts';
-import { Listing } from '../src/types/index.ts';
+import { Listing, PaymentTransaction, User } from '../src/types/index.ts';
+import { MOROCCAN_CITIES } from '../src/data/moroccoLocations.ts';
+import { INITIAL_SUBSCRIPTION_PLANS } from '../src/data/mockListings.ts';
 
 describe('Rental Logic & Moroccan Real Estate Suite', () => {
   it('formats prices correctly in Moroccan Dirhams (MAD)', () => {
@@ -292,4 +299,204 @@ describe('Rental Logic & Moroccan Real Estate Suite', () => {
     assert.equal(hiddenPhoneAuthView.contact.phone, '');
     assert.equal(hiddenPhoneAuthView.contact.whatsapp, undefined);
   });
+
+  it('calculates distance in km and detects nearest Moroccan city from Wi-Fi/GPS coordinates', () => {
+    // Coordinates in Casablanca Maârif (33.5822, -7.6325)
+    const nearestToCasa = findNearestMoroccanCity(33.5822, -7.6325, MOROCCAN_CITIES);
+    assert.equal(nearestToCasa.city.name, 'Casablanca');
+    assert.ok(nearestToCasa.distanceKm < 15);
+
+    // Coordinates in Marrakech Guéliz (31.634, -8.01)
+    const nearestToKech = findNearestMoroccanCity(31.634, -8.01, MOROCCAN_CITIES);
+    assert.equal(nearestToKech.city.name, 'Marrakech');
+
+    // Distance between Casablanca and Rabat is ~86 km
+    const distCasaRabat = calculateDistanceKm(33.5731, -7.5898, 34.0209, -6.8416);
+    assert.ok(distCasaRabat > 70 && distCasaRabat < 100);
+  });
+
+  it('prioritizes sponsored listings in default sort while strictly enforcing moderation and search filters', () => {
+    const futureIso = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+    const baseListing: Listing = {
+      id: 'reg-1',
+      title: 'Appartement standard Casablanca',
+      slug: 'appartement-standard-casa',
+      description: 'Appartement calme et propre à Casablanca.',
+      category: 'appartement',
+      city: 'Casablanca',
+      district: 'Maârif',
+      price: 6000,
+      period: 'mois',
+      surface: 80,
+      bedrooms: 2,
+      amenities: [],
+      images: [],
+      latitude: 33.58,
+      longitude: -7.63,
+      contact: {
+        name: 'Ali',
+        type: 'particulier',
+        phone: '0661000000',
+        email: 'ali@test.ma',
+        showPhone: true,
+        showEmail: true,
+        showWhatsApp: true,
+        showExactAddress: false
+      },
+      userId: 'u1',
+      status: 'publiee',
+      viewsCount: 10,
+      favoritesCount: 1,
+      createdAt: '2026-05-04T12:00:00Z',
+      updatedAt: '2026-05-04T12:00:00Z',
+      availableFrom: 'Immédiate',
+      legalConsentAccepted: true
+    };
+
+    const sponsoredCasa: Listing = {
+      ...baseListing,
+      id: 'spons-casa',
+      title: 'Appartement Sponsorisé Casablanca',
+      createdAt: '2026-05-01T10:00:00Z', // Older than reg-1, but boosted
+      boost: {
+        optionId: 'top',
+        optionName: 'Annonce Top',
+        status: 'active',
+        startedAt: '2026-05-01T10:00:00Z',
+        expiresAt: futureIso,
+        transactionId: 'tx-1'
+      }
+    };
+
+    const sponsoredUnapproved: Listing = {
+      ...sponsoredCasa,
+      id: 'spons-pending',
+      status: 'en_attente' // Not approved by moderation yet
+    };
+
+    const all = [baseListing, sponsoredCasa, sponsoredUnapproved];
+
+    // 1. Unapproved sponsored listing is strictly excluded by moderation rule
+    const resultsCasa = filterAndSortListings(all, { city: 'Casablanca', sortBy: 'recent' });
+    assert.equal(resultsCasa.length, 2);
+    // Sponsored Casa ranks first even though it is older than baseListing
+    assert.equal(resultsCasa[0].id, 'spons-casa');
+    assert.equal(isListingBoostActive(resultsCasa[0]), true);
+
+    // 2. Sponsored Casablanca listing is strictly excluded when filtering for Rabat
+    const resultsRabat = filterAndSortListings(all, { city: 'Rabat', sortBy: 'recent' });
+    assert.equal(resultsRabat.length, 0);
+  });
+
+  it('calculates subscription and boost revenues strictly from confirmed payments and excludes failed or refunded ones', () => {
+    const txs: PaymentTransaction[] = [
+      {
+        id: 'tx-1',
+        idempotencyKey: 'k1',
+        userId: 'u1',
+        userName: 'Agence Atlas',
+        userEmail: 'atlas@ma.ma',
+        type: 'subscription',
+        targetId: 'pro',
+        targetLabel: 'Abonnement Agence Pro',
+        optionId: 'pro',
+        amount: 499,
+        currency: 'MAD',
+        status: 'paye',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: 'CMI Test',
+        createdAt: '2026-05-04T10:00:00Z'
+      },
+      {
+        id: 'tx-2',
+        idempotencyKey: 'k2',
+        userId: 'u1',
+        userName: 'Agence Atlas',
+        userEmail: 'atlas@ma.ma',
+        type: 'boost',
+        targetId: 'darna-1',
+        targetLabel: 'Annonce Top',
+        optionId: 'top',
+        amount: 99,
+        currency: 'MAD',
+        status: 'paye',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: 'CMI Test',
+        createdAt: '2026-05-04T10:05:00Z'
+      },
+      {
+        id: 'tx-3',
+        idempotencyKey: 'k3',
+        userId: 'u2',
+        userName: 'Karim',
+        userEmail: 'karim@ma.ma',
+        type: 'boost',
+        targetId: 'darna-2',
+        targetLabel: 'Annonce Premium',
+        optionId: 'premium',
+        amount: 49,
+        currency: 'MAD',
+        status: 'echoue',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: 'CMI Test',
+        createdAt: '2026-05-04T10:10:00Z'
+      },
+      {
+        id: 'tx-4',
+        idempotencyKey: 'k4',
+        userId: 'u3',
+        userName: 'Agence Sud',
+        userEmail: 'sud@ma.ma',
+        type: 'subscription',
+        targetId: 'starter',
+        targetLabel: 'Abonnement Agence Starter',
+        optionId: 'starter',
+        amount: 199,
+        currency: 'MAD',
+        status: 'rembourse',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: 'CMI Test',
+        createdAt: '2026-05-04T10:15:00Z'
+      }
+    ];
+
+    const summary = calculateRevenueSummary(txs);
+    assert.equal(summary.subscriptionRevenue, 499);
+    assert.equal(summary.boostRevenue, 99);
+    assert.equal(summary.totalNetRevenue, 598);
+    assert.equal(summary.refundedTotal, 199);
+    assert.equal(summary.paidTransactionsCount, 2);
+    assert.equal(summary.failedTransactionsCount, 1);
+    assert.equal(summary.refundedTransactionsCount, 1);
+  });
+
+  it('enforces subscription plan maxListings quota accurately', () => {
+    const user: User = {
+      id: 'u-test',
+      name: 'Particulier Test',
+      email: 'test@darna.ma',
+      phone: '0661000000',
+      role: 'particulier',
+      subscription: {
+        planId: 'particulier',
+        planName: 'Particulier',
+        status: 'active',
+        maxListings: 2,
+        startedAt: '2026-01-01T00:00:00Z',
+        expiresAt: '2027-01-01T00:00:00Z'
+      },
+      createdAt: '2026-01-01'
+    };
+
+    const twoListings = [
+      { id: 'l1', userId: 'u-test', status: 'publiee' },
+      { id: 'l2', userId: 'u-test', status: 'en_attente' }
+    ] as Listing[];
+
+    const quotaReached = getUserListingQuota(user, twoListings, INITIAL_SUBSCRIPTION_PLANS);
+    assert.equal(quotaReached.usedListings, 2);
+    assert.equal(quotaReached.maxListings, 2);
+    assert.equal(quotaReached.canPublish, false);
+  });
 });
+

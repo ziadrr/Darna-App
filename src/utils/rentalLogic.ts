@@ -1,4 +1,13 @@
-import { Listing, ListingFilter, PropertyCategory, ListingContact } from '../types';
+import {
+  Listing,
+  ListingFilter,
+  ListingContact,
+  CityData,
+  PaymentTransaction,
+  RevenueSummary,
+  SubscriptionPlan,
+  User
+} from '../types';
 
 /**
  * Format price in Moroccan Dirhams (MAD)
@@ -264,6 +273,20 @@ export function filterAndSortListings(listings: Listing[], filters: ListingFilte
     })
     .sort((a, b) => {
       switch (filters.sortBy) {
+        case 'nearest': {
+          if (filters.userLat !== undefined && filters.userLng !== undefined) {
+            const distA =
+              a.latitude && a.longitude
+                ? calculateDistanceKm(filters.userLat, filters.userLng, a.latitude, a.longitude)
+                : 9999;
+            const distB =
+              b.latitude && b.longitude
+                ? calculateDistanceKm(filters.userLat, filters.userLng, b.latitude, b.longitude)
+                : 9999;
+            return distA - distB;
+          }
+          return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        }
         case 'price_asc':
           return a.price - b.price;
         case 'price_desc':
@@ -271,10 +294,180 @@ export function filterAndSortListings(listings: Listing[], filters: ListingFilte
         case 'surface_desc':
           return b.surface - a.surface;
         case 'recent':
-        default:
+        default: {
+          const boostDiff = getBoostPriorityWeight(b) - getBoostPriorityWeight(a);
+          if (boostDiff !== 0) return boostDiff;
           return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        }
       }
     });
+}
+
+/**
+ * Check if a listing has an active, non-expired paid boost
+ */
+export function isListingBoostActive(listing: Listing, nowMs: number = Date.now()): boolean {
+  if (!listing.boost || listing.boost.status !== 'active') return false;
+  const expiresMs = new Date(listing.boost.expiresAt).getTime();
+  return !isNaN(expiresMs) && expiresMs > nowMs;
+}
+
+/**
+ * Priority weight for active boosted listings:
+ * homepage (3) > top (2) > premium (1) > none (0)
+ */
+export function getBoostPriorityWeight(listing: Listing, nowMs: number = Date.now()): number {
+  if (!isListingBoostActive(listing, nowMs)) return 0;
+  switch (listing.boost?.optionId) {
+    case 'homepage':
+      return 3;
+    case 'top':
+      return 2;
+    case 'premium':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Calculate real-time revenue breakdown from confirmed transactions only.
+ * Failed ('echoue'), pending ('en_attente'), and refunded ('rembourse') transactions
+ * do NOT count toward net revenues.
+ */
+export function calculateRevenueSummary(transactions: PaymentTransaction[]): RevenueSummary {
+  let subscriptionRevenue = 0;
+  let boostRevenue = 0;
+  let refundedTotal = 0;
+  let paidTransactionsCount = 0;
+  let failedTransactionsCount = 0;
+  let refundedTransactionsCount = 0;
+
+  for (const tx of transactions) {
+    if (tx.status === 'paye') {
+      paidTransactionsCount += 1;
+      if (tx.type === 'subscription') {
+        subscriptionRevenue += tx.amount;
+      } else if (tx.type === 'boost') {
+        boostRevenue += tx.amount;
+      }
+    } else if (tx.status === 'echoue') {
+      failedTransactionsCount += 1;
+    } else if (tx.status === 'rembourse') {
+      refundedTransactionsCount += 1;
+      refundedTotal += tx.amount;
+    }
+  }
+
+  return {
+    subscriptionRevenue,
+    boostRevenue,
+    totalNetRevenue: subscriptionRevenue + boostRevenue,
+    refundedTotal,
+    paidTransactionsCount,
+    failedTransactionsCount,
+    refundedTransactionsCount,
+  };
+}
+
+/**
+ * Calculate user's active subscription plan limits and current listing usage
+ */
+export function getUserListingQuota(
+  user: User | null,
+  allListings: Listing[],
+  plans: SubscriptionPlan[]
+): {
+  planId: string;
+  planName: string;
+  maxListings: number;
+  usedListings: number;
+  remainingListings: number;
+  canPublish: boolean;
+} {
+  if (!user) {
+    return {
+      planId: 'particulier',
+      planName: 'Particulier',
+      maxListings: 3,
+      usedListings: 0,
+      remainingListings: 3,
+      canPublish: false,
+    };
+  }
+
+  const activeSub =
+    user.subscription && user.subscription.status === 'active' ? user.subscription : null;
+  const matchedPlan =
+    plans.find((p) => p.id === (activeSub?.planId || 'particulier')) || plans[0];
+
+  const maxListings =
+    user.role === 'admin'
+      ? 999
+      : activeSub?.maxListings ?? matchedPlan?.maxListings ?? 3;
+  const planName = activeSub?.planName || matchedPlan?.name || 'Particulier';
+  const planId = activeSub?.planId || matchedPlan?.id || 'particulier';
+
+  const usedListings = allListings.filter(
+    (l) =>
+      l.userId === user.id &&
+      (l.status === 'publiee' || l.status === 'en_attente' || l.status === 'brouillon')
+  ).length;
+
+  const remainingListings = Math.max(0, maxListings - usedListings);
+
+  return {
+    planId,
+    planName,
+    maxListings,
+    usedListings,
+    remainingListings,
+    canPublish: usedListings < maxListings,
+  };
+}
+
+/**
+ * Calculate Haversine distance in kilometers between two GPS coordinates
+ */
+export function calculateDistanceKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371; // Earth radius in km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c * 10) / 10;
+}
+
+/**
+ * Find the closest Moroccan city to the given GPS / Wi-Fi coordinates
+ */
+export function findNearestMoroccanCity(
+  lat: number,
+  lon: number,
+  cities: CityData[]
+): { city: CityData; distanceKm: number } {
+  let closest = cities[0];
+  let minDistance = Infinity;
+
+  for (const c of cities) {
+    const dist = calculateDistanceKm(lat, lon, c.lat, c.lng);
+    if (dist < minDistance) {
+      minDistance = dist;
+      closest = c;
+    }
+  }
+
+  return { city: closest, distanceKm: minDistance };
 }
 
 /**

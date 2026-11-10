@@ -1,13 +1,14 @@
 import React from 'react';
 import { Heart, MapPin, Bed, Bath, Maximize2, Building, Sparkles } from 'lucide-react';
 import { Listing } from '../types';
-import { formatMAD } from '../utils/rentalLogic';
+import { formatMAD, calculateDistanceKm, isListingBoostActive } from '../utils/rentalLogic';
 
 interface ListingCardProps {
   listing: Listing;
   isFavorite: boolean;
   onToggleFavorite: (id: string, e: React.MouseEvent) => void;
   onClick: () => void;
+  userLocation?: { lat: number; lng: number; city?: string } | null;
 }
 
 export const ListingCard: React.FC<ListingCardProps> = ({
@@ -15,15 +16,22 @@ export const ListingCard: React.FC<ListingCardProps> = ({
   isFavorite,
   onToggleFavorite,
   onClick,
+  userLocation,
 }) => {
   const primaryImage =
     listing.images?.[0] ||
     'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=800&q=80';
 
+  const isSponsored = isListingBoostActive(listing);
+
   return (
     <div
       onClick={onClick}
-      className="group bg-white rounded-2xl overflow-hidden border border-stone-200/90 hover:border-[#C15C3D]/40 shadow-xs hover:shadow-xl transition-all duration-300 flex flex-col cursor-pointer hover:-translate-y-1"
+      className={`group bg-white rounded-2xl overflow-hidden border transition-all duration-300 flex flex-col cursor-pointer hover:-translate-y-1 ${
+        isSponsored
+          ? 'border-amber-400/90 ring-1 ring-amber-400/50 shadow-md hover:shadow-xl'
+          : 'border-stone-200/90 hover:border-[#C15C3D]/40 shadow-xs hover:shadow-xl'
+      }`}
     >
       {/* Image container */}
       <div className="relative aspect-[4/3] w-full overflow-hidden bg-stone-100">
@@ -39,6 +47,11 @@ export const ListingCard: React.FC<ListingCardProps> = ({
 
         {/* Top Badges */}
         <div className="absolute top-3 left-3 flex flex-wrap items-center gap-1.5 z-10 pr-10">
+          {isSponsored && (
+            <span className="text-[11px] font-extrabold px-2.5 py-1 rounded-full bg-amber-400 text-stone-950 shadow-sm flex items-center gap-1 border border-amber-300">
+              <Sparkles className="w-3 h-3 fill-current" /> Sponsorisé
+            </span>
+          )}
           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-white/95 backdrop-blur-md text-[#1E3D34] shadow-xs border border-stone-200/60 uppercase tracking-wider">
             {listing.category}
           </span>

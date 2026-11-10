@@ -5,14 +5,15 @@ import {
   MessageSquare,
   User as UserIcon,
   Plus,
-  Bell,
   MapPin,
   Building,
   Bot,
   Shield,
   Search,
   CheckCircle,
-  LogIn
+  LogIn,
+  Sparkles,
+  CreditCard
 } from 'lucide-react';
 import {
   Listing,
@@ -21,13 +22,26 @@ import {
   UserRole,
   Language,
   ListingReport,
-  PendingAction
+  PendingAction,
+  DetectedLocation,
+  SubscriptionPlan,
+  BoostOption,
+  PaymentTransaction
 } from './types';
-import { INITIAL_LISTINGS, INITIAL_USERS, INITIAL_REPORTS } from './data/mockListings';
+import {
+  INITIAL_LISTINGS,
+  INITIAL_USERS,
+  INITIAL_REPORTS,
+  INITIAL_SUBSCRIPTION_PLANS,
+  INITIAL_BOOST_OPTIONS
+} from './data/mockListings';
 import { MOROCCAN_CITIES } from './data/moroccoLocations';
 import {
   filterAndSortListings,
-  sanitizeListingForVisitor
+  sanitizeListingForVisitor,
+  findNearestMoroccanCity,
+  calculateDistanceKm,
+  getBoostPriorityWeight
 } from './utils/rentalLogic';
 import { TRANSLATIONS } from './data/translations';
 import { ListingCard } from './components/ListingCard';
@@ -41,15 +55,30 @@ import { ReportListingModal } from './components/ReportListingModal';
 import { FilterBar } from './components/FilterBar';
 import { MoroccoMap } from './components/MoroccoMap';
 import { AuthModal } from './components/AuthModal';
+import {
+  SubscriptionPlansView,
+  BoostListingModal,
+  PaymentCheckoutModal,
+  CheckoutTarget
+} from './components/MonetizationComponents';
 
 export default function App() {
   // Global Data State: Visitor default listings have all phone numbers/WhatsApp/emails stripped
   const [listings, setListings] = useState<Listing[]>(() =>
     INITIAL_LISTINGS.map(sanitizeListingForVisitor)
   );
-  const [users] = useState<User[]>(INITIAL_USERS);
+  const [users, setUsers] = useState<User[]>(INITIAL_USERS);
   const [reports, setReports] = useState<ListingReport[]>(INITIAL_REPORTS);
   const [favorites, setFavorites] = useState<string[]>([]);
+
+  // Monetization State (Plans, Boost Options, Transactions)
+  const [plans, setPlans] = useState<SubscriptionPlan[]>(INITIAL_SUBSCRIPTION_PLANS);
+  const [boostOptions, setBoostOptions] = useState<BoostOption[]>(INITIAL_BOOST_OPTIONS);
+  const [transactions, setTransactions] = useState<PaymentTransaction[]>([]);
+  const [myTransactions, setMyTransactions] = useState<PaymentTransaction[]>([]);
+  const [boostingListing, setBoostingListing] = useState<Listing | null>(null);
+  const [preselectedBoostOpt, setPreselectedBoostOpt] = useState<BoostOption | null>(null);
+  const [checkoutTarget, setCheckoutTarget] = useState<CheckoutTarget | null>(null);
 
   // Auth Session State: Visitor (null) by default
   const [authToken, setAuthToken] = useState<string | null>(() =>
@@ -61,12 +90,25 @@ export default function App() {
   const [authReasonMessage, setAuthReasonMessage] = useState<string | undefined>(undefined);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
 
+  // Automatic Wi-Fi / IP + GPS Geolocation State
+  const [userLocation, setUserLocation] = useState<DetectedLocation>({
+    city: 'Casablanca',
+    lat: 33.5731,
+    lng: -7.5898,
+    source: 'wifi_ip',
+    accuracyLabel: 'Ville détectée via connexion Wi-Fi / Réseau',
+  });
+  const [, setIsLocatingGps] = useState(false);
+  const [homeProximityMode] = useState<'city' | 'nearest' | 'all'>('city');
+
   // Language & RTL State
   const [lang, setLang] = useState<Language>('fr');
   const t = TRANSLATIONS[lang] || TRANSLATIONS.fr;
 
   // Navigation / View State
-  const [currentView, setCurrentView] = useState<'home' | 'search' | 'admin' | 'favorites'>('home');
+  const [currentView, setCurrentView] = useState<
+    'home' | 'search' | 'pricing' | 'admin' | 'favorites'
+  >('home');
   const [viewMode, setViewMode] = useState<'list' | 'map'>('list');
   const [isFilterDrawerOpen, setIsFilterDrawerOpen] = useState(false);
 
@@ -77,6 +119,8 @@ export default function App() {
     district: undefined,
     priceMax: 50000,
     sortBy: 'recent',
+    userLat: 33.5731,
+    userLng: -7.5898,
   });
 
   // Modal Dialogs State
@@ -99,6 +143,150 @@ export default function App() {
     document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
     document.documentElement.lang = lang;
   }, [lang]);
+
+  // Apply detected coordinates and find closest Moroccan city
+  const applyCoordinates = useCallback(
+    (lat: number, lng: number, source: 'gps' | 'wifi_ip' | 'manual', customCityName?: string) => {
+      const nearest = findNearestMoroccanCity(lat, lng, MOROCCAN_CITIES);
+      const matchedCity = customCityName || nearest.city.name;
+      const accuracyLabel =
+        source === 'gps'
+          ? `Position GPS précise (${matchedCity})`
+          : source === 'manual'
+          ? `Ville sélectionnée : ${matchedCity}`
+          : `Ville détectée via Wi-Fi / Réseau (${matchedCity})`;
+
+      setUserLocation({
+        city: matchedCity,
+        lat,
+        lng,
+        source,
+        accuracyLabel,
+      });
+      setFilters((prev) => ({
+        ...prev,
+        userLat: lat,
+        userLng: lng,
+      }));
+    },
+    []
+  );
+
+  // Request precise browser GPS / Wi-Fi triangulation
+  const requestGpsLocation = useCallback(
+    (silent: boolean = false) => {
+      if (!('geolocation' in navigator)) {
+        if (!silent) {
+          showToast('La géolocalisation GPS n’est pas disponible sur cet appareil.');
+        }
+        return;
+      }
+      setIsLocatingGps(true);
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setIsLocatingGps(false);
+          const { latitude, longitude } = pos.coords;
+          const nearest = findNearestMoroccanCity(latitude, longitude, MOROCCAN_CITIES);
+          // If the user is physically outside Morocco (>800 km away), keep coordinates for distance or snap to closest Moroccan city
+          if (nearest.distanceKm <= 800) {
+            applyCoordinates(latitude, longitude, 'gps', nearest.city.name);
+            if (!silent) {
+              showToast(`Position GPS activée : annonces autour de ${nearest.city.name} affichées.`);
+            }
+          } else {
+            // User testing from abroad: use closest Moroccan hub (or keep their GPS if they want)
+            applyCoordinates(nearest.city.lat, nearest.city.lng, 'gps', nearest.city.name);
+            if (!silent) {
+              showToast(`Localisation activée : rattachée à ${nearest.city.name} (Maroc).`);
+            }
+          }
+        },
+        () => {
+          setIsLocatingGps(false);
+          if (!silent) {
+            showToast(
+              `Localisation par Wi-Fi/Réseau maintenue (${userLocation.city}).`
+            );
+          }
+        },
+        { enableHighAccuracy: true, timeout: 6000, maximumAge: 60000 }
+      );
+    },
+    [applyCoordinates, showToast, userLocation.city]
+  );
+
+  // Automatic location detection on app entry:
+  // 1) Instant Wi-Fi / IP city detection via /api/locate-ip
+  // 2) Silent automatic GPS/Wi-Fi triangulation via navigator.geolocation
+  useEffect(() => {
+    let mounted = true;
+    fetch('/api/locate-ip')
+      .then((res) => res.json())
+      .then((data) => {
+        if (mounted && data.success && data.lat && data.lng) {
+          const nearest = findNearestMoroccanCity(data.lat, data.lng, MOROCCAN_CITIES);
+          const city = nearest.distanceKm <= 800 ? nearest.city.name : 'Casablanca';
+          const lat = nearest.distanceKm <= 800 ? data.lat : 33.5731;
+          const lng = nearest.distanceKm <= 800 ? data.lng : -7.5898;
+          applyCoordinates(lat, lng, 'wifi_ip', city);
+        }
+      })
+      .catch(() => {});
+
+    // Also trigger silent browser Wi-Fi/GPS positioning on entry
+    requestGpsLocation(true);
+
+    return () => {
+      mounted = false;
+    };
+  }, [applyCoordinates, requestGpsLocation]);
+
+  // Fetch monetization config (plans & boost options)
+  const fetchMonetizationConfig = useCallback(async () => {
+    try {
+      const res = await fetch('/api/monetization/config');
+      const data = await res.json();
+      if (data.success) {
+        if (Array.isArray(data.plans)) setPlans(data.plans);
+        if (Array.isArray(data.boostOptions)) setBoostOptions(data.boostOptions);
+      }
+    } catch (err) {
+      console.warn('Fallback to default monetization config:', err);
+    }
+  }, []);
+
+  // Fetch user's payment history and admin monetization data
+  const fetchPaymentData = useCallback(async (token?: string | null) => {
+    if (!token) {
+      setMyTransactions([]);
+      return;
+    }
+    try {
+      const myRes = await fetch('/api/payments/my', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const myData = await myRes.json();
+      if (myData.success && Array.isArray(myData.transactions)) {
+        setMyTransactions(myData.transactions);
+      }
+
+      const admRes = await fetch('/api/admin/monetization', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const admData = await admRes.json();
+      if (admData.success) {
+        if (Array.isArray(admData.transactions)) setTransactions(admData.transactions);
+        if (Array.isArray(admData.plans)) setPlans(admData.plans);
+        if (Array.isArray(admData.boostOptions)) setBoostOptions(admData.boostOptions);
+      }
+    } catch (err) {
+      console.warn('Error fetching payment data:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMonetizationConfig();
+  }, [fetchMonetizationConfig]);
 
   // Fetch listings (sanitized by server based on authToken)
   const fetchListings = useCallback(async (token?: string | null) => {
@@ -131,6 +319,7 @@ export default function App() {
             setCurrentUser(data.user);
             setFavorites(data.user.favorites || []);
             fetchListings(authToken);
+            fetchPaymentData(authToken);
           } else {
             localStorage.removeItem('darna_token');
             setAuthToken(null);
@@ -144,7 +333,7 @@ export default function App() {
     } else {
       fetchListings(null);
     }
-  }, [authToken, fetchListings]);
+  }, [authToken, fetchListings, fetchPaymentData]);
 
   // Open listing from URL query parameter ?annonce=id if present
   useEffect(() => {
@@ -183,6 +372,7 @@ export default function App() {
     setIsAuthModalOpen(false);
 
     const updatedListings = await fetchListings(token);
+    await fetchPaymentData(token);
 
     if (pendingAction) {
       if (pendingAction.type === 'post_ad') {
@@ -206,6 +396,24 @@ export default function App() {
           body: JSON.stringify({ listingId: id }),
         }).catch(() => {});
         showToast('Annonce enregistrée dans vos favoris !');
+      } else if (pendingAction.type === 'subscribe') {
+        const plan = plans.find((p) => p.id === pendingAction.planId);
+        if (plan && plan.price !== null) {
+          setCheckoutTarget({
+            type: 'subscription',
+            optionId: plan.id,
+            targetId: plan.id,
+            title: `Abonnement ${plan.name}`,
+            subtitle: `Jusqu’à ${plan.maxListings} annonces actives / ${plan.period}`,
+            amount: plan.price,
+          });
+        }
+      } else if (pendingAction.type === 'boost') {
+        const target =
+          (updatedListings || listings).find((l) => l.id === pendingAction.listingId) || null;
+        if (target) {
+          setBoostingListing(target);
+        }
       }
       setPendingAction(null);
     } else {
@@ -224,21 +432,61 @@ export default function App() {
     setAuthToken(null);
     setCurrentUser(null);
     setFavorites([]);
+    setMyTransactions([]);
     setIsProfileModalOpen(false);
     if (currentView === 'admin') setCurrentView('home');
     await fetchListings(null);
     showToast('Vous êtes déconnecté.');
   };
 
-  // Filtered Listings
+  // Filtered Listings for Search view
   const filteredListings = useMemo(() => {
-    return filterAndSortListings(listings, filters);
-  }, [listings, filters]);
+    return filterAndSortListings(listings, {
+      ...filters,
+      userLat: userLocation.lat,
+      userLng: userLocation.lng,
+    });
+  }, [listings, filters, userLocation.lat, userLocation.lng]);
 
-  // Featured / Recent Listings for Home View
-  const recentListings = useMemo(() => {
-    return listings.filter((l) => l.status === 'publiee').slice(0, 6);
-  }, [listings]);
+  // Smart Geolocation + Homepage Sponsored Listings for Home View
+  const homeDisplayedListings = useMemo(() => {
+    const published = listings.filter((l) => l.status === 'publiee');
+    const sortWithSponsoredAndProximity = (arr: Listing[]) =>
+      [...arr].sort((a, b) => {
+        const boostDiff = getBoostPriorityWeight(b) - getBoostPriorityWeight(a);
+        if (boostDiff !== 0) return boostDiff;
+        return (
+          calculateDistanceKm(userLocation.lat, userLocation.lng, a.latitude, a.longitude) -
+          calculateDistanceKm(userLocation.lat, userLocation.lng, b.latitude, b.longitude)
+        );
+      });
+
+    if (homeProximityMode === 'city') {
+      // Homepage-sponsored listings appear first, followed by same-city listings, then nearest
+      const homepageBoosted = published.filter(
+        (l) => getBoostPriorityWeight(l) >= 3
+      );
+      const inCity = sortWithSponsoredAndProximity(
+        published.filter(
+          (l) =>
+            l.city.toLowerCase() === userLocation.city.toLowerCase() &&
+            !homepageBoosted.some((hb) => hb.id === l.id)
+        )
+      );
+      const othersSortedByDist = sortWithSponsoredAndProximity(
+        published.filter(
+          (l) =>
+            l.city.toLowerCase() !== userLocation.city.toLowerCase() &&
+            !homepageBoosted.some((hb) => hb.id === l.id)
+        )
+      );
+      return [...homepageBoosted, ...inCity, ...othersSortedByDist].slice(0, 6);
+    }
+    if (homeProximityMode === 'nearest') {
+      return sortWithSponsoredAndProximity(published).slice(0, 6);
+    }
+    return published.slice(0, 6);
+  }, [listings, homeProximityMode, userLocation.city, userLocation.lat, userLocation.lng]);
 
   // Favorites Listings List
   const favoriteListingsList = useMemo(() => {
@@ -274,7 +522,7 @@ export default function App() {
     if (!currentUser) {
       requireAuth(
         { type: 'post_ad' },
-        'Un compte vérifié est requis pour publier et gérer vos annonces immobilières.'
+        'Un compte est requis pour publier et gérer vos annonces immobilières.'
       );
       return;
     }
@@ -315,7 +563,18 @@ export default function App() {
           body: JSON.stringify(listingData),
         });
         const data = await res.json();
-        if (data.success && data.listing) {
+        if (!res.ok || !data.success) {
+          showToast(
+            data.message ||
+              'Impossible de publier l’annonce. Vérifiez la limite de votre abonnement.'
+          );
+          if (data.code === 'QUOTA_EXCEEDED') {
+            setIsPostWizardOpen(false);
+            setCurrentView('pricing');
+          }
+          return;
+        }
+        if (data.listing) {
           setListings((prev) => [data.listing, ...prev]);
           showToast('Votre annonce a été publiée avec succès !');
         }
@@ -474,6 +733,154 @@ export default function App() {
     if (newRole === 'admin') {
       setCurrentView('admin');
       setIsProfileModalOpen(false);
+      fetchPaymentData(authToken);
+    }
+  };
+
+  // Monetization & Payment Handlers
+  const handleSelectSubscriptionPlan = (plan: SubscriptionPlan) => {
+    if (!currentUser) {
+      requireAuth(
+        { type: 'subscribe', planId: plan.id },
+        `Connectez-vous ou créez un compte pour souscrire à l'offre « ${plan.name} ».`
+      );
+      return;
+    }
+    if (plan.price === null || plan.isCustomQuote) return;
+    setCheckoutTarget({
+      type: 'subscription',
+      optionId: plan.id,
+      targetId: plan.id,
+      title: `Abonnement ${plan.name}`,
+      subtitle: `Jusqu’à ${plan.maxListings} annonces actives / ${plan.period}`,
+      amount: plan.price,
+    });
+  };
+
+  const handleOpenBoostForListing = (listing: Listing, preselected?: BoostOption) => {
+    if (!currentUser) {
+      requireAuth(
+        { type: 'boost', listingId: listing.id, optionId: preselected?.id },
+        'Connectez-vous pour mettre en avant votre annonce.'
+      );
+      return;
+    }
+    setPreselectedBoostOpt(preselected || null);
+    setBoostingListing(listing);
+  };
+
+  const handleProceedBoostToCheckout = (listing: Listing, option: BoostOption) => {
+    setBoostingListing(null);
+    setCheckoutTarget({
+      type: 'boost',
+      optionId: option.id,
+      targetId: listing.id,
+      title: option.name,
+      subtitle: `Annonce : ${listing.title} (${option.durationDays} jours)`,
+      amount: option.price,
+    });
+  };
+
+  const handlePaymentConfirmed = async (data: {
+    transaction: PaymentTransaction;
+    user?: User;
+    listing?: Listing;
+    message: string;
+  }) => {
+    if (data.user) {
+      setCurrentUser(data.user);
+      setUsers((prev) => prev.map((u) => (u.id === data.user!.id ? data.user! : u)));
+    }
+    if (data.listing) {
+      setListings((prev) => prev.map((l) => (l.id === data.listing!.id ? data.listing! : l)));
+    }
+    setTransactions((prev) => [data.transaction, ...prev]);
+    setMyTransactions((prev) => [data.transaction, ...prev]);
+    showToast(data.message);
+    await fetchPaymentData(authToken);
+  };
+
+  // Admin Monetization Handlers
+  const handleAdminUpdatePlan = async (planId: string, updated: Partial<SubscriptionPlan>) => {
+    try {
+      const res = await fetch(`/api/admin/plans/${planId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify(updated),
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.plans)) {
+        setPlans(data.plans);
+        showToast(`L'offre « ${data.plan.name} » a été mise à jour avec succès.`);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleAdminCreatePlan = async (newPlan: Partial<SubscriptionPlan>) => {
+    try {
+      const res = await fetch('/api/admin/plans', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify(newPlan),
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.plans)) {
+        setPlans(data.plans);
+        showToast(`Nouvelle offre « ${data.plan.name} » créée !`);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleAdminUpdateBoostOption = async (
+    boostId: string,
+    updated: Partial<BoostOption>
+  ) => {
+    try {
+      const res = await fetch(`/api/admin/boost-options/${boostId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify(updated),
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.boostOptions)) {
+        setBoostOptions(data.boostOptions);
+        showToast(`L'option « ${data.boostOption.name} » a été mise à jour.`);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleAdminRefundTransaction = async (txId: string) => {
+    try {
+      const res = await fetch(`/api/payments/${txId}/refund`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast(data.message || 'Transaction remboursée avec succès.');
+        await fetchListings(authToken);
+        await fetchPaymentData(authToken);
+      }
+    } catch (err) {
+      console.error(err);
     }
   };
 
@@ -507,7 +914,7 @@ export default function App() {
           </div>
 
           {/* Quick Search on Desktop / Tablet */}
-          <div className="hidden md:flex items-center gap-2 max-w-sm flex-1 mx-6">
+          <div className="hidden md:flex items-center gap-2 max-w-xs flex-1 mx-4">
             <div className="relative w-full">
               <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
@@ -524,9 +931,38 @@ export default function App() {
           </div>
 
           {/* Header Actions */}
-          <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-2 sm:gap-2.5">
+            {/* Tarifs & Abonnements Pro Link */}
+            <button
+              type="button"
+              onClick={() => setCurrentView('pricing')}
+              className={`px-3 py-2 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all border ${
+                currentView === 'pricing'
+                  ? 'bg-[#1E3D34] text-white border-[#1E3D34]'
+                  : 'bg-amber-50 hover:bg-amber-100 text-stone-900 border-amber-200'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5 text-[#C15C3D]" />
+              <span>Abonnements & Tarifs</span>
+            </button>
+
+            {currentUser?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={() => setCurrentView('admin')}
+                className={`hidden sm:flex px-3 py-2 rounded-full text-xs font-bold items-center gap-1.5 transition-all border ${
+                  currentView === 'admin'
+                    ? 'bg-stone-900 text-amber-300 border-stone-900'
+                    : 'bg-stone-100 hover:bg-stone-200 text-stone-800 border-stone-300'
+                }`}
+              >
+                <Shield className="w-3.5 h-3.5" />
+                <span>Admin</span>
+              </button>
+            )}
+
             {/* Language Switcher */}
-            <div className="flex items-center gap-1 text-xs font-semibold bg-stone-100 p-1 rounded-xl">
+            <div className="hidden lg:flex items-center gap-1 text-xs font-semibold bg-stone-100 p-1 rounded-xl">
               <button
                 onClick={() => setLang('fr')}
                 className={`px-2 py-1 rounded-lg transition-colors ${
@@ -604,7 +1040,7 @@ export default function App() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-7">
         {/* VIEW 1: HOME VIEW */}
         {currentView === 'home' && (
-          <div className="space-y-8 animate-fade-in">
+          <div className="space-y-7 animate-fade-in">
             {/* Hero Section */}
             <div className="pt-2 sm:pt-4 space-y-2">
               <h1 className="text-3xl sm:text-5xl font-serif-title font-bold text-[#1E3D34] tracking-tight max-w-xl leading-tight">
@@ -623,7 +1059,13 @@ export default function App() {
                 setCurrentView('search');
               }}
               onResetFilters={() =>
-                setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+                setFilters({
+                  category: 'all',
+                  priceMax: 50000,
+                  sortBy: 'recent',
+                  userLat: userLocation.lat,
+                  userLng: userLocation.lng,
+                })
               }
               viewMode={viewMode}
               onChangeViewMode={setViewMode}
@@ -632,7 +1074,7 @@ export default function App() {
               totalResultsCount={filteredListings.length}
             />
 
-            {/* Section "Annonces récentes" or Interactive Map on Home */}
+            {/* Section "Annonces récentes" (silently prioritized by user's city & proximity) or Interactive Map */}
             <div className="space-y-4 pt-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-xl sm:text-2xl font-bold text-stone-900">
@@ -666,23 +1108,12 @@ export default function App() {
                   listings={filteredListings}
                   selectedListing={selectedListing}
                   onSelectListing={(listing) => setSelectedListing(listing)}
-                  center={
-                    filters.city
-                      ? [
-                          MOROCCAN_CITIES.find(
-                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
-                          )?.lat || 32.2,
-                          MOROCCAN_CITIES.find(
-                            (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
-                          )?.lng || -6.8,
-                        ]
-                      : [32.2, -6.8]
-                  }
-                  zoom={filters.city ? 12 : 6}
+                  center={[userLocation.lat, userLocation.lng]}
+                  zoom={11}
                 />
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
-                  {recentListings.map((listing) => (
+                  {homeDisplayedListings.map((listing) => (
                     <ListingCard
                       key={listing.id}
                       listing={listing}
@@ -773,7 +1204,13 @@ export default function App() {
               filters={filters}
               onChangeFilters={setFilters}
               onResetFilters={() =>
-                setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+                setFilters({
+                  category: 'all',
+                  priceMax: 50000,
+                  sortBy: 'recent',
+                  userLat: userLocation.lat,
+                  userLng: userLocation.lng,
+                })
               }
               viewMode={viewMode}
               onChangeViewMode={setViewMode}
@@ -794,12 +1231,12 @@ export default function App() {
                       ? [
                           MOROCCAN_CITIES.find(
                             (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
-                          )?.lat || 31.7917,
+                          )?.lat || userLocation.lat,
                           MOROCCAN_CITIES.find(
                             (c) => c.name.toLowerCase() === filters.city?.toLowerCase()
-                          )?.lng || -7.0926,
+                          )?.lng || userLocation.lng,
                         ]
-                      : [31.7917, -7.0926]
+                      : [userLocation.lat, userLocation.lng]
                   }
                   zoom={filters.city ? 12 : 6}
                 />
@@ -815,7 +1252,13 @@ export default function App() {
                     </p>
                     <button
                       onClick={() =>
-                        setFilters({ category: 'all', priceMax: 50000, sortBy: 'recent' })
+                        setFilters({
+                          category: 'all',
+                          priceMax: 50000,
+                          sortBy: 'recent',
+                          userLat: userLocation.lat,
+                          userLng: userLocation.lng,
+                        })
                       }
                       className="px-4 py-2 bg-[#C15C3D] text-white rounded-xl text-xs font-bold hover:bg-[#a94f33]"
                     >
@@ -831,6 +1274,7 @@ export default function App() {
                         isFavorite={favorites.includes(listing.id)}
                         onToggleFavorite={handleToggleFavorite}
                         onClick={() => setSelectedListing(listing)}
+                        userLocation={userLocation}
                       />
                     ))}
                   </div>
@@ -903,11 +1347,31 @@ export default function App() {
                     isFavorite={true}
                     onToggleFavorite={handleToggleFavorite}
                     onClick={() => setSelectedListing(listing)}
+                    userLocation={userLocation}
                   />
                 ))}
               </div>
             )}
           </div>
+        )}
+
+        {/* VIEW 3.5: PRICING, PROFESSIONAL SUBSCRIPTIONS & PAID BOOSTS */}
+        {currentView === 'pricing' && (
+          <SubscriptionPlansView
+            plans={plans}
+            boostOptions={boostOptions}
+            currentUser={currentUser}
+            myListings={
+              currentUser ? listings.filter((l) => l.userId === currentUser.id) : []
+            }
+            onSelectPlan={handleSelectSubscriptionPlan}
+            onOpenBoostForListing={handleOpenBoostForListing}
+            onOpenAuth={() => {
+              setPendingAction(null);
+              setAuthInitialMode('login');
+              setIsAuthModalOpen(true);
+            }}
+          />
         )}
 
         {/* VIEW 4: ADMIN CONSOLE */}
@@ -916,9 +1380,16 @@ export default function App() {
             listings={listings}
             reports={reports}
             users={users}
+            plans={plans}
+            boostOptions={boostOptions}
+            transactions={transactions}
             onModerateListing={handleModerateListing}
             onResolveReport={handleResolveReport}
             onSelectListing={(listing) => setSelectedListing(listing)}
+            onUpdatePlan={handleAdminUpdatePlan}
+            onCreatePlan={handleAdminCreatePlan}
+            onUpdateBoostOption={handleAdminUpdateBoostOption}
+            onRefundTransaction={handleAdminRefundTransaction}
           />
         )}
       </main>
@@ -949,6 +1420,16 @@ export default function App() {
         >
           <Home className="w-5 h-5" />
           <span className="text-[10px]">{t.home}</span>
+        </button>
+
+        <button
+          onClick={() => setCurrentView('pricing')}
+          className={`flex flex-col items-center gap-1 transition-colors ${
+            currentView === 'pricing' ? 'text-[#1E3D34] font-bold' : 'text-stone-400'
+          }`}
+        >
+          <CreditCard className="w-5 h-5" />
+          <span className="text-[10px]">Offres Pro</span>
         </button>
 
         <button
@@ -986,17 +1467,6 @@ export default function App() {
       </nav>
 
       {/* ALL MODALS */}
-      <AuthModal
-        isOpen={isAuthModalOpen}
-        onClose={() => {
-          setIsAuthModalOpen(false);
-          setPendingAction(null);
-        }}
-        initialMode={authInitialMode}
-        reasonMessage={authReasonMessage}
-        onAuthSuccess={handleAuthSuccess}
-      />
-
       <ListingDetailModal
         listing={selectedListing}
         isOpen={!!selectedListing}
@@ -1016,6 +1486,10 @@ export default function App() {
         }
         allListings={listings}
         onSelectListing={(listing) => setSelectedListing(listing)}
+        onOpenBoostModal={(listing) => {
+          setSelectedListing(null);
+          handleOpenBoostForListing(listing);
+        }}
       />
 
       <PostListingWizard
@@ -1038,6 +1512,9 @@ export default function App() {
           currentUser={currentUser}
           onSwitchRole={handleSwitchUserRole}
           myListings={listings.filter((l) => l.userId === currentUser.id)}
+          allListings={listings}
+          plans={plans}
+          myTransactions={myTransactions}
           favoriteListings={favoriteListingsList}
           onOpenListing={(listing) => setSelectedListing(listing)}
           onOpenCreateAd={() => {
@@ -1048,12 +1525,37 @@ export default function App() {
             setEditingListing(listing);
             setIsPostWizardOpen(true);
           }}
+          onBoostListing={(listing) => {
+            setIsProfileModalOpen(false);
+            handleOpenBoostForListing(listing);
+          }}
+          onOpenPricingPage={() => setCurrentView('pricing')}
           onToggleListingStatus={handleToggleListingStatus}
           onDeleteListing={handleDeleteListing}
           onVerifyEmail={handleVerifyEmail}
           onLogout={handleLogout}
         />
       )}
+
+      <BoostListingModal
+        isOpen={!!boostingListing}
+        onClose={() => {
+          setBoostingListing(null);
+          setPreselectedBoostOpt(null);
+        }}
+        listing={boostingListing}
+        boostOptions={boostOptions}
+        initialOption={preselectedBoostOpt}
+        onProceedToCheckout={handleProceedBoostToCheckout}
+      />
+
+      <PaymentCheckoutModal
+        isOpen={!!checkoutTarget}
+        onClose={() => setCheckoutTarget(null)}
+        target={checkoutTarget}
+        authToken={authToken}
+        onPaymentConfirmed={handlePaymentConfirmed}
+      />
 
       <LegalAndCndpModal
         isOpen={isLegalModalOpen}
@@ -1065,6 +1567,17 @@ export default function App() {
         isOpen={!!reportingListing}
         onClose={() => setReportingListing(null)}
         onSubmitReport={handleSubmitReport}
+      />
+
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => {
+          setIsAuthModalOpen(false);
+          setPendingAction(null);
+        }}
+        initialMode={authInitialMode}
+        reasonMessage={authReasonMessage}
+        onAuthSuccess={handleAuthSuccess}
       />
     </div>
   );

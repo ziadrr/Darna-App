@@ -25,6 +25,80 @@ export type RentPeriod = 'mois' | 'jour' | 'an';
 
 export type UserRole = 'visiteur' | 'particulier' | 'professionnel' | 'admin';
 
+export type BoostOptionId = 'premium' | 'top' | 'homepage';
+
+export interface BoostOption {
+  id: BoostOptionId;
+  name: string;
+  description: string;
+  price: number; // MAD (e.g. 49, 99, 199)
+  durationDays: number;
+  badgeLabel: string; // "Sponsorisé"
+}
+
+export interface ListingBoost {
+  optionId: BoostOptionId;
+  optionName: string;
+  status: 'active' | 'expired' | 'revoked';
+  startedAt: string;
+  expiresAt: string;
+  transactionId: string;
+}
+
+export interface SubscriptionPlan {
+  id: string;
+  name: string;
+  price: number | null; // null = "Sur devis"
+  period: 'mois' | 'an';
+  maxListings: number;
+  features: string[];
+  isCustomQuote?: boolean;
+  popular?: boolean;
+}
+
+export interface UserSubscription {
+  planId: string;
+  planName: string;
+  status: 'active' | 'cancelled' | 'refunded';
+  maxListings: number;
+  startedAt: string;
+  expiresAt: string;
+  transactionId?: string;
+}
+
+export type PaymentStatus = 'en_attente' | 'paye' | 'echoue' | 'rembourse';
+
+export interface PaymentTransaction {
+  id: string;
+  idempotencyKey: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  type: 'subscription' | 'boost';
+  targetId: string; // planId or listingId
+  targetLabel: string;
+  optionId: string; // planId or boostOptionId
+  amount: number; // in MAD
+  currency: 'MAD';
+  status: PaymentStatus;
+  provider: 'test_cmi_sandbox';
+  paymentMethodLabel: string; // never stores full card numbers
+  failureReason?: string;
+  createdAt: string;
+  confirmedAt?: string;
+  refundedAt?: string;
+}
+
+export interface RevenueSummary {
+  subscriptionRevenue: number;
+  boostRevenue: number;
+  totalNetRevenue: number;
+  refundedTotal: number;
+  paidTransactionsCount: number;
+  failedTransactionsCount: number;
+  refundedTransactionsCount: number;
+}
+
 export interface User {
   id: string;
   firstName?: string;
@@ -40,6 +114,7 @@ export interface User {
   verified?: boolean;
   emailVerified?: boolean;
   favorites?: string[];
+  subscription?: UserSubscription;
   createdAt: string;
 }
 
@@ -92,6 +167,7 @@ export interface Listing {
   legalConsentAccepted: boolean;
   isDemo?: boolean;
   flaggedForContactInText?: boolean;
+  boost?: ListingBoost;
 }
 
 export interface ListingFilter {
@@ -107,7 +183,17 @@ export interface ListingFilter {
   furnished?: boolean | 'all';
   advertiserType?: AdvertiserType | 'all';
   amenities?: string[];
-  sortBy?: 'recent' | 'price_asc' | 'price_desc' | 'surface_desc';
+  sortBy?: 'recent' | 'price_asc' | 'price_desc' | 'surface_desc' | 'nearest';
+  userLat?: number;
+  userLng?: number;
+}
+
+export interface DetectedLocation {
+  city: string;
+  lat: number;
+  lng: number;
+  source: 'gps' | 'wifi_ip' | 'manual';
+  accuracyLabel: string;
 }
 
 export interface ListingReport {
@@ -146,4 +232,7 @@ export type PendingAction =
   | { type: 'contact'; listingId: string }
   | { type: 'favorite'; listingId: string }
   | { type: 'post_ad' }
+  | { type: 'subscribe'; planId: string }
+  | { type: 'boost'; listingId: string; optionId?: BoostOptionId }
   | null;
+

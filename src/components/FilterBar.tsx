@@ -8,7 +8,8 @@ import {
   List,
   X,
   ArrowUpDown,
-  Check
+  Check,
+  LocateFixed
 } from 'lucide-react';
 import { ListingFilter } from '../types';
 import { MOROCCAN_CITIES, CATEGORIES_CONFIG, AVAILABLE_AMENITIES } from '../data/moroccoLocations';
@@ -22,6 +23,8 @@ interface FilterBarProps {
   isFilterDrawerOpen: boolean;
   onToggleFilterDrawer: () => void;
   totalResultsCount: number;
+  onRequestGpsLocation?: () => void;
+  isLocatingGps?: boolean;
 }
 
 const CATEGORY_ICONS: Record<string, string> = {
@@ -47,6 +50,8 @@ export const FilterBar: React.FC<FilterBarProps> = ({
   isFilterDrawerOpen,
   onToggleFilterDrawer,
   totalResultsCount,
+  onRequestGpsLocation,
+  isLocatingGps,
 }) => {
   const currentCity = MOROCCAN_CITIES.find(
     (c) => c.name.toLowerCase() === (filters.city || '').toLowerCase()
@@ -77,7 +82,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
     <div className="space-y-4">
       {/* Main Search Input Bar */}
       <div className="bg-white p-2.5 sm:p-3 rounded-3xl shadow-sm border border-stone-200/90 flex flex-wrap sm:flex-nowrap items-center gap-2">
-        <div className="flex-1 min-w-[200px] flex items-center gap-2.5 px-3">
+        <div className="flex-1 min-w-[180px] flex items-center gap-2.5 px-3">
           <Search className="w-5 h-5 text-stone-400 shrink-0" />
           <input
             type="text"
@@ -97,6 +102,22 @@ export const FilterBar: React.FC<FilterBarProps> = ({
           )}
         </div>
 
+        {/* Button "Autour de moi" */}
+        {onRequestGpsLocation && (
+          <button
+            type="button"
+            onClick={onRequestGpsLocation}
+            disabled={isLocatingGps}
+            className="px-3 py-2 rounded-2xl bg-emerald-50 hover:bg-emerald-100 text-[#1E3D34] border border-emerald-200 text-xs font-bold flex items-center gap-1.5 transition-all shrink-0"
+            title="Détecter ma position exacte pour afficher les annonces les plus proches"
+          >
+            <LocateFixed className={`w-3.5 h-3.5 text-[#C15C3D] ${isLocatingGps ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">
+              {isLocatingGps ? 'Localisation...' : 'Autour de moi'}
+            </span>
+          </button>
+        )}
+
         {/* Quick Sort Selector */}
         <div className="hidden md:flex items-center gap-1.5 px-3 py-2 rounded-2xl bg-stone-50 border border-stone-200 text-xs text-stone-700">
           <ArrowUpDown className="w-3.5 h-3.5 text-stone-400" />
@@ -107,6 +128,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
             aria-label="Trier les annonces"
           >
             <option value="recent">Plus récentes</option>
+            <option value="nearest">Plus proches de moi</option>
             <option value="price_asc">Prix croissant</option>
             <option value="price_desc">Prix décroissant</option>
             <option value="surface_desc">Grande superficie</option>
@@ -122,7 +144,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
           <SlidersHorizontal className="w-4 h-4 sm:w-5 sm:h-5" />
           <span className="text-xs font-bold sm:hidden">Filtres</span>
           {activeFiltersCount > 0 && (
-            <span className=" -top-1.5 -right-1.5 sm:absolute w-5 h-5 rounded-full bg-stone-900 text-white text-[10px] font-bold flex items-center justify-center border-2 border-white">
+            <span className="-top-1.5 -right-1.5 sm:absolute w-5 h-5 rounded-full bg-stone-900 text-white text-[10px] font-bold flex items-center justify-center border-2 border-white">
               {activeFiltersCount}
             </span>
           )}
@@ -384,6 +406,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
                 className="w-full text-xs px-3 py-2.5 rounded-xl border border-stone-200 bg-stone-50 focus:outline-none focus:ring-1 focus:ring-[#C15C3D]"
               >
                 <option value="recent">Plus récentes d'abord</option>
+                <option value="nearest">Proximité (les plus proches de moi)</option>
                 <option value="price_asc">Prix : du moins cher au plus cher</option>
                 <option value="price_desc">Prix : du plus cher au moins cher</option>
                 <option value="surface_desc">Superficie : de la plus grande à la plus petite</option>

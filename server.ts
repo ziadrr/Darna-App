@@ -4,12 +4,28 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
-import { INITIAL_LISTINGS, INITIAL_USERS, INITIAL_REPORTS } from './src/data/mockListings.ts';
-import { Listing, ListingReport, User } from './src/types/index.ts';
+import {
+  INITIAL_LISTINGS,
+  INITIAL_USERS,
+  INITIAL_REPORTS,
+  INITIAL_SUBSCRIPTION_PLANS,
+  INITIAL_BOOST_OPTIONS
+} from './src/data/mockListings.ts';
+import {
+  Listing,
+  ListingReport,
+  User,
+  SubscriptionPlan,
+  BoostOption,
+  PaymentTransaction,
+  BoostOptionId
+} from './src/types/index.ts';
 import {
   sanitizeListingForVisitor,
   sanitizeListingForPublic,
-  detectContactInPublicText
+  detectContactInPublicText,
+  calculateRevenueSummary,
+  getUserListingQuota
 } from './src/utils/rentalLogic.ts';
 
 dotenv.config();
@@ -34,6 +50,11 @@ const ai = new GoogleGenAI({
 let dbListings: Listing[] = [...INITIAL_LISTINGS];
 let dbUsers: User[] = [...INITIAL_USERS];
 let dbReports: ListingReport[] = [...INITIAL_REPORTS];
+let dbPlans: SubscriptionPlan[] = [...INITIAL_SUBSCRIPTION_PLANS];
+let dbBoostOptions: BoostOption[] = [...INITIAL_BOOST_OPTIONS];
+// Strictly empty initial transactions: no fake payments or fake revenues
+let dbTransactions: PaymentTransaction[] = [];
+
 const dbPasswords = new Map<string, string>([
   ['karim.bennani@gmail.com', 'Darna2026!'],
   ['contact@atlasprestige.ma', 'Darna2026!'],
@@ -97,6 +118,10 @@ async function startServer() {
     }
 
     const role = advertiserType === 'professionnel' ? 'professionnel' : 'particulier';
+    const defaultPlan = dbPlans.find((p) => p.id === 'particulier') || dbPlans[0];
+    const nowIso = new Date().toISOString();
+    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
     const newUser: User = {
       id: `user-${Date.now()}`,
       firstName: String(firstName).trim(),
@@ -109,7 +134,15 @@ async function startServer() {
       verified: false,
       emailVerified: false,
       favorites: [],
-      createdAt: new Date().toISOString().split('T')[0],
+      subscription: {
+        planId: defaultPlan.id,
+        planName: defaultPlan.name,
+        status: 'active',
+        maxListings: defaultPlan.maxListings,
+        startedAt: nowIso,
+        expiresAt: nextYearIso,
+      },
+      createdAt: nowIso.split('T')[0],
     };
 
     dbUsers.push(newUser);
@@ -223,6 +256,46 @@ async function startServer() {
     res.json({ success: true, favorites: viewer.favorites });
   });
 
+  // Automatic Wi-Fi / IP Network Geolocation Endpoint
+  app.get('/api/locate-ip', async (req, res) => {
+    try {
+      // Check Cloud Run / Proxy geolocation headers first
+      const gcpCity = req.headers['x-appengine-city'] as string | undefined;
+      const gcpLatLong = req.headers['x-appengine-citylatlong'] as string | undefined;
+      if (gcpLatLong && gcpLatLong.includes(',')) {
+        const [latStr, lngStr] = gcpLatLong.split(',');
+        const lat = parseFloat(latStr);
+        const lng = parseFloat(lngStr);
+        if (!isNaN(lat) && !isNaN(lng)) {
+          return res.json({
+            success: true,
+            city: gcpCity ? gcpCity.charAt(0).toUpperCase() + gcpCity.slice(1) : 'Casablanca',
+            lat,
+            lng,
+            source: 'wifi_ip',
+          });
+        }
+      }
+
+      // Default Moroccan hub coordinates (Casablanca Maârif) when behind local/cloud proxy
+      res.json({
+        success: true,
+        city: 'Casablanca',
+        lat: 33.5731,
+        lng: -7.5898,
+        source: 'wifi_ip',
+      });
+    } catch {
+      res.json({
+        success: true,
+        city: 'Casablanca',
+        lat: 33.5731,
+        lng: -7.5898,
+        source: 'wifi_ip',
+      });
+    }
+  });
+
   // API Routes: Listings (Strictly sanitized based on authentication state)
   app.get('/api/listings', (req, res) => {
     const viewer = getAuthUser(req);
@@ -284,6 +357,17 @@ async function startServer() {
       return res.status(401).json({
         success: false,
         message: 'Créez un compte ou connectez-vous pour continuer.',
+      });
+    }
+
+    // Check subscription plan listing limit
+    const quota = getUserListingQuota(viewer, dbListings, dbPlans);
+    if (!quota.canPublish) {
+      return res.status(403).json({
+        success: false,
+        code: 'QUOTA_EXCEEDED',
+        message: `Vous avez atteint la limite de votre offre « ${quota.planName} » (${quota.usedListings}/${quota.maxListings} annonces). Passez à une offre supérieure pour publier davantage de biens.`,
+        quota,
       });
     }
 
@@ -422,6 +506,489 @@ async function startServer() {
   // Users
   app.get('/api/users', (_req, res) => {
     res.json({ success: true, users: dbUsers });
+  });
+
+  // ============================================================================
+  // MONETIZATION, SUBSCRIPTIONS, BOOSTS & SECURE TEST PAYMENTS (MAD)
+  // ============================================================================
+
+  // Public Monetization Config (Plans, Boost Options & Payment Gateway Mode)
+  app.get('/api/monetization/config', (_req, res) => {
+    res.json({
+      success: true,
+      plans: dbPlans,
+      boostOptions: dbBoostOptions,
+      paymentGateway: {
+        mode: 'test',
+        providerName: 'Passerelle CMI / Payzone Maroc (Mode Test / Bac à sable)',
+        liveOperational: false,
+        currency: 'MAD',
+        notice:
+          'Mode Test actif : aucun débit bancaire réel n’est effectué tant que les identifiants marchands CMI/Payzone de production ne sont pas configurés.',
+      },
+    });
+  });
+
+  // Authenticated user's current subscription, quota & payment history
+  app.get('/api/payments/my', (req, res) => {
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        message: 'Créez un compte ou connectez-vous pour consulter vos abonnements et paiements.',
+      });
+    }
+    const quota = getUserListingQuota(viewer, dbListings, dbPlans);
+    const myTransactions = dbTransactions.filter((t) => t.userId === viewer.id);
+    res.json({
+      success: true,
+      subscription: viewer.subscription || null,
+      quota,
+      transactions: myTransactions,
+    });
+  });
+
+  // Admin: Get full monetization overview (plans, boost options, active subscriptions, transactions, revenue breakdown)
+  app.get('/api/admin/monetization', (_req, res) => {
+    const revenueSummary = calculateRevenueSummary(dbTransactions);
+    const activeSubscriptions = dbUsers
+      .filter((u) => u.subscription && u.subscription.status === 'active')
+      .map((u) => ({
+        userId: u.id,
+        userName: u.name,
+        userEmail: u.email,
+        role: u.role,
+        companyName: u.companyName,
+        subscription: u.subscription!,
+        usedListings: dbListings.filter(
+          (l) =>
+            l.userId === u.id &&
+            (l.status === 'publiee' || l.status === 'en_attente' || l.status === 'brouillon')
+        ).length,
+      }));
+
+    res.json({
+      success: true,
+      plans: dbPlans,
+      boostOptions: dbBoostOptions,
+      transactions: dbTransactions,
+      activeSubscriptions,
+      revenueSummary,
+    });
+  });
+
+  // Admin: Create a new subscription plan
+  app.post('/api/admin/plans', (req, res) => {
+    const { name, price, period = 'mois', maxListings, features, isCustomQuote } = req.body;
+    if (!name || String(name).trim().length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: "Le nom de l'offre est obligatoire.",
+      });
+    }
+    const slugId = String(name)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+    const id = dbPlans.some((p) => p.id === slugId) ? `${slugId}-${Date.now()}` : slugId;
+
+    const newPlan: SubscriptionPlan = {
+      id,
+      name: String(name).trim(),
+      price: isCustomQuote ? null : Math.max(0, Number(price) || 0),
+      period: period === 'an' ? 'an' : 'mois',
+      maxListings: Math.max(1, Number(maxListings) || 5),
+      features: Array.isArray(features)
+        ? features.map((f: any) => String(f).trim()).filter(Boolean)
+        : ['Publication d’annonces vérifiées'],
+      isCustomQuote: Boolean(isCustomQuote),
+    };
+
+    dbPlans.push(newPlan);
+    res.status(201).json({ success: true, plan: newPlan, plans: dbPlans });
+  });
+
+  // Admin: Update an existing subscription plan (price, maxListings, features, name)
+  app.put('/api/admin/plans/:id', (req, res) => {
+    const idx = dbPlans.findIndex((p) => p.id === req.params.id);
+    if (idx === -1) {
+      return res.status(404).json({ success: false, message: 'Offre introuvable.' });
+    }
+
+    const existing = dbPlans[idx];
+    const isCustomQuote =
+      req.body.isCustomQuote !== undefined ? Boolean(req.body.isCustomQuote) : existing.isCustomQuote;
+    const updatedPrice = isCustomQuote
+      ? null
+      : req.body.price !== undefined
+      ? Math.max(0, Number(req.body.price))
+      : existing.price;
+    const updatedMaxListings =
+      req.body.maxListings !== undefined
+        ? Math.max(1, Number(req.body.maxListings))
+        : existing.maxListings;
+    const updatedName =
+      req.body.name !== undefined && String(req.body.name).trim().length > 0
+        ? String(req.body.name).trim()
+        : existing.name;
+    const updatedFeatures = Array.isArray(req.body.features)
+      ? req.body.features.map((f: any) => String(f).trim()).filter(Boolean)
+      : existing.features;
+
+    dbPlans[idx] = {
+      ...existing,
+      name: updatedName,
+      price: updatedPrice,
+      maxListings: updatedMaxListings,
+      features: updatedFeatures,
+      isCustomQuote,
+    };
+
+    // Propagate updated maxListings & planName to users currently subscribed to this plan
+    for (const u of dbUsers) {
+      if (u.subscription && u.subscription.planId === existing.id && u.subscription.status === 'active') {
+        u.subscription.maxListings = updatedMaxListings;
+        u.subscription.planName = updatedName;
+      }
+    }
+
+    res.json({ success: true, plan: dbPlans[idx], plans: dbPlans });
+  });
+
+  // Admin: Update a listing boost option (price in MAD, durationDays, name, description)
+  app.put('/api/admin/boost-options/:id', (req, res) => {
+    const idx = dbBoostOptions.findIndex((b) => b.id === req.params.id);
+    if (idx === -1) {
+      return res.status(404).json({
+        success: false,
+        message: 'Option de mise en avant introuvable.',
+      });
+    }
+
+    const existing = dbBoostOptions[idx];
+    dbBoostOptions[idx] = {
+      ...existing,
+      name:
+        req.body.name !== undefined && String(req.body.name).trim()
+          ? String(req.body.name).trim()
+          : existing.name,
+      description:
+        req.body.description !== undefined && String(req.body.description).trim()
+          ? String(req.body.description).trim()
+          : existing.description,
+      price:
+        req.body.price !== undefined
+          ? Math.max(1, Number(req.body.price))
+          : existing.price,
+      durationDays:
+        req.body.durationDays !== undefined
+          ? Math.max(1, Number(req.body.durationDays))
+          : existing.durationDays,
+    };
+
+    res.json({
+      success: true,
+      boostOption: dbBoostOptions[idx],
+      boostOptions: dbBoostOptions,
+    });
+  });
+
+  // Checkout Endpoint (Test Mode CMI / Payzone Maroc):
+  // - Never stores full card numbers
+  // - Protects against double payments via idempotencyKey and active purchase check
+  // - Only activates subscription or listing boost AFTER confirmed payment ('paye')
+  app.post('/api/payments/checkout', (req, res) => {
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        message: 'Créez un compte ou connectez-vous pour souscrire une offre ou mettre en avant une annonce.',
+      });
+    }
+
+    const {
+      type,
+      optionId,
+      targetId,
+      idempotencyKey,
+      testScenario = 'success',
+      paymentMethodType = 'cmi_card',
+      cardNumber,
+    } = req.body;
+
+    // Security check: Reject if client attempts to send or store a full raw card number
+    if (cardNumber && String(cardNumber).replace(/\D/g, '').length >= 12) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Sécurité PCI-DSS : ne transmettez jamais de numéro de carte bancaire complet au serveur. Utilisez le jeton sécurisé du prestataire en mode test.',
+      });
+    }
+
+    if (!type || !optionId || !idempotencyKey) {
+      return res.status(400).json({
+        success: false,
+        message: 'Paramètres de paiement incomplets.',
+      });
+    }
+
+    // 1. Idempotency protection: check if this idempotencyKey already succeeded
+    const duplicateByKey = dbTransactions.find(
+      (t) => t.idempotencyKey === idempotencyKey && t.status === 'paye'
+    );
+    if (duplicateByKey) {
+      return res.status(409).json({
+        success: false,
+        code: 'DUPLICATE_PAYMENT',
+        message:
+          'Protection anti-double paiement : ce paiement a déjà été enregistré et confirmé. Aucun second débit n’a été effectué.',
+        transaction: duplicateByKey,
+      });
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const methodLabel =
+      paymentMethodType === 'payzone'
+        ? 'Payzone Maroc (Mode Test •••• 1111)'
+        : 'Carte CMI / Visa Maroc (Mode Test •••• 4242)';
+
+    if (type === 'subscription') {
+      const plan = dbPlans.find((p) => p.id === optionId);
+      if (!plan) {
+        return res.status(404).json({ success: false, message: 'Offre d’abonnement introuvable.' });
+      }
+      if (plan.isCustomQuote || plan.price === null) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'L’offre Entreprise est disponible uniquement sur devis personnalisé. Contactez notre service grands comptes.',
+        });
+      }
+
+      // Check if user already has this exact paid plan active (within last 60 seconds) to prevent accidental double click
+      const recentIdenticalSubTx = dbTransactions.find(
+        (t) =>
+          t.userId === viewer.id &&
+          t.type === 'subscription' &&
+          t.optionId === plan.id &&
+          t.status === 'paye' &&
+          now.getTime() - new Date(t.createdAt).getTime() < 60_000
+      );
+      if (recentIdenticalSubTx) {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PAYMENT',
+          message: `Protection anti-double paiement : votre abonnement « ${plan.name} » vient déjà d'être activé.`,
+          transaction: recentIdenticalSubTx,
+        });
+      }
+
+      const tx: PaymentTransaction = {
+        id: `tx-sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        idempotencyKey: String(idempotencyKey),
+        userId: viewer.id,
+        userName: viewer.name,
+        userEmail: viewer.email,
+        type: 'subscription',
+        targetId: plan.id,
+        targetLabel: `Abonnement ${plan.name}`,
+        optionId: plan.id,
+        amount: plan.price,
+        currency: 'MAD',
+        status: testScenario === 'failed' ? 'echoue' : 'paye',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: plan.price === 0 ? 'Activation gratuite (0 MAD)' : methodLabel,
+        failureReason:
+          testScenario === 'failed'
+            ? 'Transaction refusée par la banque émettrice (Simulation d’échec Mode Test).'
+            : undefined,
+        createdAt: nowIso,
+        confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+      };
+
+      dbTransactions.unshift(tx);
+
+      if (tx.status === 'echoue') {
+        return res.status(402).json({
+          success: false,
+          status: 'echoue',
+          message:
+            'Le paiement a échoué (simulation Mode Test). Votre abonnement n’a pas été modifié.',
+          transaction: tx,
+        });
+      }
+
+      // Payment confirmed ('paye'): Activate subscription now
+      const expiresAt = new Date(now.getTime() + 30 * 24 * 3600 * 1000).toISOString();
+      viewer.subscription = {
+        planId: plan.id,
+        planName: plan.name,
+        status: 'active',
+        maxListings: plan.maxListings,
+        startedAt: nowIso,
+        expiresAt,
+        transactionId: tx.id,
+      };
+      if (plan.id !== 'particulier' && viewer.role === 'particulier') {
+        viewer.role = 'professionnel';
+        viewer.advertiserType = 'professionnel';
+      }
+
+      return res.json({
+        success: true,
+        status: 'paye',
+        message: `Paiement confirmé (Mode Test). Votre offre « ${plan.name} » est désormais active !`,
+        transaction: tx,
+        user: viewer,
+        quota: getUserListingQuota(viewer, dbListings, dbPlans),
+      });
+    }
+
+    if (type === 'boost') {
+      const boostOpt = dbBoostOptions.find((b) => b.id === (optionId as BoostOptionId));
+      if (!boostOpt) {
+        return res.status(404).json({
+          success: false,
+          message: 'Option de mise en avant introuvable.',
+        });
+      }
+      const listing = dbListings.find((l) => l.id === targetId);
+      if (!listing) {
+        return res.status(404).json({
+          success: false,
+          message: 'Annonce cible introuvable.',
+        });
+      }
+      if (listing.userId !== viewer.id && viewer.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Vous ne pouvez mettre en avant que vos propres annonces.',
+        });
+      }
+
+      // Check duplicate active boost with same option on the same listing
+      if (
+        listing.boost &&
+        listing.boost.status === 'active' &&
+        listing.boost.optionId === boostOpt.id &&
+        new Date(listing.boost.expiresAt).getTime() > now.getTime()
+      ) {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PAYMENT',
+          message: `Protection anti-double paiement : cette annonce bénéficie déjà de l’option « ${boostOpt.name} » active.`,
+        });
+      }
+
+      const tx: PaymentTransaction = {
+        id: `tx-boost-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        idempotencyKey: String(idempotencyKey),
+        userId: viewer.id,
+        userName: viewer.name,
+        userEmail: viewer.email,
+        type: 'boost',
+        targetId: listing.id,
+        targetLabel: `${boostOpt.name} — ${listing.title}`,
+        optionId: boostOpt.id,
+        amount: boostOpt.price,
+        currency: 'MAD',
+        status: testScenario === 'failed' ? 'echoue' : 'paye',
+        provider: 'test_cmi_sandbox',
+        paymentMethodLabel: methodLabel,
+        failureReason:
+          testScenario === 'failed'
+            ? 'Autorisation bancaire refusée (Simulation d’échec Mode Test).'
+            : undefined,
+        createdAt: nowIso,
+        confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+      };
+
+      dbTransactions.unshift(tx);
+
+      if (tx.status === 'echoue') {
+        return res.status(402).json({
+          success: false,
+          status: 'echoue',
+          message:
+            'Le paiement a échoué (simulation Mode Test). La mise en avant n’a pas été activée sur votre annonce.',
+          transaction: tx,
+        });
+      }
+
+      // Payment confirmed ('paye'): Activate boost on listing
+      const expiresAt = new Date(
+        now.getTime() + boostOpt.durationDays * 24 * 3600 * 1000
+      ).toISOString();
+
+      listing.boost = {
+        optionId: boostOpt.id,
+        optionName: boostOpt.name,
+        status: 'active',
+        startedAt: nowIso,
+        expiresAt,
+        transactionId: tx.id,
+      };
+      listing.updatedAt = nowIso;
+
+      return res.json({
+        success: true,
+        status: 'paye',
+        message: `Paiement confirmé (Mode Test). Votre annonce affiche désormais la mention « Sponsorisé » (${boostOpt.name} — ${boostOpt.durationDays} jours) !`,
+        transaction: tx,
+        listing,
+      });
+    }
+
+    return res.status(400).json({ success: false, message: 'Type de transaction non reconnu.' });
+  });
+
+  // Admin: Refund a confirmed transaction and revoke the corresponding subscription or boost
+  app.post('/api/payments/:id/refund', (req, res) => {
+    const tx = dbTransactions.find((t) => t.id === req.params.id);
+    if (!tx) {
+      return res.status(404).json({ success: false, message: 'Transaction introuvable.' });
+    }
+    if (tx.status !== 'paye') {
+      return res.status(400).json({
+        success: false,
+        message: 'Seul un paiement confirmé (« payé ») peut faire l’objet d’un remboursement.',
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    tx.status = 'rembourse';
+    tx.refundedAt = nowIso;
+
+    if (tx.type === 'subscription') {
+      const targetUser = dbUsers.find((u) => u.id === tx.userId);
+      const freePlan = dbPlans.find((p) => p.id === 'particulier') || dbPlans[0];
+      if (targetUser) {
+        targetUser.subscription = {
+          planId: freePlan.id,
+          planName: freePlan.name,
+          status: 'refunded',
+          maxListings: freePlan.maxListings,
+          startedAt: nowIso,
+          expiresAt: nowIso,
+        };
+      }
+    } else if (tx.type === 'boost') {
+      const targetListing = dbListings.find((l) => l.id === tx.targetId);
+      if (targetListing && targetListing.boost) {
+        targetListing.boost = {
+          ...targetListing.boost,
+          status: 'revoked',
+        };
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Transaction ${tx.id} remboursée (${tx.amount} MAD). L’option associée a été désactivée.`,
+      transaction: tx,
+      revenueSummary: calculateRevenueSummary(dbTransactions),
+    });
   });
 
   // Feature 1: TTS with gemini-3.8-flash-tts

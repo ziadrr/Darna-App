@@ -19,14 +19,16 @@ import {
   Building,
   Info,
   Lock,
-  AlertTriangle
+  AlertTriangle,
+  Sparkles
 } from 'lucide-react';
 import { Listing, User, PendingAction } from '../types';
 import {
   formatMAD,
   formatMoroccanPhone,
   buildWhatsAppLink,
-  getSimilarListings
+  getSimilarListings,
+  isListingBoostActive
 } from '../utils/rentalLogic';
 import { AudioTourPlayer } from './AudioTourPlayer';
 import { SingleLocationMap } from './MoroccoMap';
@@ -42,6 +44,7 @@ interface ListingDetailModalProps {
   onRequireAuth: (action: PendingAction) => void;
   allListings?: Listing[];
   onSelectListing?: (listing: Listing) => void;
+  onOpenBoostModal?: (listing: Listing) => void;
 }
 
 export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
@@ -55,6 +58,7 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   onRequireAuth,
   allListings = [],
   onSelectListing,
+  onOpenBoostModal,
 }) => {
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -62,6 +66,9 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   const [messageText, setMessageText] = useState('');
 
   if (!isOpen || !listing) return null;
+
+  const isSponsored = isListingBoostActive(listing);
+  const isOwner = Boolean(currentUser && currentUser.id === listing.userId);
 
   const images =
     listing.images?.length > 0
@@ -119,6 +126,11 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
         {/* Sticky Header Bar */}
         <div className="px-5 py-3.5 bg-white border-b border-stone-200 flex items-center justify-between z-10">
           <div className="flex flex-wrap items-center gap-2">
+            {isSponsored && (
+              <span className="text-xs font-extrabold px-2.5 py-1 rounded-full bg-amber-400 text-stone-950 flex items-center gap-1 border border-amber-300">
+                <Sparkles className="w-3.5 h-3.5 fill-current" /> Sponsorisé
+              </span>
+            )}
             <span className="text-xs font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-[#1E3D34]/10 text-[#1E3D34]">
               {listing.category}
             </span>
@@ -133,6 +145,15 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {isOwner && onOpenBoostModal && (
+              <button
+                onClick={() => onOpenBoostModal(listing)}
+                className="px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-400 hover:bg-amber-300 text-stone-950 transition-colors flex items-center gap-1.5 shadow-2xs"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>{isSponsored ? 'Gérer la mise en avant' : 'Mettre en avant'}</span>
+              </button>
+            )}
             <button
               onClick={handleShare}
               className="px-3 py-1.5 rounded-xl text-xs font-semibold text-stone-600 hover:text-stone-900 hover:bg-stone-100 transition-colors flex items-center gap-1.5 border border-stone-200"
