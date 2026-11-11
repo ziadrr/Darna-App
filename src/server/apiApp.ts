@@ -79,11 +79,12 @@ export function createDarnaApiApp(
     next();
   });
 
-  app.get('/api/system/status', (_req, res) => {
+  app.get(['/api/system/status', '/api/system/status/', '/api/health', '/api/health/'], (_req, res) => {
     const cloudSqlConfigured = isCloudSqlConfigured();
     const emailConfigured = isEmailServiceConfigured();
     return res.json({
       success: true,
+      version: '2026-11-11-v2',
       nodeEnv: process.env.NODE_ENV || 'development',
       persistence: {
         postgresqlConfigured: cloudSqlConfigured,
@@ -2165,6 +2166,17 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: err.message || "Erreur lors de la communication avec l'assistant IA.",
       });
     }
+  });
+
+  // Strict JSON 404 handler for all /api/* routes so unmatched API endpoints never fall through
+  // to the SPA catch-all (index.html homepage).
+  app.use('/api', (req, res) => {
+    res.status(404).json({
+      success: false,
+      code: 'API_ENDPOINT_NOT_FOUND',
+      path: req.originalUrl,
+      message: "Cet endpoint API n'existe pas sur cette version du serveur Darna.",
+    });
   });
 
   return { app, db };
