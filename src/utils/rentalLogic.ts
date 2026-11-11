@@ -1,4 +1,4 @@
-import {
+import type {
   Listing,
   ListingFilter,
   ListingContact,
@@ -7,7 +7,7 @@ import {
   RevenueSummary,
   SubscriptionPlan,
   User
-} from '../types';
+} from '../types/index.ts';
 
 /**
  * Format price in Moroccan Dirhams (MAD)

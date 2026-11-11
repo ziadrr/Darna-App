@@ -108,8 +108,89 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
           </div>
         )}
 
-        {/* Pricing Table Summary (as requested in prompt) */}
-        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
+        {/* Overview Table of Professional Subscription Offers */}
+        <div className="bg-white rounded-3xl border border-stone-200/90 shadow-2xs overflow-hidden">
+          <div className="px-6 py-4 bg-stone-50/80 border-b border-stone-200/80 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-stone-900">
+              Grille récapitulative des abonnements (Tarifs provisoires en Dirhams)
+            </h2>
+            <span className="text-xs text-stone-500">
+              Modifiables à tout moment depuis l’espace administrateur
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-stone-200/80 text-[11px] font-bold uppercase tracking-wider text-stone-500 bg-stone-50/40">
+                  <th className="py-3.5 px-6">Offre</th>
+                  <th className="py-3.5 px-6">Prix de départ</th>
+                  <th className="py-3.5 px-6">Annonces autorisées</th>
+                  <th className="py-3.5 px-6 text-right">Statut / Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-200/60 text-xs sm:text-sm">
+                {plans.map((plan) => {
+                  const isCurrent = Boolean(currentUser && currentPlanId === plan.id);
+                  return (
+                    <tr
+                      key={`row-${plan.id}`}
+                      className={`transition-colors ${
+                        plan.popular ? 'bg-amber-50/40' : 'hover:bg-stone-50/80'
+                      }`}
+                    >
+                      <td className="py-3.5 px-6 font-bold text-stone-900 whitespace-nowrap">
+                        <div className="flex items-center gap-2">
+                          <span>{plan.name}</span>
+                          {plan.popular && (
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-200/80 text-amber-950">
+                              Recommandé
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-6 font-extrabold text-[#1E3D34] tabular-nums whitespace-nowrap">
+                        {plan.isCustomQuote || plan.price === null
+                          ? 'Sur devis'
+                          : plan.price === 0
+                          ? 'Gratuit'
+                          : `${plan.price} DH / ${plan.period}`}
+                      </td>
+                      <td className="py-3.5 px-6 text-stone-600 tabular-nums whitespace-nowrap">
+                        Jusqu’à {plan.maxListings} annonces actives
+                      </td>
+                      <td className="py-3.5 px-6 text-right whitespace-nowrap">
+                        {isCurrent ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-700">
+                            <CheckCircle2 className="w-4 h-4" /> Offre actuelle
+                          </span>
+                        ) : plan.isCustomQuote || plan.price === null ? (
+                          <button
+                            type="button"
+                            onClick={() => setQuoteRequested(true)}
+                            className="text-xs font-bold text-[#C15C3D] hover:underline"
+                          >
+                            Demander un devis →
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onSelectPlan(plan)}
+                            className="text-xs font-bold text-[#1E3D34] hover:text-[#C15C3D] transition-colors"
+                          >
+                            Choisir cette offre →
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Detailed Subscription Cards Grid (Well-Proportioned 3-Column Layout) */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {plans.map((plan) => {
             const isCurrent = Boolean(currentUser && currentPlanId === plan.id);
             const isPopular = Boolean(plan.popular);
@@ -117,16 +198,16 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
             return (
               <div
                 key={plan.id}
-                className={`rounded-3xl p-5 flex flex-col justify-between transition-all border ${
+                className={`rounded-3xl p-6 flex flex-col justify-between transition-all border ${
                   isPopular
                     ? 'bg-[#1E3D34] text-white border-[#1E3D34] shadow-xl ring-2 ring-amber-400/70'
                     : 'bg-white text-stone-800 border-stone-200/90 shadow-xs hover:border-[#C15C3D]/50'
                 }`}
               >
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <span
-                      className={`text-xs font-extrabold uppercase tracking-wider px-2.5 py-1 rounded-full ${
+                      className={`text-xs font-extrabold uppercase tracking-wider px-3 py-1 rounded-full whitespace-nowrap ${
                         isPopular
                           ? 'bg-amber-400 text-stone-950'
                           : 'bg-stone-100 text-[#1E3D34]'
@@ -135,7 +216,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                       {plan.name}
                     </span>
                     {isCurrent && (
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500 text-white">
+                      <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500 text-white whitespace-nowrap">
                         Offre actuelle
                       </span>
                     )}
@@ -144,22 +225,22 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                   {/* Price display */}
                   <div className="pt-1">
                     {plan.isCustomQuote || plan.price === null ? (
-                      <div className="text-2xl font-extrabold text-[#C15C3D]">
+                      <div className="text-2xl sm:text-3xl font-extrabold text-[#C15C3D]">
                         Sur devis
                       </div>
                     ) : plan.price === 0 ? (
-                      <div className="text-2xl font-extrabold">Gratuit</div>
+                      <div className="text-2xl sm:text-3xl font-extrabold">Gratuit</div>
                     ) : (
-                      <div className="flex items-baseline gap-1">
+                      <div className="flex items-baseline gap-1.5">
                         <span
-                          className={`text-2xl sm:text-3xl font-extrabold ${
+                          className={`text-2xl sm:text-3xl font-extrabold tabular-nums whitespace-nowrap ${
                             isPopular ? 'text-amber-300' : 'text-stone-900'
                           }`}
                         >
                           {plan.price} DH
                         </span>
                         <span
-                          className={`text-xs font-medium ${
+                          className={`text-xs font-medium whitespace-nowrap ${
                             isPopular ? 'text-stone-300' : 'text-stone-500'
                           }`}
                         >
@@ -168,7 +249,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                       </div>
                     )}
                     <p
-                      className={`text-[11px] mt-1 font-semibold ${
+                      className={`text-xs mt-1.5 font-semibold ${
                         isPopular ? 'text-emerald-200' : 'text-[#C15C3D]'
                       }`}
                     >
@@ -177,9 +258,9 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                   </div>
 
                   {/* Features list */}
-                  <ul className="space-y-2 pt-3 border-t border-current/10 text-xs">
+                  <ul className="space-y-2.5 pt-4 border-t border-current/10 text-xs sm:text-sm">
                     {plan.features.map((feat, i) => (
-                      <li key={i} className="flex items-start gap-2">
+                      <li key={i} className="flex items-start gap-2.5">
                         <CheckCircle2
                           className={`w-4 h-4 shrink-0 mt-0.5 ${
                             isPopular ? 'text-amber-300' : 'text-emerald-600'
@@ -193,21 +274,21 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                   </ul>
                 </div>
 
-                <div className="pt-6 mt-4">
+                <div className="pt-6 mt-5">
                   {plan.isCustomQuote || plan.price === null ? (
                     <button
                       type="button"
                       onClick={() => setQuoteRequested(true)}
-                      className="w-full py-2.5 px-4 rounded-xl font-bold text-xs bg-stone-900 hover:bg-stone-800 text-white transition-all flex items-center justify-center gap-1.5"
+                      className="w-full py-3 px-4 rounded-xl font-bold text-xs bg-stone-900 hover:bg-stone-800 text-white transition-all flex items-center justify-center gap-1.5 whitespace-nowrap"
                     >
                       <span>Demander un devis</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
+                      <ArrowRight className="w-3.5 h-3.5 shrink-0" />
                     </button>
                   ) : isCurrent ? (
                     <button
                       type="button"
                       disabled
-                      className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs cursor-default ${
+                      className={`w-full py-3 px-4 rounded-xl font-bold text-xs cursor-default whitespace-nowrap ${
                         isPopular
                           ? 'bg-white/15 text-white border border-white/20'
                           : 'bg-stone-100 text-stone-500 border border-stone-200'
@@ -219,7 +300,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                     <button
                       type="button"
                       onClick={() => onSelectPlan(plan)}
-                      className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 shadow-sm active:scale-95 ${
+                      className={`w-full py-3 px-4 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 shadow-sm active:scale-95 whitespace-nowrap ${
                         isPopular
                           ? 'bg-amber-400 hover:bg-amber-300 text-stone-950'
                           : 'bg-[#C15C3D] hover:bg-[#a94f33] text-white'
@@ -228,7 +309,7 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
                       <span>
                         {plan.price === 0 ? 'Activer Gratuitement' : `Choisir (${plan.price} DH)`}
                       </span>
-                      <ArrowRight className="w-3.5 h-3.5" />
+                      <ArrowRight className="w-3.5 h-3.5 shrink-0" />
                     </button>
                   )}
                 </div>

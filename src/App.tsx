@@ -19,7 +19,6 @@ import {
   Listing,
   ListingFilter,
   User,
-  UserRole,
   Language,
   ListingReport,
   PendingAction,
@@ -30,8 +29,6 @@ import {
 } from './types';
 import {
   INITIAL_LISTINGS,
-  INITIAL_USERS,
-  INITIAL_REPORTS,
   INITIAL_SUBSCRIPTION_PLANS,
   INITIAL_BOOST_OPTIONS
 } from './data/mockListings';
@@ -65,10 +62,11 @@ import {
 export default function App() {
   // Global Data State: Visitor default listings have all phone numbers/WhatsApp/emails stripped
   const [listings, setListings] = useState<Listing[]>(() =>
-    INITIAL_LISTINGS.map(sanitizeListingForVisitor)
+    INITIAL_LISTINGS.filter((l) => l.status === 'publiee').map(sanitizeListingForVisitor)
   );
-  const [users, setUsers] = useState<User[]>(INITIAL_USERS);
-  const [reports, setReports] = useState<ListingReport[]>(INITIAL_REPORTS);
+  // Admin-only collections are never populated in visitor memory
+  const [users, setUsers] = useState<User[]>([]);
+  const [reports, setReports] = useState<ListingReport[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
 
   // Monetization State (Plans, Boost Options, Transactions)
@@ -156,18 +154,37 @@ export default function App() {
           ? `Ville sélectionnée : ${matchedCity}`
           : `Ville détectée via Wi-Fi / Réseau (${matchedCity})`;
 
-      setUserLocation({
-        city: matchedCity,
-        lat,
-        lng,
-        source,
-        accuracyLabel,
+      setUserLocation((prev) => {
+        if (
+          prev.city === matchedCity &&
+          Math.abs(prev.lat - lat) < 0.01 &&
+          Math.abs(prev.lng - lng) < 0.01
+        ) {
+          return prev;
+        }
+        return {
+          city: matchedCity,
+          lat,
+          lng,
+          source,
+          accuracyLabel,
+        };
       });
-      setFilters((prev) => ({
-        ...prev,
-        userLat: lat,
-        userLng: lng,
-      }));
+      setFilters((prev) => {
+        if (
+          prev.userLat !== undefined &&
+          prev.userLng !== undefined &&
+          Math.abs(prev.userLat - lat) < 0.01 &&
+          Math.abs(prev.userLng - lng) < 0.01
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          userLat: lat,
+          userLng: lng,
+        };
+      });
     },
     []
   );
@@ -187,14 +204,12 @@ export default function App() {
           setIsLocatingGps(false);
           const { latitude, longitude } = pos.coords;
           const nearest = findNearestMoroccanCity(latitude, longitude, MOROCCAN_CITIES);
-          // If the user is physically outside Morocco (>800 km away), keep coordinates for distance or snap to closest Moroccan city
           if (nearest.distanceKm <= 800) {
             applyCoordinates(latitude, longitude, 'gps', nearest.city.name);
             if (!silent) {
               showToast(`Position GPS activée : annonces autour de ${nearest.city.name} affichées.`);
             }
           } else {
-            // User testing from abroad: use closest Moroccan hub (or keep their GPS if they want)
             applyCoordinates(nearest.city.lat, nearest.city.lng, 'gps', nearest.city.name);
             if (!silent) {
               showToast(`Localisation activée : rattachée à ${nearest.city.name} (Maroc).`);
@@ -204,20 +219,16 @@ export default function App() {
         () => {
           setIsLocatingGps(false);
           if (!silent) {
-            showToast(
-              `Localisation par Wi-Fi/Réseau maintenue (${userLocation.city}).`
-            );
+            showToast('Localisation par Wi-Fi/Réseau maintenue.');
           }
         },
-        { enableHighAccuracy: true, timeout: 6000, maximumAge: 60000 }
+        { enableHighAccuracy: false, timeout: 5000, maximumAge: 300000 }
       );
     },
-    [applyCoordinates, showToast, userLocation.city]
+    [applyCoordinates, showToast]
   );
 
-  // Automatic location detection on app entry:
-  // 1) Instant Wi-Fi / IP city detection via /api/locate-ip
-  // 2) Silent automatic GPS/Wi-Fi triangulation via navigator.geolocation
+  // Automatic location detection on app entry (runs once)
   useEffect(() => {
     let mounted = true;
     fetch('/api/locate-ip')
@@ -233,13 +244,10 @@ export default function App() {
       })
       .catch(() => {});
 
-    // Also trigger silent browser Wi-Fi/GPS positioning on entry
-    requestGpsLocation(true);
-
     return () => {
       mounted = false;
     };
-  }, [applyCoordinates, requestGpsLocation]);
+  }, [applyCoordinates]);
 
   // Fetch monetization config (plans & boost options)
   const fetchMonetizationConfig = useCallback(async () => {
@@ -255,10 +263,12 @@ export default function App() {
     }
   }, []);
 
-  // Fetch user's payment history and admin monetization data
-  const fetchPaymentData = useCallback(async (token?: string | null) => {
+  // Fetch user's payment history and (only if admin) admin monetization/users/reports data
+  const fetchPaymentData = useCallback(async (token?: string | null, role?: string) => {
     if (!token) {
       setMyTransactions([]);
+      setUsers([]);
+      setReports([]);
       return;
     }
     try {
@@ -270,14 +280,34 @@ export default function App() {
         setMyTransactions(myData.transactions);
       }
 
-      const admRes = await fetch('/api/admin/monetization', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const admData = await admRes.json();
-      if (admData.success) {
-        if (Array.isArray(admData.transactions)) setTransactions(admData.transactions);
-        if (Array.isArray(admData.plans)) setPlans(admData.plans);
-        if (Array.isArray(admData.boostOptions)) setBoostOptions(admData.boostOptions);
+      if (role === 'admin') {
+        const [admRes, usersRes, reportsRes] = await Promise.all([
+          fetch('/api/admin/monetization', {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch('/api/users', {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch('/api/reports', {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ]);
+        const [admData, usersData, reportsData] = await Promise.all([
+          admRes.json(),
+          usersRes.json(),
+          reportsRes.json(),
+        ]);
+        if (admData.success) {
+          if (Array.isArray(admData.transactions)) setTransactions(admData.transactions);
+          if (Array.isArray(admData.plans)) setPlans(admData.plans);
+          if (Array.isArray(admData.boostOptions)) setBoostOptions(admData.boostOptions);
+        }
+        if (usersData.success && Array.isArray(usersData.users)) {
+          setUsers(usersData.users);
+        }
+        if (reportsData.success && Array.isArray(reportsData.reports)) {
+          setReports(reportsData.reports);
+        }
       }
     } catch (err) {
       console.warn('Error fetching payment data:', err);
@@ -319,7 +349,7 @@ export default function App() {
             setCurrentUser(data.user);
             setFavorites(data.user.favorites || []);
             fetchListings(authToken);
-            fetchPaymentData(authToken);
+            fetchPaymentData(authToken, data.user.role);
           } else {
             localStorage.removeItem('darna_token');
             setAuthToken(null);
@@ -372,7 +402,7 @@ export default function App() {
     setIsAuthModalOpen(false);
 
     const updatedListings = await fetchListings(token);
-    await fetchPaymentData(token);
+    await fetchPaymentData(token, user.role);
 
     if (pendingAction) {
       if (pendingAction.type === 'post_ad') {
@@ -651,44 +681,43 @@ export default function App() {
     action: 'approve' | 'reject' | 'hide' | 'expire',
     reason?: string
   ) => {
+    if (!authToken || currentUser?.role !== 'admin') return;
     try {
-      await fetch(`/api/listings/${id}/moderate`, {
+      const res = await fetch(`/api/listings/${id}/moderate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ action, reason }),
       });
-    } catch (err) {
-      console.warn('API error, updating locally:', err);
-    }
-
-    setListings((prev) =>
-      prev.map((l) => {
-        if (l.id !== id) return l;
-        if (action === 'approve') return { ...l, status: 'publiee', rejectionReason: undefined };
-        if (action === 'reject') return { ...l, status: 'refusee', rejectionReason: reason };
-        if (action === 'hide') return { ...l, status: 'masquee', rejectionReason: reason };
-        if (action === 'expire') return { ...l, status: 'expiree' };
-        return l;
-      })
-    );
-  };
-
-  const handleResolveReport = async (reportId: string, action: 'resolve' | 'dismiss') => {
-    try {
-      await fetch(`/api/reports/${reportId}/resolve`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action }),
-      });
+      const data = await res.json();
+      if (res.ok && data.success && data.listing) {
+        setListings((prev) => prev.map((l) => (l.id === id ? data.listing : l)));
+      }
     } catch (err) {
       console.warn('API error:', err);
     }
+  };
 
-    setReports((prev) =>
-      prev.map((r) =>
-        r.id === reportId ? { ...r, status: action === 'dismiss' ? 'rejete' : 'resolu' } : r
-      )
-    );
+  const handleResolveReport = async (reportId: string, action: 'resolve' | 'dismiss') => {
+    if (!authToken || currentUser?.role !== 'admin') return;
+    try {
+      const res = await fetch(`/api/reports/${reportId}/resolve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success && data.report) {
+        setReports((prev) => prev.map((r) => (r.id === reportId ? data.report : r)));
+      }
+    } catch (err) {
+      console.warn('API error:', err);
+    }
   };
 
   const handleSubmitReport = async (
@@ -697,43 +726,27 @@ export default function App() {
     comment: string,
     email: string
   ) => {
-    const newReport: ListingReport = {
-      id: `rep-${Date.now()}`,
+    const newReportPayload = {
       listingId,
       listingTitle: listings.find((l) => l.id === listingId)?.title || 'Annonce',
       reason: reason as any,
       comment,
       reporterEmail: email,
-      createdAt: new Date().toISOString(),
-      status: 'en_attente',
     };
 
-    setReports((prev) => [newReport, ...prev]);
-
     try {
-      await fetch('/api/reports', {
+      const res = await fetch('/api/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newReport),
+        body: JSON.stringify(newReportPayload),
       });
+      const data = await res.json();
+      if (data.success && data.report && currentUser?.role === 'admin') {
+        setReports((prev) => [data.report, ...prev]);
+      }
       showToast('Merci. Votre signalement a été transmis à notre équipe.');
     } catch (err) {
       console.warn('API report error:', err);
-    }
-  };
-
-  const handleSwitchUserRole = (newRole: UserRole) => {
-    if (!currentUser) return;
-    const updated: User = {
-      ...currentUser,
-      role: newRole,
-      advertiserType: newRole === 'professionnel' ? 'professionnel' : 'particulier',
-    };
-    setCurrentUser(updated);
-    if (newRole === 'admin') {
-      setCurrentView('admin');
-      setIsProfileModalOpen(false);
-      fetchPaymentData(authToken);
     }
   };
 
@@ -797,7 +810,7 @@ export default function App() {
     setTransactions((prev) => [data.transaction, ...prev]);
     setMyTransactions((prev) => [data.transaction, ...prev]);
     showToast(data.message);
-    await fetchPaymentData(authToken);
+    await fetchPaymentData(authToken, data.user?.role || currentUser?.role);
   };
 
   // Admin Monetization Handlers
@@ -877,7 +890,7 @@ export default function App() {
       if (data.success) {
         showToast(data.message || 'Transaction remboursée avec succès.');
         await fetchListings(authToken);
-        await fetchPaymentData(authToken);
+        await fetchPaymentData(authToken, currentUser?.role);
       }
     } catch (err) {
       console.error(err);
@@ -895,77 +908,104 @@ export default function App() {
       )}
 
       {/* TOP NAVBAR */}
-      <header className="sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-stone-200/80 px-4 sm:px-8 py-3.5 transition-all">
-        <div className="max-w-6xl mx-auto flex items-center justify-between">
-          {/* Logo */}
-          <div
+      <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-stone-200/80 px-4 sm:px-8 py-3 transition-all">
+        <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
+          {/* Zone 1: Brand Logo */}
+          <button
+            type="button"
             onClick={() => setCurrentView('home')}
-            className="flex items-center gap-2 cursor-pointer select-none group"
+            className="flex items-center gap-2.5 cursor-pointer select-none group shrink-0 text-left"
           >
             <div className="w-9 h-9 rounded-xl bg-[#C15C3D] flex items-center justify-center text-white shadow-xs group-hover:scale-105 transition-transform">
               <Home className="w-5 h-5 fill-current" />
             </div>
-            <span className="text-2xl font-serif-title font-bold text-stone-900 tracking-tight">
+            <span className="text-2xl font-serif-title font-bold text-stone-900 tracking-tight whitespace-nowrap">
               Darna
             </span>
-            <span className="hidden sm:inline text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-stone-100 text-[#1E3D34] border border-stone-200">
-              Maroc
-            </span>
-          </div>
+          </button>
 
-          {/* Quick Search on Desktop / Tablet */}
-          <div className="hidden md:flex items-center gap-2 max-w-xs flex-1 mx-4">
-            <div className="relative w-full">
-              <Search className="w-4 h-4 text-stone-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={filters.query || ''}
-                onChange={(e) => {
-                  setFilters({ ...filters, query: e.target.value });
-                  if (currentView !== 'search') setCurrentView('search');
-                }}
-                placeholder={t.searchPlaceholder}
-                className="w-full text-xs pl-9 pr-4 py-2 rounded-full border border-stone-200 bg-stone-50 focus:outline-none focus:ring-1 focus:ring-[#C15C3D] focus:bg-white"
-              />
-            </div>
-          </div>
+          {/* Zone 2: Clean Centered Primary Navigation Links */}
+          <nav
+            aria-label="Navigation principale"
+            className="hidden md:flex items-center gap-1 bg-stone-100/90 p-1.5 rounded-full border border-stone-200/80 shrink-0"
+          >
+            <button
+              type="button"
+              onClick={() => setCurrentView('home')}
+              className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all whitespace-nowrap shrink-0 ${
+                currentView === 'home'
+                  ? 'bg-white text-[#1E3D34] shadow-2xs'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              {t.home}
+            </button>
 
-          {/* Header Actions */}
-          <div className="flex items-center gap-2 sm:gap-2.5">
-            {/* Tarifs & Abonnements Pro Link */}
+            <button
+              type="button"
+              onClick={() => setCurrentView('search')}
+              className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all whitespace-nowrap shrink-0 ${
+                currentView === 'search'
+                  ? 'bg-white text-[#1E3D34] shadow-2xs'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              Explorer
+            </button>
+
             <button
               type="button"
               onClick={() => setCurrentView('pricing')}
-              className={`px-3 py-2 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all border ${
+              className={`px-3.5 py-1.5 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap shrink-0 ${
                 currentView === 'pricing'
-                  ? 'bg-[#1E3D34] text-white border-[#1E3D34]'
-                  : 'bg-amber-50 hover:bg-amber-100 text-stone-900 border-amber-200'
+                  ? 'bg-[#1E3D34] text-white shadow-2xs'
+                  : 'text-stone-700 hover:text-[#1E3D34] hover:bg-white/60'
               }`}
             >
-              <Sparkles className="w-3.5 h-3.5 text-[#C15C3D]" />
+              <Sparkles
+                className={`w-3.5 h-3.5 shrink-0 ${
+                  currentView === 'pricing' ? 'text-amber-300' : 'text-[#C15C3D]'
+                }`}
+              />
               <span>Abonnements & Tarifs</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setCurrentView('favorites')}
+              className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all whitespace-nowrap shrink-0 ${
+                currentView === 'favorites'
+                  ? 'bg-white text-[#1E3D34] shadow-2xs'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              {t.favorites}
             </button>
 
             {currentUser?.role === 'admin' && (
               <button
                 type="button"
                 onClick={() => setCurrentView('admin')}
-                className={`hidden sm:flex px-3 py-2 rounded-full text-xs font-bold items-center gap-1.5 transition-all border ${
+                className={`px-3.5 py-1.5 rounded-full text-xs font-bold flex items-center gap-1.5 transition-all whitespace-nowrap shrink-0 ${
                   currentView === 'admin'
-                    ? 'bg-stone-900 text-amber-300 border-stone-900'
-                    : 'bg-stone-100 hover:bg-stone-200 text-stone-800 border-stone-300'
+                    ? 'bg-stone-900 text-amber-300 shadow-2xs'
+                    : 'text-stone-700 hover:text-stone-900 hover:bg-white/60'
                 }`}
               >
-                <Shield className="w-3.5 h-3.5" />
+                <Shield className="w-3.5 h-3.5 shrink-0" />
                 <span>Admin</span>
               </button>
             )}
+          </nav>
 
+          {/* Zone 3: Header Actions */}
+          <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
             {/* Language Switcher */}
-            <div className="hidden lg:flex items-center gap-1 text-xs font-semibold bg-stone-100 p-1 rounded-xl">
+            <div className="hidden lg:flex items-center gap-0.5 text-xs font-semibold bg-stone-100 p-1 rounded-xl border border-stone-200/60 shrink-0">
               <button
+                type="button"
                 onClick={() => setLang('fr')}
-                className={`px-2 py-1 rounded-lg transition-colors ${
+                className={`px-2 py-1 rounded-lg transition-colors whitespace-nowrap ${
                   lang === 'fr'
                     ? 'bg-white text-stone-900 shadow-2xs font-bold'
                     : 'text-stone-500 hover:text-stone-800'
@@ -974,8 +1014,9 @@ export default function App() {
                 FR
               </button>
               <button
+                type="button"
                 onClick={() => setLang('ar')}
-                className={`px-2 py-1 rounded-lg transition-colors ${
+                className={`px-2 py-1 rounded-lg transition-colors whitespace-nowrap ${
                   lang === 'ar'
                     ? 'bg-white text-[#C15C3D] shadow-2xs font-bold'
                     : 'text-stone-500 hover:text-stone-800'
@@ -984,8 +1025,9 @@ export default function App() {
                 عر
               </button>
               <button
+                type="button"
                 onClick={() => setLang('en')}
-                className={`px-2 py-1 rounded-lg transition-colors ${
+                className={`px-2 py-1 rounded-lg transition-colors whitespace-nowrap ${
                   lang === 'en'
                     ? 'bg-white text-stone-900 shadow-2xs font-bold'
                     : 'text-stone-500 hover:text-stone-800'
@@ -997,21 +1039,23 @@ export default function App() {
 
             {/* CTA "+ Déposer une annonce" */}
             <button
+              type="button"
               onClick={handleOpenPostAd}
-              className="hidden sm:flex items-center gap-2 px-4 py-2.5 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-full text-xs font-bold shadow-md hover:shadow-lg transition-all active:scale-95"
+              className="hidden sm:flex items-center gap-1.5 px-4 py-2 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-full text-xs font-bold shadow-sm hover:shadow-md transition-all active:scale-95 whitespace-nowrap shrink-0"
             >
-              <Plus className="w-4 h-4 stroke-[3]" />
+              <Plus className="w-4 h-4 stroke-[2.5] shrink-0" />
               <span>{t.postAd}</span>
             </button>
 
             {/* Auth / Profile Button */}
             {currentUser ? (
               <button
+                type="button"
                 onClick={() => setIsProfileModalOpen(true)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-800 text-xs font-bold border border-stone-300 transition-all"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-800 text-xs font-bold border border-stone-300 transition-all whitespace-nowrap shrink-0"
                 title="Mon espace personnel Darna"
               >
-                <div className="w-6 h-6 rounded-full bg-[#1E3D34] text-white flex items-center justify-center text-[11px] font-bold">
+                <div className="w-6 h-6 rounded-full bg-[#1E3D34] text-white flex items-center justify-center text-[11px] font-bold shrink-0">
                   {currentUser.name.charAt(0)}
                 </div>
                 <span className="hidden sm:inline max-w-[110px] truncate">
@@ -1020,15 +1064,16 @@ export default function App() {
               </button>
             ) : (
               <button
+                type="button"
                 onClick={() => {
                   setPendingAction(null);
                   setAuthReasonMessage(undefined);
                   setAuthInitialMode('login');
                   setIsAuthModalOpen(true);
                 }}
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all"
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all whitespace-nowrap shrink-0"
               >
-                <LogIn className="w-3.5 h-3.5 text-[#C15C3D]" />
+                <LogIn className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
                 <span>Se connecter</span>
               </button>
             )}
@@ -1129,12 +1174,39 @@ export default function App() {
             {/* Mobile Prominent CTA button */}
             <div className="pt-2 sm:hidden">
               <button
+                type="button"
                 onClick={handleOpenPostAd}
                 className="w-full py-4 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-2xl font-bold text-base flex items-center justify-center gap-2 shadow-lg active:scale-95 transition-all"
               >
                 <Plus className="w-5 h-5 stroke-[2.5]" />
                 <span>{t.postAd}</span>
               </button>
+            </div>
+
+            {/* Clean Dedicated Section for Professional Subscriptions & Boosts */}
+            <div className="bg-white rounded-3xl p-6 sm:p-8 border border-stone-200/90 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-6">
+              <div className="space-y-2 max-w-2xl">
+                <div className="flex items-center gap-2 text-xs font-bold text-[#C15C3D]">
+                  <Sparkles className="w-4 h-4 shrink-0" />
+                  <span>Particuliers, Agences Immobilières & Promoteurs</span>
+                </div>
+                <h3 className="text-lg sm:text-xl font-bold text-stone-900">
+                  Abonnements professionnels & Mise en avant des annonces
+                </h3>
+                <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
+                  Découvrez nos formules adaptées au marché marocain : offre Particulier gratuite, abonnements Agence dès 199 DH / mois et options de visibilité « Sponsorisé » dès 49 DH.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setCurrentView('pricing')}
+                  className="px-5 py-3 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-sm transition-all whitespace-nowrap"
+                >
+                  <CreditCard className="w-4 h-4 text-amber-300 shrink-0" />
+                  <span>Consulter les abonnements & tarifs</span>
+                </button>
+              </div>
             </div>
 
             {/* Moroccan Market Trust & Safety Banner */}
@@ -1394,63 +1466,74 @@ export default function App() {
         )}
       </main>
 
-      {/* FLOATING ACTION BUTTON FOR AI CHATBOT */}
-      <div className="fixed bottom-20 sm:bottom-6 right-4 sm:right-8 z-30">
+      {/* FLOATING ACTION BUTTON FOR ASSISTANT */}
+      <div className="fixed bottom-20 sm:bottom-6 right-4 sm:right-6 z-30">
         <button
+          type="button"
           onClick={() => setIsChatbotOpen(true)}
-          className="group flex items-center gap-2.5 px-4 py-3 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-full shadow-2xl border border-emerald-500/40 hover:scale-105 transition-all"
+          aria-label="Ouvrir l'assistant Darna"
+          className="group flex items-center gap-2 p-3 sm:px-4 sm:py-2.5 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-full shadow-lg border border-emerald-500/30 hover:scale-105 transition-all"
         >
-          <div className="w-7 h-7 rounded-full bg-amber-400 text-stone-900 flex items-center justify-center font-bold">
-            <Bot className="w-4 h-4" />
+          <div className="w-6 h-6 rounded-full bg-amber-400 text-stone-900 flex items-center justify-center font-bold shrink-0">
+            <Bot className="w-3.5 h-3.5" />
           </div>
-          <span className="text-xs font-bold pr-1">Assistant Darna</span>
-          <span className="text-[10px] bg-white/20 px-2 py-0.5 rounded-full text-emerald-200">
-            gemini-4-argon
+          <span className="hidden sm:inline text-xs font-bold pr-1 whitespace-nowrap">
+            Assistant Darna
           </span>
         </button>
       </div>
 
       {/* BOTTOM MOBILE NAVIGATION BAR */}
-      <nav className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-stone-200 px-6 py-2.5 flex items-center justify-between">
+      <nav
+        aria-label="Navigation mobile"
+        className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-stone-200 px-2 py-2 flex items-center justify-around"
+      >
         <button
+          type="button"
           onClick={() => setCurrentView('home')}
-          className={`flex flex-col items-center gap-1 transition-colors ${
-            currentView === 'home' ? 'text-[#1E3D34] font-bold' : 'text-stone-400'
+          className={`flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+            currentView === 'home' ? 'text-[#1E3D34] font-bold' : 'text-stone-500'
           }`}
         >
           <Home className="w-5 h-5" />
-          <span className="text-[10px]">{t.home}</span>
+          <span className="text-[10px] whitespace-nowrap">{t.home}</span>
         </button>
 
         <button
+          type="button"
+          onClick={() => setCurrentView('search')}
+          className={`flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+            currentView === 'search' ? 'text-[#1E3D34] font-bold' : 'text-stone-500'
+          }`}
+        >
+          <Search className="w-5 h-5" />
+          <span className="text-[10px] whitespace-nowrap">Explorer</span>
+        </button>
+
+        <button
+          type="button"
           onClick={() => setCurrentView('pricing')}
-          className={`flex flex-col items-center gap-1 transition-colors ${
-            currentView === 'pricing' ? 'text-[#1E3D34] font-bold' : 'text-stone-400'
+          className={`flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+            currentView === 'pricing' ? 'text-[#C15C3D] font-bold' : 'text-stone-500'
           }`}
         >
           <CreditCard className="w-5 h-5" />
-          <span className="text-[10px]">Offres Pro</span>
+          <span className="text-[10px] whitespace-nowrap">Tarifs & Pro</span>
         </button>
 
         <button
+          type="button"
           onClick={() => setCurrentView('favorites')}
-          className={`flex flex-col items-center gap-1 transition-colors ${
-            currentView === 'favorites' ? 'text-[#1E3D34] font-bold' : 'text-stone-400'
+          className={`flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+            currentView === 'favorites' ? 'text-[#1E3D34] font-bold' : 'text-stone-500'
           }`}
         >
           <Heart className="w-5 h-5" />
-          <span className="text-[10px]">{t.favorites}</span>
+          <span className="text-[10px] whitespace-nowrap">{t.favorites}</span>
         </button>
 
         <button
-          onClick={() => setIsChatbotOpen(true)}
-          className="flex flex-col items-center gap-1 text-stone-400 hover:text-[#1E3D34] transition-colors"
-        >
-          <MessageSquare className="w-5 h-5" />
-          <span className="text-[10px]">{t.messages}</span>
-        </button>
-
-        <button
+          type="button"
           onClick={() => {
             if (currentUser) {
               setIsProfileModalOpen(true);
@@ -1459,10 +1542,12 @@ export default function App() {
               setIsAuthModalOpen(true);
             }
           }}
-          className="flex flex-col items-center gap-1 text-stone-400 hover:text-[#1E3D34] transition-colors"
+          className="flex-1 flex flex-col items-center gap-1 py-1 text-stone-500 hover:text-[#1E3D34] transition-colors"
         >
           <UserIcon className="w-5 h-5" />
-          <span className="text-[10px]">{currentUser ? t.profile : 'Connexion'}</span>
+          <span className="text-[10px] whitespace-nowrap">
+            {currentUser ? t.profile : 'Connexion'}
+          </span>
         </button>
       </nav>
 
@@ -1510,7 +1595,6 @@ export default function App() {
           isOpen={isProfileModalOpen}
           onClose={() => setIsProfileModalOpen(false)}
           currentUser={currentUser}
-          onSwitchRole={handleSwitchUserRole}
           myListings={listings.filter((l) => l.userId === currentUser.id)}
           allListings={listings}
           plans={plans}

@@ -21,7 +21,6 @@ import {
 import {
   Listing,
   User,
-  UserRole,
   PaymentTransaction,
   SubscriptionPlan
 } from '../types';
@@ -35,7 +34,6 @@ interface UserProfileModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentUser: User;
-  onSwitchRole: (newRole: UserRole) => void;
   myListings: Listing[];
   allListings: Listing[];
   plans: SubscriptionPlan[];
@@ -56,7 +54,6 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   isOpen,
   onClose,
   currentUser,
-  onSwitchRole,
   myListings,
   allListings,
   plans,
@@ -139,30 +136,6 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
             >
               <X className="w-5 h-5" />
             </button>
-          </div>
-        </div>
-
-        {/* Role switcher for quick testing */}
-        <div className="bg-stone-50 px-6 py-2.5 border-b border-stone-200 flex flex-wrap items-center justify-between gap-2 text-xs">
-          <span className="font-bold text-stone-600">Basculer le profil de test :</span>
-          <div className="flex items-center gap-1.5">
-            {[
-              { id: 'particulier', label: 'Particulier' },
-              { id: 'professionnel', label: 'Professionnel' },
-              { id: 'admin', label: 'Admin Modération' },
-            ].map((r) => (
-              <button
-                key={r.id}
-                onClick={() => onSwitchRole(r.id as any)}
-                className={`px-2.5 py-1 rounded-lg font-bold text-[11px] transition-colors ${
-                  currentUser.role === r.id
-                    ? 'bg-[#1E3D34] text-white'
-                    : 'bg-white text-stone-600 hover:bg-stone-200 border border-stone-200'
-                }`}
-              >
-                {r.label}
-              </button>
-            ))}
           </div>
         </div>
 

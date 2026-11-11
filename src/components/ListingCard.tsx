@@ -27,10 +27,10 @@ export const ListingCard: React.FC<ListingCardProps> = ({
   return (
     <div
       onClick={onClick}
-      className={`group bg-white rounded-2xl overflow-hidden border transition-all duration-300 flex flex-col cursor-pointer hover:-translate-y-1 ${
+      className={`group bg-white rounded-2xl overflow-hidden border transition-colors duration-200 flex flex-col cursor-pointer ${
         isSponsored
-          ? 'border-amber-400/90 ring-1 ring-amber-400/50 shadow-md hover:shadow-xl'
-          : 'border-stone-200/90 hover:border-[#C15C3D]/40 shadow-xs hover:shadow-xl'
+          ? 'border-amber-400/90 ring-1 ring-amber-400/50 shadow-md hover:shadow-lg'
+          : 'border-stone-200/90 hover:border-[#C15C3D]/40 shadow-xs hover:shadow-md'
       }`}
     >
       {/* Image container */}
@@ -39,11 +39,11 @@ export const ListingCard: React.FC<ListingCardProps> = ({
           src={primaryImage}
           alt={listing.title}
           loading="lazy"
-          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500 ease-out"
+          className="w-full h-full object-cover"
         />
 
-        {/* Gradient overlay on hover */}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+        {/* Subtle overlay on hover */}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/25 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
 
         {/* Top Badges */}
         <div className="absolute top-3 left-3 flex flex-wrap items-center gap-1.5 z-10 pr-10">

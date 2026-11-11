@@ -1,4 +1,4 @@
-import { Listing, User, ListingReport, SubscriptionPlan, BoostOption } from '../types';
+import type { Listing, User, ListingReport, SubscriptionPlan, BoostOption } from '../types/index.ts';
 
 export const INITIAL_SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
   {
