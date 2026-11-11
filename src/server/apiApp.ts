@@ -23,12 +23,20 @@ import {
 import { DarnaPersistentDb } from './persistentDb.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { getOrCreateUser, isCloudSqlConfigured } from '../db/users.ts';
+import {
+  isEmailServiceConfigured,
+  sendEmailVerificationMessage,
+  sendPasswordResetMessage,
+} from './mailer.ts';
 
-export function createDarnaApiApp(customDbPath?: string): {
+export function createDarnaApiApp(
+  customDbPath?: string,
+  options?: { enableCloudSqlSync?: boolean }
+): {
   app: express.Express;
   db: DarnaPersistentDb;
 } {
-  const db = new DarnaPersistentDb(customDbPath);
+  const db = new DarnaPersistentDb(customDbPath, options);
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
@@ -456,7 +464,9 @@ export function createDarnaApiApp(customDbPath?: string): {
 
   /**
    * Step 1 of Email Verification:
-   * Generates a single-use SHA-256 hashed cryptographic verification token valid for 30 minutes.
+   * Generates a single-use SHA-256 hashed cryptographic verification token and sends it
+   * via the configured SMTP / transactional email provider.
+   * Never claims an email was sent if no email delivery occurred, and never returns the token in HTTP responses.
    */
   app.post('/api/auth/request-email-verification', async (req, res) => {
     try {
@@ -464,24 +474,52 @@ export function createDarnaApiApp(customDbPath?: string): {
       if (!viewer) {
         return res.status(401).json({ success: false, message: 'Non connecté.' });
       }
+
+      if (!isEmailServiceConfigured()) {
+        return res.status(503).json({
+          success: false,
+          emailSent: false,
+          smtpConfigured: false,
+          code: 'EMAIL_SERVICE_NOT_CONFIGURED',
+          message:
+            "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP_HOST) n'est pas encore configuré.",
+        });
+      }
+
       const rawToken = await db.createEmailVerificationToken(viewer.id, viewer.email);
-      const smtpConfigured = Boolean(process.env.SMTP_HOST);
+      const mailResult = await sendEmailVerificationMessage({
+        toEmail: viewer.email,
+        userName: viewer.name,
+        verificationToken: rawToken,
+      });
+
+      if (!mailResult.sent) {
+        return res.status(502).json({
+          success: false,
+          emailSent: false,
+          smtpConfigured: mailResult.configured,
+          code: 'EMAIL_SEND_FAILED',
+          message:
+            mailResult.errorMessage ||
+            "Échec de l'envoi de l'e-mail de vérification : aucun e-mail n'a pu être acheminé.",
+        });
+      }
+
       return res.json({
         success: true,
-        smtpConfigured,
-        message: smtpConfigured
-          ? 'Un jeton de vérification à usage unique a été envoyé à votre adresse e-mail.'
-          : 'Jeton de vérification généré (serveur SMTP non configuré : utilisez le jeton de vérification en environnement de test).',
-        ...(process.env.NODE_ENV !== 'production' && !smtpConfigured && rawToken
-          ? { devVerificationToken: rawToken }
-          : {}),
+        emailSent: true,
+        smtpConfigured: true,
+        provider: mailResult.provider,
+        message:
+          'Un e-mail contenant votre jeton de vérification à usage unique (valable 15 minutes) a été envoyé à votre adresse.',
       });
     } catch (err) {
       console.error('Error in POST /api/auth/request-email-verification:', err);
       return res.status(503).json({
         success: false,
+        emailSent: false,
         code: 'DATABASE_SYNC_FAILED',
-        message: 'Impossible de générer le jeton de vérification e-mail.',
+        message: 'Impossible de générer ou enregistrer le jeton de vérification e-mail.',
       });
     }
   });
@@ -774,8 +812,9 @@ export function createDarnaApiApp(customDbPath?: string): {
 
   /**
    * Step 1 of Secure Password Reset:
-   * Generates a single-use, 15-minute cryptographic reset token (hashed in DB).
-   * Does not reveal whether the email exists.
+   * Generates a single-use, 15-minute cryptographic reset token (hashed in DB) and sends it by email.
+   * Never claims an email was sent unless SMTP/transactional delivery actually succeeded,
+   * and never returns the reset token in HTTP responses.
    */
   app.post('/api/auth/request-password-reset', async (req, res) => {
     try {
@@ -783,28 +822,67 @@ export function createDarnaApiApp(customDbPath?: string): {
       if (!email) {
         return res.status(400).json({
           success: false,
+          emailSent: false,
           message: 'Veuillez indiquer votre adresse e-mail.',
         });
       }
 
+      if (!isEmailServiceConfigured()) {
+        return res.status(503).json({
+          success: false,
+          emailSent: false,
+          smtpConfigured: false,
+          code: 'EMAIL_SERVICE_NOT_CONFIGURED',
+          message:
+            "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP_HOST) n'est pas encore configuré.",
+        });
+      }
+
       const normalizedEmail = String(email).trim().toLowerCase();
+      const userRecord = db.getUserByEmail(normalizedEmail);
       const rawResetToken = await db.createPasswordResetToken(normalizedEmail);
-      const smtpConfigured = Boolean(process.env.SMTP_HOST);
+
+      if (!rawResetToken || !userRecord) {
+        return res.status(200).json({
+          success: true,
+          emailSent: false,
+          smtpConfigured: true,
+          message:
+            "Demande traitée. Aucun envoi n'a eu lieu (aucun compte actif ne correspond à cette adresse).",
+        });
+      }
+
+      const mailResult = await sendPasswordResetMessage({
+        toEmail: normalizedEmail,
+        userName: userRecord.user.name || 'Membre Darna',
+        resetToken: rawResetToken,
+      });
+
+      if (!mailResult.sent) {
+        return res.status(502).json({
+          success: false,
+          emailSent: false,
+          smtpConfigured: mailResult.configured,
+          code: 'EMAIL_SEND_FAILED',
+          message:
+            mailResult.errorMessage ||
+            "Échec de l'envoi de l'e-mail de réinitialisation : aucun e-mail n'a pu être acheminé.",
+        });
+      }
 
       return res.json({
         success: true,
-        smtpConfigured,
-        message: smtpConfigured
-          ? 'Si un compte est associé à cette adresse e-mail, un code de réinitialisation sécurisé valable 15 minutes vous a été envoyé.'
-          : 'Demande de réinitialisation enregistrée (serveur SMTP non configuré : utilisez le jeton de vérification généré en environnement de développement/test).',
-        ...(process.env.NODE_ENV !== 'production' && !smtpConfigured && rawResetToken
-          ? { devResetToken: rawResetToken }
-          : {}),
+        emailSent: true,
+        smtpConfigured: true,
+        provider: mailResult.provider,
+        message:
+          'Un e-mail contenant votre code de réinitialisation sécurisé (valable 15 minutes) a été envoyé.',
       });
     } catch (err) {
       console.error('Error in POST /api/auth/request-password-reset:', err);
       return res.status(503).json({
         success: false,
+        emailSent: false,
         code: 'DATABASE_SYNC_FAILED',
         message: 'Erreur de persistance lors de la génération du jeton de réinitialisation.',
       });

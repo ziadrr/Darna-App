@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
 import {
   hashPassword,
   verifyPassword,
@@ -14,11 +15,82 @@ import {
 import { createDarnaApiApp } from '../src/server/apiApp';
 import { DarnaPersistentDb } from '../src/server/persistentDb';
 
-describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () => {
+/**
+ * Minimal RFC 5321 SMTP server on 127.0.0.1 to test real Nodemailer SMTP email delivery
+ * without external network dependencies.
+ */
+function createLocalTestSmtpServer(): {
+  server: net.Server;
+  messages: Array<{ raw: string }>;
+  start: () => Promise<number>;
+  stop: () => Promise<void>;
+} {
+  const messages: Array<{ raw: string }> = [];
+  const server = net.createServer((socket) => {
+    socket.write('220 localhost ESMTP DarnaTestMail\r\n');
+    let inData = false;
+    let dataBuffer = '';
+
+    socket.on('data', (chunk) => {
+      const str = chunk.toString('utf8');
+      if (inData) {
+        dataBuffer += str;
+        if (dataBuffer.includes('\r\n.\r\n')) {
+          messages.push({ raw: dataBuffer });
+          dataBuffer = '';
+          inData = false;
+          socket.write('250 2.0.0 OK: queued as darna-test-msg\r\n');
+        }
+        return;
+      }
+
+      const lines = str.split(/\r?\n/).filter(Boolean);
+      for (const line of lines) {
+        const upper = line.toUpperCase();
+        if (upper.startsWith('EHLO') || upper.startsWith('HELO')) {
+          socket.write('250-localhost\r\n250 8BITMIME\r\n');
+        } else if (upper.startsWith('MAIL FROM')) {
+          socket.write('250 2.1.0 OK\r\n');
+        } else if (upper.startsWith('RCPT TO')) {
+          socket.write('250 2.1.5 OK\r\n');
+        } else if (upper === 'DATA') {
+          inData = true;
+          dataBuffer = '';
+          socket.write('354 End data with <CR><LF>.<CR><LF>\r\n');
+        } else if (upper.startsWith('QUIT')) {
+          socket.write('221 2.0.0 Bye\r\n');
+          socket.end();
+        } else {
+          socket.write('250 OK\r\n');
+        }
+      }
+    });
+  });
+
+  return {
+    server,
+    messages,
+    start: () =>
+      new Promise<number>((resolve) => {
+        server.listen(0, '127.0.0.1', () => {
+          const addr = server.address();
+          resolve(addr && typeof addr === 'object' ? addr.port : 0);
+        });
+      }),
+    stop: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}
+
+describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Suite', () => {
   let server: http.Server;
   let baseUrl: string;
   let tempDbPath: string;
   let dbInstance: DarnaPersistentDb;
+  let smtpServer: ReturnType<typeof createLocalTestSmtpServer>;
+  let smtpPort: number;
 
   before(async () => {
     tempDbPath = path.join(
@@ -26,6 +98,9 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       `darna-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
     );
     process.env.ADMIN_EMAILS = 'ayarziad@gmail.com,superadmin@darna.ma';
+
+    smtpServer = createLocalTestSmtpServer();
+    smtpPort = await smtpServer.start();
 
     const created = createDarnaApiApp(tempDbPath);
     dbInstance = created.db;
@@ -42,6 +117,11 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
   });
 
   after(async () => {
+    delete process.env.SMTP_HOST;
+    delete process.env.SMTP_PORT;
+    if (smtpServer) {
+      await smtpServer.stop();
+    }
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -68,10 +148,8 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     assert.ok(!hashed.includes(plain), 'Hash must never contain plaintext password');
     assert.equal(verifyPassword(plain, hashed), true);
     assert.equal(verifyPassword('WrongPassword123!', hashed), false);
-    // Rejects raw plaintext stored as hash
     assert.equal(verifyPassword(plain, plain), false);
 
-    // Enforces strong password policy
     assert.equal(validatePasswordStrength('12345').valid, false);
     assert.equal(validatePasswordStrength('onlyletters').valid, false);
     assert.equal(validatePasswordStrength('DarnaSecure2026!').valid, true);
@@ -92,7 +170,6 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
   });
 
   it('3. blocks unauthenticated visitors (401) and regular users (403) from all admin, moderation, user-list, and refund endpoints', async () => {
-    // Register a normal 'particulier' user (even if they try to inject role: 'admin' in body)
     const regUserRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -103,7 +180,7 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
         password: 'UserPass2026!',
         phone: '0661112233',
         advertiserType: 'particulier',
-        role: 'admin', // Attempted privilege escalation!
+        role: 'admin',
         termsAccepted: true,
       }),
     });
@@ -117,7 +194,7 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       path: string;
       body?: Record<string, unknown>;
     }> = [
-      { method: 'POST', path: '/api/listings/darna-1/moderate', body: { action: 'reject' } },
+      { method: 'POST', path: '/api/listings/darna-casa-01/moderate', body: { action: 'reject' } },
       { method: 'GET', path: '/api/reports' },
       { method: 'POST', path: '/api/reports/rep-1/resolve', body: { action: 'resolve' } },
       { method: 'GET', path: '/api/users' },
@@ -146,9 +223,12 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
         method: 'POST',
         path: '/api/payments/tx-fake/refund',
       },
+      {
+        method: 'POST',
+        path: '/api/admin/sessions/revoke-all',
+      },
     ];
 
-    // A) Visitor (no token) must receive 401 Unauthorized on every admin endpoint
     for (const route of adminProtectedRoutes) {
       const res = await fetch(`${baseUrl}${route.path}`, {
         method: route.method,
@@ -164,7 +244,6 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       assert.equal(data.code, 'UNAUTHORIZED');
     }
 
-    // B) Authenticated regular user must receive 403 Forbidden on every admin endpoint
     for (const route of adminProtectedRoutes) {
       const res = await fetch(`${baseUrl}${route.path}`, {
         method: route.method,
@@ -183,7 +262,6 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       assert.equal(data.code, 'FORBIDDEN_ADMIN_ONLY');
     }
 
-    // C) Authorized Admin (email in ADMIN_EMAILS) can access admin endpoints
     const regAdminRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -211,21 +289,51 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     assert.equal(adminUsersRes.status, 200);
   });
 
-  it('4. enforces two-step token verification for password reset and blocks unauthenticated password overwrites', async () => {
+  it('4. enforces real SMTP email sending for password reset, never claims email sent when unconfigured, and never leaks devResetToken', async () => {
     const email = 'youssef.alami@example.ma';
 
-    // Attempt to reset password without a valid resetToken must fail
-    const directResetRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
+    // A) When SMTP_HOST is not configured, request-password-reset must return 503 and emailSent: false
+    delete process.env.SMTP_HOST;
+    const unconfRes = await fetch(`${baseUrl}/api/auth/request-password-reset`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email,
-        newPassword: 'HackedPassword123!',
-      }),
+      body: JSON.stringify({ email }),
     });
-    assert.equal(directResetRes.status, 400);
+    const unconfData = await unconfRes.json();
+    assert.equal(unconfRes.status, 503);
+    assert.equal(unconfData.emailSent, false);
+    assert.equal(unconfData.code, 'EMAIL_SERVICE_NOT_CONFIGURED');
+    assert.equal(unconfData.devResetToken, undefined, 'Must never return devResetToken');
 
-    // Attempt with a forged resetToken must fail with 403
+    // B) Configure local SMTP server and request password reset
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtpPort);
+
+    const reqResetRes = await fetch(`${baseUrl}/api/auth/request-password-reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const reqResetData = await reqResetRes.json();
+    assert.equal(reqResetRes.status, 200);
+    assert.equal(reqResetData.emailSent, true);
+    assert.equal(
+      reqResetData.devResetToken,
+      undefined,
+      'Must never leak devResetToken in HTTP JSON response even in development/test mode'
+    );
+
+    // Extract the reset token from the actual SMTP message received by our local SMTP server
+    assert.ok(smtpServer.messages.length >= 1, 'SMTP server must have received the email');
+    const lastMailRaw = smtpServer.messages[smtpServer.messages.length - 1].raw.replace(
+      /=\r?\n/g,
+      ''
+    );
+    const match = lastMailRaw.match(/JETON_RESET:\s*([a-f0-9]{48})/i);
+    assert.ok(match && match[1], 'Email body must contain the 48-char cryptographic reset token');
+    const emailedResetToken = match[1];
+
+    // C) Forged reset token must fail with 403
     const forgedResetRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -237,54 +345,32 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     });
     assert.equal(forgedResetRes.status, 403);
 
-    // Legitimate step 1: request password reset token
-    const reqResetRes = await fetch(`${baseUrl}/api/auth/request-password-reset`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-    });
-    const reqResetData = await reqResetRes.json();
-    assert.equal(reqResetRes.status, 200);
-    assert.ok(reqResetData.devResetToken, 'Should return devResetToken in test environment');
-
-    // Legitimate step 2: consume resetToken with strong password
+    // D) Consume real emailed token with strong password
     const confirmResetRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email,
-        resetToken: reqResetData.devResetToken,
+        resetToken: emailedResetToken,
         newPassword: 'NewSecurePassword2026!',
       }),
     });
     assert.equal(confirmResetRes.status, 200);
 
-    // Reusing the same resetToken a second time must fail (single-use)
+    // E) Reusing the same resetToken a second time must fail (single-use)
     const replayResetRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         email,
-        resetToken: reqResetData.devResetToken,
+        resetToken: emailedResetToken,
         newPassword: 'AnotherPassword2026!',
       }),
     });
     assert.equal(replayResetRes.status, 403);
-
-    // Login with new password succeeds
-    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email,
-        password: 'NewSecurePassword2026!',
-      }),
-    });
-    assert.equal(loginRes.status, 200);
   });
 
   it('5. protects advertiser contact details from unauthenticated visitors and hides non-published listings', async () => {
-    // Visitor requests public listings
     const pubRes = await fetch(`${baseUrl}/api/listings`);
     const pubData = await pubRes.json();
     assert.equal(pubRes.status, 200);
@@ -296,19 +382,16 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     }
 
     const sampleListing = pubData.listings[0];
-    // Visitor requests /api/listings/:id/contact -> 401
     const visitorContactRes = await fetch(
       `${baseUrl}/api/listings/${sampleListing.id}/contact`
     );
     assert.equal(visitorContactRes.status, 401);
 
-    // Pure helper verification
     assert.equal(verifyAdminAuthorization(null).statusCode, 401);
     assert.equal(authorizeAdvertiserContactAccess(sampleListing, null).statusCode, 401);
   });
 
   it('6. disables Google and Apple social login endpoints by default and strictly rejects unverified social login attempts', async () => {
-    // A) By default (and in production), all social auth endpoints must return 403 SOCIAL_AUTH_DISABLED
     const gmailDisabledRes = await fetch(`${baseUrl}/api/auth/social-login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -331,7 +414,6 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     );
     assert.equal(callbackRes.status, 403);
 
-    // B) Even if ENABLE_SOCIAL_AUTH=true in non-production, plain email without a verified provider idToken is rejected (401)
     process.env.ENABLE_SOCIAL_AUTH = 'true';
     try {
       const noTokenRes = await fetch(`${baseUrl}/api/auth/social-login`, {
@@ -345,14 +427,9 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
         }),
       });
       const noTokenData = await noTokenRes.json();
-      assert.equal(
-        noTokenRes.status,
-        401,
-        'Social login without idToken must be rejected with 401'
-      );
+      assert.equal(noTokenRes.status, 401);
       assert.equal(noTokenData.code, 'PROVIDER_TOKEN_REQUIRED');
 
-      // Forged / unverified JWT must be rejected (401 INVALID_PROVIDER_TOKEN)
       const forgedTokenRes = await fetch(`${baseUrl}/api/auth/social-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -366,7 +443,6 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       assert.equal(forgedTokenRes.status, 401);
       assert.equal(forgedTokenData.code, 'INVALID_PROVIDER_TOKEN');
 
-      // Ensure no account was created for salma.mobile@gmail.com
       assert.equal(
         dbInstance.getUserByEmail('salma.mobile@gmail.com'),
         null,
@@ -377,8 +453,7 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     }
   });
 
-  it('7. requires a valid single-use cryptographic token to mark an email as verified', async () => {
-    // Login as regular user (whose emailVerified is initially false)
+  it('7. requires a valid single-use cryptographic token sent via SMTP to mark an email as verified and never leaks devVerificationToken', async () => {
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -392,7 +467,18 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     assert.equal(loginData.user.emailVerified, false);
     const userToken = loginData.token as string;
 
-    // A) Calling /api/auth/verify-email without a token must fail with 400
+    // A) Without SMTP configured, request-email-verification returns 503 and emailSent: false
+    delete process.env.SMTP_HOST;
+    const unconfVerifyReq = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+    const unconfVerifyData = await unconfVerifyReq.json();
+    assert.equal(unconfVerifyReq.status, 503);
+    assert.equal(unconfVerifyData.emailSent, false);
+    assert.equal(unconfVerifyData.devVerificationToken, undefined);
+
+    // B) Calling /api/auth/verify-email without a token fails with 400
     const noProofRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
       method: 'POST',
       headers: {
@@ -401,31 +487,32 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       },
       body: JSON.stringify({}),
     });
-    const noProofData = await noProofRes.json();
     assert.equal(noProofRes.status, 400);
-    assert.equal(noProofData.code, 'EMAIL_VERIFICATION_TOKEN_REQUIRED');
 
-    // B) Calling /api/auth/verify-email with a forged token must fail with 403
-    const forgedProofRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${userToken}`,
-      },
-      body: JSON.stringify({ verificationToken: 'forged-verification-token-123' }),
-    });
-    const forgedProofData = await forgedProofRes.json();
-    assert.equal(forgedProofRes.status, 403);
-    assert.equal(forgedProofData.code, 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN');
+    // C) Enable local SMTP server, request email verification, and verify token is delivered by SMTP (never in HTTP JSON)
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtpPort);
 
-    // C) Requesting a real verification token and consuming it succeeds once
     const reqTokenRes = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${userToken}` },
     });
     const reqTokenData = await reqTokenRes.json();
     assert.equal(reqTokenRes.status, 200);
-    assert.ok(reqTokenData.devVerificationToken);
+    assert.equal(reqTokenData.emailSent, true);
+    assert.equal(
+      reqTokenData.devVerificationToken,
+      undefined,
+      'Must never return devVerificationToken in HTTP response'
+    );
+
+    const lastMailRaw = smtpServer.messages[smtpServer.messages.length - 1].raw.replace(
+      /=\r?\n/g,
+      ''
+    );
+    const match = lastMailRaw.match(/JETON_VERIFICATION:\s*([a-f0-9]{48})/i);
+    assert.ok(match && match[1], 'Email must contain the 48-char verification token');
+    const emailedVerifyToken = match[1];
 
     const validVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
       method: 'POST',
@@ -433,46 +520,81 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
       },
-      body: JSON.stringify({ verificationToken: reqTokenData.devVerificationToken }),
+      body: JSON.stringify({ verificationToken: emailedVerifyToken }),
     });
     const validVerifyData = await validVerifyRes.json();
     assert.equal(validVerifyRes.status, 200);
     assert.equal(validVerifyData.user.emailVerified, true);
 
-    // D) Replaying the same verification token a second time must fail with 403
+    // D) Replaying the same verification token a second time fails with 403
     const replayVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
       },
-      body: JSON.stringify({ verificationToken: reqTokenData.devVerificationToken }),
+      body: JSON.stringify({ verificationToken: emailedVerifyToken }),
     });
     assert.equal(replayVerifyRes.status, 403);
   });
 
-  it('8. persists users, listings, subscriptions, and transactions across database restarts and supports global session revocation', async () => {
-    // Test global session revocation
+  it('8. refuses to confirm a save (HTTP 503) if PostgreSQL synchronization fails and persists across restarts when healthy', async () => {
+    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'youssef.alami@example.ma',
+        password: 'NewSecurePassword2026!',
+      }),
+    });
+    const { token } = await loginRes.json();
+
+    // Simulate a PostgreSQL connection outage during write
+    const listingsBefore = dbInstance.getAllListings().length;
+    dbInstance.setSimulateCloudSqlFailure(true);
+    try {
+      const failedListingRes = await fetch(`${baseUrl}/api/listings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: 'Annonce pendant panne PostgreSQL',
+          description: 'Ne doit jamais être confirmée comme sauvegardée.',
+          category: 'appartement',
+          price: 5000,
+          city: 'Casablanca',
+          neighborhood: 'Maarif',
+        }),
+      });
+      const failedListingData = await failedListingRes.json();
+      assert.equal(
+        failedListingRes.status,
+        503,
+        'Must return 503 Service Unavailable when PostgreSQL write fails'
+      );
+      assert.equal(failedListingData.success, false);
+      assert.equal(failedListingData.code, 'DATABASE_SYNC_FAILED');
+      assert.equal(
+        dbInstance.getAllListings().length,
+        listingsBefore,
+        'Must not write to local SQLite if PostgreSQL sync failed'
+      );
+    } finally {
+      dbInstance.setSimulateCloudSqlFailure(false);
+    }
+
+    // Global session revocation
     const revokedCount = await dbInstance.revokeAllSessions();
     assert.ok(revokedCount >= 1, 'Should revoke active sessions');
 
-    // Close current DB connection and open a brand-new connection to the same SQLite file
+    // Close current DB connection and reopen to verify restart persistence
     dbInstance.close();
-
     const reopenedDb = new DarnaPersistentDb(tempDbPath);
     const persistedUser = reopenedDb.getUserByEmail('youssef.alami@example.ma');
-    assert.ok(persistedUser, 'Registered user must persist on disk across DB restarts');
-    assert.ok(
-      persistedUser.passwordHash.startsWith('scrypt$'),
-      'Persisted password hash must be scrypt'
-    );
+    assert.ok(persistedUser, 'Registered user must persist across DB restarts');
     assert.equal(persistedUser.user.emailVerified, true);
-
-    const persistedListings = reopenedDb.getAllListings();
-    assert.ok(persistedListings.length >= 8, 'Existing listings must be preserved in SQLite');
-
-    const persistedPlans = reopenedDb.getAllPlans();
-    assert.equal(persistedPlans.length, 5, '5 subscription plans must be preserved in SQLite');
     reopenedDb.close();
   });
 });

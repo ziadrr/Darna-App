@@ -667,29 +667,18 @@ export default function App() {
         headers: { Authorization: `Bearer ${authToken}` },
       });
       const reqData = await reqRes.json();
-      if (!reqData.success || !reqData.devVerificationToken) {
+      if (!reqRes.ok || !reqData.success || reqData.emailSent !== true) {
         showToast(
           reqData.message ||
-            'Un jeton de vérification e-mail est requis (serveur SMTP requis en production).'
+            "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP) n'est pas configuré."
         );
         return;
       }
 
-      const res = await fetch('/api/auth/verify-email', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ verificationToken: reqData.devVerificationToken }),
-      });
-      const data = await res.json();
-      if (data.success && data.user) {
-        setCurrentUser(data.user);
-        showToast('Votre adresse e-mail est désormais vérifiée par jeton cryptographique !');
-      } else {
-        showToast(data.message || 'Jeton de vérification e-mail invalide.');
-      }
+      showToast(
+        reqData.message ||
+          'Un e-mail contenant votre jeton de vérification à usage unique a été envoyé.'
+      );
     } catch (err) {
       console.warn(err);
     }

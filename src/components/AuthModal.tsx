@@ -143,16 +143,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         body: JSON.stringify({ email }),
       });
       const data = await res.json();
-      if (!res.ok || !data.success) {
-        setError(data.message || 'Impossible de générer le code de réinitialisation.');
+      if (!res.ok || !data.success || data.emailSent !== true) {
+        setError(
+          data.message ||
+            "Aucun e-mail n'a été envoyé. Vérifiez l'adresse saisie ou la configuration du serveur SMTP."
+        );
       } else {
         setResetStep('confirm');
-        if (data.devResetToken) {
-          setResetToken(data.devResetToken);
-        }
         setSuccessMsg(
           data.message ||
-            'Si un compte existe avec cette adresse e-mail, un code de réinitialisation sécurisé a été émis.'
+            'Un e-mail contenant votre code de réinitialisation sécurisé a été envoyé.'
         );
       }
     } catch {

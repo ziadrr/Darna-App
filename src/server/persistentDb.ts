@@ -45,12 +45,16 @@ export class DarnaPersistentDb {
   private db: any;
   public readonly dbFilePath: string;
   private readonly enableCloudSqlSync: boolean;
+  private simulateCloudSqlFailure = false;
   private cloudSqlHydrated = false;
   private lastCloudSqlSyncAt = 0;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
 
-  constructor(customDbPath?: string) {
-    this.enableCloudSqlSync = !customDbPath && isCloudSqlConfigured();
+  constructor(customDbPath?: string, options?: { enableCloudSqlSync?: boolean }) {
+    this.enableCloudSqlSync =
+      options?.enableCloudSqlSync !== undefined
+        ? Boolean(options.enableCloudSqlSync && isCloudSqlConfigured())
+        : !customDbPath && isCloudSqlConfigured();
     this.dbFilePath =
       customDbPath ||
       process.env.DARNA_DB_PATH ||
@@ -70,14 +74,33 @@ export class DarnaPersistentDb {
   }
 
   /**
+   * Allows testing PostgreSQL connection failure behavior deterministically.
+   * When enabled, all write operations reject before modifying local SQLite.
+   */
+  public setSimulateCloudSqlFailure(fail: boolean): void {
+    this.simulateCloudSqlFailure = fail;
+  }
+
+  private assertCloudSqlWritable(): void {
+    if (this.simulateCloudSqlFailure) {
+      throw new Error(
+        'CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible, écriture annulée.'
+      );
+    }
+  }
+
+  /**
    * Synchronizes state from Cloud SQL PostgreSQL (when configured) so that restarts
    * and multi-instance deployments always read authoritative PostgreSQL data.
    */
   public async ensureCloudSqlHydrated(forceRefresh = false): Promise<void> {
+    if (this.simulateCloudSqlFailure) {
+      throw new Error('CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible.');
+    }
     if (!this.enableCloudSqlSync) return;
     const now = Date.now();
-    // Refresh from Cloud SQL at least every 2 seconds across requests for multi-instance consistency
-    if (this.cloudSqlHydrated && !forceRefresh && now - this.lastCloudSqlSyncAt < 2000) {
+    // Refresh from Cloud SQL across requests for multi-instance consistency (150ms coalescing window)
+    if (this.cloudSqlHydrated && !forceRefresh && now - this.lastCloudSqlSyncAt < 150) {
       return;
     }
     if (this.cloudSqlHydratingPromise) {
@@ -173,6 +196,7 @@ export class DarnaPersistentDb {
             )
           );
         } else if (state.users.length > 0) {
+          this.db.prepare('DELETE FROM users').run();
           for (const u of state.users) {
             this.db
               .prepare(
@@ -201,6 +225,7 @@ export class DarnaPersistentDb {
         }
 
         if (state.resetTokens) {
+          this.db.prepare('DELETE FROM password_reset_tokens').run();
           for (const rt of state.resetTokens) {
             this.db
               .prepare(
@@ -210,6 +235,7 @@ export class DarnaPersistentDb {
           }
         }
 
+        this.db.prepare('DELETE FROM transactions').run();
         for (const tx of state.transactions) {
           this.db
             .prepare(
@@ -438,6 +464,7 @@ export class DarnaPersistentDb {
   }
 
   public async createUser(user: User, plainPassword: string): Promise<User> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const normalizedEmail = user.email.trim().toLowerCase();
     const cleanUser: User = { ...user, email: normalizedEmail };
@@ -467,6 +494,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateUser(user: User): Promise<User> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const normalizedEmail = user.email.trim().toLowerCase();
     const cleanUser: User = { ...user, email: normalizedEmail };
@@ -491,6 +519,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateUserPassword(userId: string, newPlainPassword: string): Promise<void> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const passwordHash = hashPassword(newPlainPassword);
 
@@ -521,6 +550,7 @@ export class DarnaPersistentDb {
   // ==========================================================================
 
   public async createSession(userId: string, ttlMs = 7 * 24 * 3600 * 1000): Promise<string> {
+    this.assertCloudSqlWritable();
     const rawToken = `darna_${generateSecureToken(32)}`;
     const tokenHash = hashToken(rawToken);
     const expiresAt = Date.now() + ttlMs;
@@ -559,6 +589,7 @@ export class DarnaPersistentDb {
   }
 
   public async deleteSession(rawToken: string): Promise<void> {
+    this.assertCloudSqlWritable();
     if (!rawToken) return;
     const tokenHash = hashToken(rawToken);
     if (this.enableCloudSqlSync) {
@@ -568,6 +599,7 @@ export class DarnaPersistentDb {
   }
 
   public async revokeAllSessions(): Promise<number> {
+    this.assertCloudSqlWritable();
     if (this.enableCloudSqlSync) {
       await revokeAllSessionsInCloudSql();
     }
@@ -587,6 +619,7 @@ export class DarnaPersistentDb {
     email: string,
     ttlMs = 15 * 60 * 1000
   ): Promise<string | null> {
+    this.assertCloudSqlWritable();
     const record = this.getUserByEmail(email);
     if (!record) return null;
 
@@ -623,6 +656,7 @@ export class DarnaPersistentDb {
     rawResetToken: string,
     newPlainPassword: string
   ): Promise<boolean> {
+    this.assertCloudSqlWritable();
     if (!email || !rawResetToken || !newPlainPassword) return false;
     const normalizedEmail = String(email).trim().toLowerCase();
     const tokenHash = hashToken(rawResetToken.trim());
@@ -666,6 +700,7 @@ export class DarnaPersistentDb {
     email: string,
     ttlMs = 15 * 60 * 1000
   ): Promise<string> {
+    this.assertCloudSqlWritable();
     const rawVerifyToken = generateSecureToken(24);
     const tokenHash = hashToken(rawVerifyToken);
     const expiresAt = Date.now() + ttlMs;
@@ -699,6 +734,7 @@ export class DarnaPersistentDb {
     email: string,
     rawVerifyToken: string
   ): Promise<User | null> {
+    this.assertCloudSqlWritable();
     if (!userId || !email || !rawVerifyToken) return null;
     const taggedEmail = `verify:${email.trim().toLowerCase()}`;
     const tokenHash = hashToken(rawVerifyToken.trim());
@@ -759,6 +795,7 @@ export class DarnaPersistentDb {
   }
 
   public async createListing(listing: Listing): Promise<Listing> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const sortTime = Date.now();
 
@@ -784,6 +821,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateListing(listing: Listing): Promise<Listing> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const updated = { ...listing, updatedAt: nowIso };
 
@@ -801,6 +839,7 @@ export class DarnaPersistentDb {
   }
 
   public async deleteListing(id: string): Promise<boolean> {
+    this.assertCloudSqlWritable();
     if (this.enableCloudSqlSync) {
       await deleteListingFromCloudSql(id);
     }
@@ -827,6 +866,7 @@ export class DarnaPersistentDb {
   }
 
   public async createReport(report: ListingReport): Promise<ListingReport> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
 
     if (this.enableCloudSqlSync) {
@@ -850,6 +890,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateReport(report: ListingReport): Promise<ListingReport> {
+    this.assertCloudSqlWritable();
     if (this.enableCloudSqlSync) {
       await syncReportToCloudSql(report);
     }
@@ -880,6 +921,7 @@ export class DarnaPersistentDb {
   }
 
   public async createPlan(plan: SubscriptionPlan): Promise<SubscriptionPlan> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
     const maxOrderRow = this.db
       .prepare('SELECT COALESCE(MAX(sort_order), 0) as maxOrder FROM subscription_plans')
@@ -900,6 +942,7 @@ export class DarnaPersistentDb {
   }
 
   public async updatePlan(plan: SubscriptionPlan): Promise<SubscriptionPlan> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
 
     if (this.enableCloudSqlSync) {
@@ -928,6 +971,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateBoostOption(opt: BoostOption): Promise<BoostOption> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
 
     if (this.enableCloudSqlSync) {
@@ -974,6 +1018,7 @@ export class DarnaPersistentDb {
   }
 
   public async createTransaction(tx: PaymentTransaction): Promise<PaymentTransaction> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
 
     if (this.enableCloudSqlSync) {
@@ -999,6 +1044,7 @@ export class DarnaPersistentDb {
   }
 
   public async updateTransaction(tx: PaymentTransaction): Promise<PaymentTransaction> {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
 
     if (this.enableCloudSqlSync) {
