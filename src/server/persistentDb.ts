@@ -28,6 +28,8 @@ import {
   syncUserToCloudSql,
   syncSessionToCloudSql,
   deleteSessionFromCloudSql,
+  deleteUserSessionsFromCloudSql,
+  revokeAllSessionsInCloudSql,
   syncPasswordResetTokenToCloudSql,
   syncListingToCloudSql,
   deleteListingFromCloudSql,
@@ -44,6 +46,7 @@ export class DarnaPersistentDb {
   public readonly dbFilePath: string;
   private readonly enableCloudSqlSync: boolean;
   private cloudSqlHydrated = false;
+  private lastCloudSqlSyncAt = 0;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
 
   constructor(customDbPath?: string) {
@@ -67,11 +70,16 @@ export class DarnaPersistentDb {
   }
 
   /**
-   * Lazily synchronizes state between Cloud SQL PostgreSQL (when configured) and the local
-   * fast cache on the first incoming HTTP request. Never runs at module load time.
+   * Synchronizes state from Cloud SQL PostgreSQL (when configured) so that restarts
+   * and multi-instance deployments always read authoritative PostgreSQL data.
    */
-  public async ensureCloudSqlHydrated(): Promise<void> {
-    if (!this.enableCloudSqlSync || this.cloudSqlHydrated) return;
+  public async ensureCloudSqlHydrated(forceRefresh = false): Promise<void> {
+    if (!this.enableCloudSqlSync) return;
+    const now = Date.now();
+    // Refresh from Cloud SQL at least every 2 seconds across requests for multi-instance consistency
+    if (this.cloudSqlHydrated && !forceRefresh && now - this.lastCloudSqlSyncAt < 2000) {
+      return;
+    }
     if (this.cloudSqlHydratingPromise) {
       return this.cloudSqlHydratingPromise;
     }
@@ -83,23 +91,107 @@ export class DarnaPersistentDb {
 
         const nowIso = new Date().toISOString();
 
-        // 1. If Cloud SQL has existing users/listings/plans/transactions, hydrate into local cache
-        for (const u of state.users) {
-          this.db
-            .prepare(
-              'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-            )
-            .run(
-              u.user.id,
-              u.user.email.toLowerCase(),
-              u.passwordHash,
-              u.user.role,
-              JSON.stringify(u.user),
-              u.user.createdAt || nowIso,
-              nowIso
-            );
+        // If Cloud SQL was newly provisioned and completely empty, push initial catalog first
+        if (state.plans.length === 0) {
+          const allPlans = this.getAllPlans();
+          await Promise.all(allPlans.map((p, i) => syncPlanToCloudSql(p, i)));
+        } else {
+          state.plans.forEach((p, idx) => {
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO subscription_plans (id, sort_order, data_json, updated_at) VALUES (?, ?, ?, ?)'
+              )
+              .run(p.id, idx, JSON.stringify(p), nowIso);
+          });
         }
 
+        if (state.boostOptions.length === 0) {
+          const allBoosts = this.getAllBoostOptions();
+          await Promise.all(allBoosts.map((b, i) => syncBoostOptionToCloudSql(b, i)));
+        } else {
+          state.boostOptions.forEach((b, idx) => {
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO boost_options (id, sort_order, data_json, updated_at) VALUES (?, ?, ?, ?)'
+              )
+              .run(b.id, idx, JSON.stringify(b), nowIso);
+          });
+        }
+
+        if (state.listings.length === 0 && !this.cloudSqlHydrated) {
+          const allListings = this.getAllListings();
+          await Promise.all(allListings.map((l) => syncListingToCloudSql(l)));
+        } else if (state.listings.length > 0) {
+          // Reconcile listings so deletions on another instance are reflected
+          this.db.prepare('DELETE FROM listings').run();
+          for (const l of state.listings) {
+            const sortTime = new Date(l.createdAt || nowIso).getTime() || Date.now();
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+              )
+              .run(
+                l.id,
+                l.userId,
+                l.status,
+                sortTime,
+                JSON.stringify(l),
+                l.createdAt || nowIso,
+                l.updatedAt || nowIso
+              );
+          }
+        }
+
+        if (state.reports.length === 0 && !this.cloudSqlHydrated) {
+          const allReports = this.getAllReports();
+          await Promise.all(allReports.map((r) => syncReportToCloudSql(r)));
+        } else if (state.reports.length > 0) {
+          for (const r of state.reports) {
+            const sortTime = new Date(r.createdAt || nowIso).getTime() || Date.now();
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO reports (id, listing_id, status, sort_time, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+              )
+              .run(
+                r.id,
+                r.listingId,
+                r.status,
+                sortTime,
+                JSON.stringify(r),
+                r.createdAt || nowIso
+              );
+          }
+        }
+
+        if (state.users.length === 0 && !this.cloudSqlHydrated) {
+          const userRows = this.db
+            .prepare('SELECT data_json, password_hash FROM users')
+            .all() as { data_json: string; password_hash: string }[];
+          await Promise.all(
+            userRows.map((row) =>
+              syncUserToCloudSql(JSON.parse(row.data_json) as User, row.password_hash)
+            )
+          );
+        } else if (state.users.length > 0) {
+          for (const u of state.users) {
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+              )
+              .run(
+                u.user.id,
+                u.user.email.toLowerCase(),
+                u.passwordHash,
+                u.user.role,
+                JSON.stringify(u.user),
+                u.user.createdAt || nowIso,
+                nowIso
+              );
+          }
+        }
+
+        // Reconcile sessions from Cloud SQL (so session revocations apply across all instances)
+        this.db.prepare('DELETE FROM sessions').run();
         for (const s of state.sessions) {
           this.db
             .prepare(
@@ -108,54 +200,15 @@ export class DarnaPersistentDb {
             .run(s.tokenHash, s.userUid, s.expiresAt, nowIso);
         }
 
-        for (const l of state.listings) {
-          const sortTime = new Date(l.createdAt || nowIso).getTime() || Date.now();
-          this.db
-            .prepare(
-              'INSERT OR REPLACE INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-            )
-            .run(
-              l.id,
-              l.userId,
-              l.status,
-              sortTime,
-              JSON.stringify(l),
-              l.createdAt || nowIso,
-              l.updatedAt || nowIso
-            );
+        if (state.resetTokens) {
+          for (const rt of state.resetTokens) {
+            this.db
+              .prepare(
+                'INSERT OR REPLACE INTO password_reset_tokens (token_hash, user_id, email, expires_at, used, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+              )
+              .run(rt.tokenHash, rt.userUid, rt.email, rt.expiresAt, rt.used, nowIso);
+          }
         }
-
-        for (const r of state.reports) {
-          const sortTime = new Date(r.createdAt || nowIso).getTime() || Date.now();
-          this.db
-            .prepare(
-              'INSERT OR REPLACE INTO reports (id, listing_id, status, sort_time, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-            )
-            .run(
-              r.id,
-              r.listingId,
-              r.status,
-              sortTime,
-              JSON.stringify(r),
-              r.createdAt || nowIso
-            );
-        }
-
-        state.plans.forEach((p, idx) => {
-          this.db
-            .prepare(
-              'INSERT OR REPLACE INTO subscription_plans (id, sort_order, data_json, updated_at) VALUES (?, ?, ?, ?)'
-            )
-            .run(p.id, idx, JSON.stringify(p), nowIso);
-        });
-
-        state.boostOptions.forEach((b, idx) => {
-          this.db
-            .prepare(
-              'INSERT OR REPLACE INTO boost_options (id, sort_order, data_json, updated_at) VALUES (?, ?, ?, ?)'
-            )
-            .run(b.id, idx, JSON.stringify(b), nowIso);
-        });
 
         for (const tx of state.transactions) {
           this.db
@@ -174,37 +227,8 @@ export class DarnaPersistentDb {
             );
         }
 
-        // 2. If Cloud SQL was newly provisioned and empty, push existing initial catalog to Cloud SQL
-        if (state.plans.length === 0) {
-          const allPlans = this.getAllPlans();
-          await Promise.all(allPlans.map((p, i) => syncPlanToCloudSql(p, i)));
-        }
-        if (state.boostOptions.length === 0) {
-          const allBoosts = this.getAllBoostOptions();
-          await Promise.all(allBoosts.map((b, i) => syncBoostOptionToCloudSql(b, i)));
-        }
-        if (state.listings.length === 0) {
-          const allListings = this.getAllListings();
-          await Promise.all(allListings.map((l) => syncListingToCloudSql(l)));
-        }
-        if (state.reports.length === 0) {
-          const allReports = this.getAllReports();
-          await Promise.all(allReports.map((r) => syncReportToCloudSql(r)));
-        }
-        if (state.users.length === 0) {
-          const userRows = this.db
-            .prepare('SELECT data_json, password_hash FROM users')
-            .all() as { data_json: string; password_hash: string }[];
-          await Promise.all(
-            userRows.map((row) =>
-              syncUserToCloudSql(JSON.parse(row.data_json) as User, row.password_hash)
-            )
-          );
-        }
-
         this.cloudSqlHydrated = true;
-      } catch (err) {
-        console.error('Cloud SQL hydration warning:', err);
+        this.lastCloudSqlSyncAt = Date.now();
       } finally {
         this.cloudSqlHydratingPromise = null;
       }
@@ -384,7 +408,7 @@ export class DarnaPersistentDb {
   }
 
   // ==========================================================================
-  // USERS & AUTHENTICATION
+  // USERS & AUTHENTICATION (Awaited Cloud SQL Write-First)
   // ==========================================================================
 
   public getAllUsers(): User[] {
@@ -413,12 +437,18 @@ export class DarnaPersistentDb {
     };
   }
 
-  public createUser(user: User, plainPassword: string): User {
+  public async createUser(user: User, plainPassword: string): Promise<User> {
     const nowIso = new Date().toISOString();
     const normalizedEmail = user.email.trim().toLowerCase();
     const cleanUser: User = { ...user, email: normalizedEmail };
     const passwordHash = hashPassword(plainPassword);
 
+    // 1. Write to Cloud SQL PostgreSQL first when enabled; throw if it fails
+    if (this.enableCloudSqlSync) {
+      await syncUserToCloudSql(cleanUser, passwordHash);
+    }
+
+    // 2. Update local cache after Cloud SQL succeeds
     this.db
       .prepare(
         'INSERT INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -433,19 +463,17 @@ export class DarnaPersistentDb {
         nowIso
       );
 
-    if (this.enableCloudSqlSync) {
-      syncUserToCloudSql(cleanUser, passwordHash).catch((err) =>
-        console.error('Cloud SQL user sync error:', err)
-      );
-    }
-
     return cleanUser;
   }
 
-  public updateUser(user: User): User {
+  public async updateUser(user: User): Promise<User> {
     const nowIso = new Date().toISOString();
     const normalizedEmail = user.email.trim().toLowerCase();
     const cleanUser: User = { ...user, email: normalizedEmail };
+
+    if (this.enableCloudSqlSync) {
+      await syncUserToCloudSql(cleanUser);
+    }
 
     this.db
       .prepare(
@@ -459,31 +487,25 @@ export class DarnaPersistentDb {
         cleanUser.id
       );
 
-    if (this.enableCloudSqlSync) {
-      syncUserToCloudSql(cleanUser).catch((err) =>
-        console.error('Cloud SQL user update sync error:', err)
-      );
-    }
-
     return cleanUser;
   }
 
-  public updateUserPassword(userId: string, newPlainPassword: string): void {
+  public async updateUserPassword(userId: string, newPlainPassword: string): Promise<void> {
     const nowIso = new Date().toISOString();
     const passwordHash = hashPassword(newPlainPassword);
-    this.db
-      .prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
-      .run(passwordHash, nowIso, userId);
-    this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 
     if (this.enableCloudSqlSync) {
       const updatedUser = this.getUserById(userId);
       if (updatedUser) {
-        syncUserToCloudSql(updatedUser, passwordHash).catch((err) =>
-          console.error('Cloud SQL password sync error:', err)
-        );
+        await syncUserToCloudSql(updatedUser, passwordHash);
       }
+      await deleteUserSessionsFromCloudSql(userId);
     }
+
+    this.db
+      .prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
+      .run(passwordHash, nowIso, userId);
+    this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
   }
 
   public verifyUserCredentials(email: string, plainPassword: string): User | null {
@@ -495,26 +517,24 @@ export class DarnaPersistentDb {
   }
 
   // ==========================================================================
-  // SESSIONS (Hashed with SHA-256)
+  // SESSIONS (Hashed with SHA-256, Awaited Cloud SQL Write-First)
   // ==========================================================================
 
-  public createSession(userId: string, ttlMs = 7 * 24 * 3600 * 1000): string {
+  public async createSession(userId: string, ttlMs = 7 * 24 * 3600 * 1000): Promise<string> {
     const rawToken = `darna_${generateSecureToken(32)}`;
     const tokenHash = hashToken(rawToken);
     const expiresAt = Date.now() + ttlMs;
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncSessionToCloudSql(tokenHash, userId, expiresAt);
+    }
 
     this.db
       .prepare(
         'INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
       )
       .run(tokenHash, userId, expiresAt, nowIso);
-
-    if (this.enableCloudSqlSync) {
-      syncSessionToCloudSql(tokenHash, userId, expiresAt).catch((err) =>
-        console.error('Cloud SQL session sync error:', err)
-      );
-    }
 
     return rawToken;
   }
@@ -538,20 +558,35 @@ export class DarnaPersistentDb {
     return this.getUserById(row.user_id);
   }
 
-  public deleteSession(rawToken: string): void {
+  public async deleteSession(rawToken: string): Promise<void> {
     if (!rawToken) return;
     const tokenHash = hashToken(rawToken);
-    this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
     if (this.enableCloudSqlSync) {
-      deleteSessionFromCloudSql(tokenHash).catch(() => {});
+      await deleteSessionFromCloudSql(tokenHash);
     }
+    this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  }
+
+  public async revokeAllSessions(): Promise<number> {
+    if (this.enableCloudSqlSync) {
+      await revokeAllSessionsInCloudSql();
+    }
+    const countRow = this.db
+      .prepare('SELECT COUNT(*) as cnt FROM sessions')
+      .get() as { cnt: number } | undefined;
+    const count = countRow?.cnt || 0;
+    this.db.prepare('DELETE FROM sessions').run();
+    return count;
   }
 
   // ==========================================================================
-  // PASSWORD RESET TOKENS (Single-use, 15-minute expiry, SHA-256 hashed)
+  // PASSWORD RESET & EMAIL VERIFICATION TOKENS (Single-use, 15-min, SHA-256)
   // ==========================================================================
 
-  public createPasswordResetToken(email: string, ttlMs = 15 * 60 * 1000): string | null {
+  public async createPasswordResetToken(
+    email: string,
+    ttlMs = 15 * 60 * 1000
+  ): Promise<string | null> {
     const record = this.getUserByEmail(email);
     if (!record) return null;
 
@@ -560,9 +595,19 @@ export class DarnaPersistentDb {
     const expiresAt = Date.now() + ttlMs;
     const nowIso = new Date().toISOString();
 
+    if (this.enableCloudSqlSync) {
+      await syncPasswordResetTokenToCloudSql(
+        tokenHash,
+        record.user.id,
+        record.user.email,
+        expiresAt,
+        0
+      );
+    }
+
     this.db
-      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ?')
-      .run(record.user.id);
+      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ? AND email = ?')
+      .run(record.user.id, record.user.email);
 
     this.db
       .prepare(
@@ -570,24 +615,14 @@ export class DarnaPersistentDb {
       )
       .run(tokenHash, record.user.id, record.user.email, expiresAt, nowIso);
 
-    if (this.enableCloudSqlSync) {
-      syncPasswordResetTokenToCloudSql(
-        tokenHash,
-        record.user.id,
-        record.user.email,
-        expiresAt,
-        0
-      ).catch(() => {});
-    }
-
     return rawResetToken;
   }
 
-  public consumePasswordResetToken(
+  public async consumePasswordResetToken(
     email: string,
     rawResetToken: string,
     newPlainPassword: string
-  ): boolean {
+  ): Promise<boolean> {
     if (!email || !rawResetToken || !newPlainPassword) return false;
     const normalizedEmail = String(email).trim().toLowerCase();
     const tokenHash = hashToken(rawResetToken.trim());
@@ -605,26 +640,108 @@ export class DarnaPersistentDb {
     if (row.email.toLowerCase() !== normalizedEmail) return false;
     if (Date.now() > row.expires_at) return false;
 
-    this.db
-      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?')
-      .run(tokenHash);
-
     if (this.enableCloudSqlSync) {
-      syncPasswordResetTokenToCloudSql(
+      await syncPasswordResetTokenToCloudSql(
         tokenHash,
         row.user_id,
         row.email,
         row.expires_at,
         1
-      ).catch(() => {});
+      );
     }
 
-    this.updateUserPassword(row.user_id, newPlainPassword);
+    this.db
+      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?')
+      .run(tokenHash);
+
+    await this.updateUserPassword(row.user_id, newPlainPassword);
     return true;
   }
 
+  /**
+   * Generates a single-use cryptographic token to verify ownership of an email address.
+   */
+  public async createEmailVerificationToken(
+    userId: string,
+    email: string,
+    ttlMs = 15 * 60 * 1000
+  ): Promise<string> {
+    const rawVerifyToken = generateSecureToken(24);
+    const tokenHash = hashToken(rawVerifyToken);
+    const expiresAt = Date.now() + ttlMs;
+    const nowIso = new Date().toISOString();
+    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
+
+    if (this.enableCloudSqlSync) {
+      await syncPasswordResetTokenToCloudSql(
+        tokenHash,
+        userId,
+        taggedEmail,
+        expiresAt,
+        0
+      );
+    }
+
+    this.db
+      .prepare(
+        'INSERT INTO password_reset_tokens (token_hash, user_id, email, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)'
+      )
+      .run(tokenHash, userId, taggedEmail, expiresAt, nowIso);
+
+    return rawVerifyToken;
+  }
+
+  /**
+   * Validates and consumes a single-use cryptographic email verification token.
+   */
+  public async consumeEmailVerificationToken(
+    userId: string,
+    email: string,
+    rawVerifyToken: string
+  ): Promise<User | null> {
+    if (!userId || !email || !rawVerifyToken) return null;
+    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
+    const tokenHash = hashToken(rawVerifyToken.trim());
+
+    const row = this.db
+      .prepare(
+        'SELECT user_id, email, expires_at, used FROM password_reset_tokens WHERE token_hash = ?'
+      )
+      .get(tokenHash) as
+      | { user_id: string; email: string; expires_at: number; used: number }
+      | undefined;
+
+    if (!row) return null;
+    if (row.used !== 0) return null;
+    if (row.user_id !== userId) return null;
+    if (row.email !== taggedEmail) return null;
+    if (Date.now() > row.expires_at) return null;
+
+    const user = this.getUserById(userId);
+    if (!user) return null;
+
+    if (this.enableCloudSqlSync) {
+      await syncPasswordResetTokenToCloudSql(
+        tokenHash,
+        row.user_id,
+        row.email,
+        row.expires_at,
+        1
+      );
+    }
+
+    this.db
+      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?')
+      .run(tokenHash);
+
+    user.emailVerified = true;
+    user.verified = true;
+    const updatedUser = await this.updateUser(user);
+    return updatedUser;
+  }
+
   // ==========================================================================
-  // LISTINGS
+  // LISTINGS (Awaited Cloud SQL Write-First)
   // ==========================================================================
 
   public getAllListings(): Listing[] {
@@ -641,9 +758,14 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as Listing) : null;
   }
 
-  public createListing(listing: Listing): Listing {
+  public async createListing(listing: Listing): Promise<Listing> {
     const nowIso = new Date().toISOString();
     const sortTime = Date.now();
+
+    if (this.enableCloudSqlSync) {
+      await syncListingToCloudSql(listing);
+    }
+
     this.db
       .prepare(
         'INSERT INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -658,45 +780,36 @@ export class DarnaPersistentDb {
         listing.updatedAt || nowIso
       );
 
-    if (this.enableCloudSqlSync) {
-      syncListingToCloudSql(listing).catch((err) =>
-        console.error('Cloud SQL listing create sync error:', err)
-      );
-    }
-
     return listing;
   }
 
-  public updateListing(listing: Listing): Listing {
+  public async updateListing(listing: Listing): Promise<Listing> {
     const nowIso = new Date().toISOString();
     const updated = { ...listing, updatedAt: nowIso };
+
+    if (this.enableCloudSqlSync) {
+      await syncListingToCloudSql(updated);
+    }
+
     this.db
       .prepare(
         'UPDATE listings SET status = ?, data_json = ?, updated_at = ? WHERE id = ?'
       )
       .run(updated.status, JSON.stringify(updated), nowIso, updated.id);
 
-    if (this.enableCloudSqlSync) {
-      syncListingToCloudSql(updated).catch((err) =>
-        console.error('Cloud SQL listing update sync error:', err)
-      );
-    }
-
     return updated;
   }
 
-  public deleteListing(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM listings WHERE id = ?').run(id);
+  public async deleteListing(id: string): Promise<boolean> {
     if (this.enableCloudSqlSync) {
-      deleteListingFromCloudSql(id).catch((err) =>
-        console.error('Cloud SQL listing delete sync error:', err)
-      );
+      await deleteListingFromCloudSql(id);
     }
+    const res = this.db.prepare('DELETE FROM listings WHERE id = ?').run(id);
     return Number(res.changes) > 0;
   }
 
   // ==========================================================================
-  // REPORTS
+  // REPORTS (Awaited Cloud SQL Write-First)
   // ==========================================================================
 
   public getAllReports(): ListingReport[] {
@@ -713,8 +826,13 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as ListingReport) : null;
   }
 
-  public createReport(report: ListingReport): ListingReport {
+  public async createReport(report: ListingReport): Promise<ListingReport> {
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncReportToCloudSql(report);
+    }
+
     this.db
       .prepare(
         'INSERT INTO reports (id, listing_id, status, sort_time, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
@@ -728,31 +846,23 @@ export class DarnaPersistentDb {
         report.createdAt || nowIso
       );
 
-    if (this.enableCloudSqlSync) {
-      syncReportToCloudSql(report).catch((err) =>
-        console.error('Cloud SQL report create sync error:', err)
-      );
-    }
-
     return report;
   }
 
-  public updateReport(report: ListingReport): ListingReport {
+  public async updateReport(report: ListingReport): Promise<ListingReport> {
+    if (this.enableCloudSqlSync) {
+      await syncReportToCloudSql(report);
+    }
+
     this.db
       .prepare('UPDATE reports SET status = ?, data_json = ? WHERE id = ?')
       .run(report.status, JSON.stringify(report), report.id);
-
-    if (this.enableCloudSqlSync) {
-      syncReportToCloudSql(report).catch((err) =>
-        console.error('Cloud SQL report update sync error:', err)
-      );
-    }
 
     return report;
   }
 
   // ==========================================================================
-  // SUBSCRIPTION PLANS & BOOST OPTIONS
+  // SUBSCRIPTION PLANS & BOOST OPTIONS (Awaited Cloud SQL Write-First)
   // ==========================================================================
 
   public getAllPlans(): SubscriptionPlan[] {
@@ -769,38 +879,36 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as SubscriptionPlan) : null;
   }
 
-  public createPlan(plan: SubscriptionPlan): SubscriptionPlan {
+  public async createPlan(plan: SubscriptionPlan): Promise<SubscriptionPlan> {
     const nowIso = new Date().toISOString();
     const maxOrderRow = this.db
       .prepare('SELECT COALESCE(MAX(sort_order), 0) as maxOrder FROM subscription_plans')
       .get() as { maxOrder: number };
     const nextOrder = (maxOrderRow?.maxOrder || 0) + 1;
+
+    if (this.enableCloudSqlSync) {
+      await syncPlanToCloudSql(plan, nextOrder);
+    }
+
     this.db
       .prepare(
         'INSERT INTO subscription_plans (id, sort_order, data_json, updated_at) VALUES (?, ?, ?, ?)'
       )
       .run(plan.id, nextOrder, JSON.stringify(plan), nowIso);
 
-    if (this.enableCloudSqlSync) {
-      syncPlanToCloudSql(plan, nextOrder).catch((err) =>
-        console.error('Cloud SQL plan create sync error:', err)
-      );
-    }
-
     return plan;
   }
 
-  public updatePlan(plan: SubscriptionPlan): SubscriptionPlan {
+  public async updatePlan(plan: SubscriptionPlan): Promise<SubscriptionPlan> {
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncPlanToCloudSql(plan);
+    }
+
     this.db
       .prepare('UPDATE subscription_plans SET data_json = ?, updated_at = ? WHERE id = ?')
       .run(JSON.stringify(plan), nowIso, plan.id);
-
-    if (this.enableCloudSqlSync) {
-      syncPlanToCloudSql(plan).catch((err) =>
-        console.error('Cloud SQL plan update sync error:', err)
-      );
-    }
 
     return plan;
   }
@@ -819,23 +927,22 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as BoostOption) : null;
   }
 
-  public updateBoostOption(opt: BoostOption): BoostOption {
+  public async updateBoostOption(opt: BoostOption): Promise<BoostOption> {
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncBoostOptionToCloudSql(opt);
+    }
+
     this.db
       .prepare('UPDATE boost_options SET data_json = ?, updated_at = ? WHERE id = ?')
       .run(JSON.stringify(opt), nowIso, opt.id);
-
-    if (this.enableCloudSqlSync) {
-      syncBoostOptionToCloudSql(opt).catch((err) =>
-        console.error('Cloud SQL boost update sync error:', err)
-      );
-    }
 
     return opt;
   }
 
   // ==========================================================================
-  // TRANSACTIONS
+  // TRANSACTIONS (Awaited Cloud SQL Write-First)
   // ==========================================================================
 
   public getAllTransactions(): PaymentTransaction[] {
@@ -866,8 +973,13 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as PaymentTransaction) : null;
   }
 
-  public createTransaction(tx: PaymentTransaction): PaymentTransaction {
+  public async createTransaction(tx: PaymentTransaction): Promise<PaymentTransaction> {
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncTransactionToCloudSql(tx);
+    }
+
     this.db
       .prepare(
         'INSERT INTO transactions (id, idempotency_key, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -883,26 +995,19 @@ export class DarnaPersistentDb {
         nowIso
       );
 
-    if (this.enableCloudSqlSync) {
-      syncTransactionToCloudSql(tx).catch((err) =>
-        console.error('Cloud SQL transaction create sync error:', err)
-      );
-    }
-
     return tx;
   }
 
-  public updateTransaction(tx: PaymentTransaction): PaymentTransaction {
+  public async updateTransaction(tx: PaymentTransaction): Promise<PaymentTransaction> {
     const nowIso = new Date().toISOString();
+
+    if (this.enableCloudSqlSync) {
+      await syncTransactionToCloudSql(tx);
+    }
+
     this.db
       .prepare('UPDATE transactions SET status = ?, data_json = ?, updated_at = ? WHERE id = ?')
       .run(tx.status, JSON.stringify(tx), nowIso, tx.id);
-
-    if (this.enableCloudSqlSync) {
-      syncTransactionToCloudSql(tx).catch((err) =>
-        console.error('Cloud SQL transaction update sync error:', err)
-      );
-    }
 
     return tx;
   }

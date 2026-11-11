@@ -307,8 +307,9 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
     assert.equal(authorizeAdvertiserContactAccess(sampleListing, null).statusCode, 401);
   });
 
-  it('6. supports Google/Gmail and Apple iOS social sign-in while protecting admin accounts', async () => {
-    const gmailRes = await fetch(`${baseUrl}/api/auth/social-login`, {
+  it('6. disables Google and Apple social login endpoints by default and strictly rejects unverified social login attempts', async () => {
+    // A) By default (and in production), all social auth endpoints must return 403 SOCIAL_AUTH_DISABLED
+    const gmailDisabledRes = await fetch(`${baseUrl}/api/auth/social-login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -316,44 +317,145 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
         email: 'salma.mobile@gmail.com',
         firstName: 'Salma',
         lastName: 'Idrissi',
-        advertiserType: 'particulier',
       }),
     });
-    const gmailData = await gmailRes.json();
-    assert.equal(gmailRes.status, 200);
-    assert.equal(gmailData.user.email, 'salma.mobile@gmail.com');
-    assert.equal(gmailData.user.role, 'particulier');
-    assert.ok(gmailData.token.startsWith('darna_'));
+    const gmailDisabledData = await gmailDisabledRes.json();
+    assert.equal(gmailDisabledRes.status, 403);
+    assert.equal(gmailDisabledData.code, 'SOCIAL_AUTH_DISABLED');
 
-    const appleRes = await fetch(`${baseUrl}/api/auth/social-login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider: 'apple',
-        email: 'mehdi.ios@icloud.com',
-        firstName: 'Mehdi',
-        lastName: 'Tazi',
-        advertiserType: 'professionnel',
-      }),
-    });
-    const appleData = await appleRes.json();
-    assert.equal(appleRes.status, 200);
-    assert.equal(appleData.user.email, 'mehdi.ios@icloud.com');
-    assert.equal(appleData.user.role, 'professionnel');
+    const oauthUrlRes = await fetch(`${baseUrl}/api/auth/oauth/google/url`);
+    assert.equal(oauthUrlRes.status, 403);
 
-    // Attempt to spoof existing admin account via unverified social login must be rejected (403)
-    const spoofAdminRes = await fetch(`${baseUrl}/api/auth/social-login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider: 'google',
-        email: 'ayarziad@gmail.com',
-      }),
-    });
-    assert.equal(spoofAdminRes.status, 403);
+    const callbackRes = await fetch(
+      `${baseUrl}/auth/callback?email=spoof@gmail.com&state=google`
+    );
+    assert.equal(callbackRes.status, 403);
+
+    // B) Even if ENABLE_SOCIAL_AUTH=true in non-production, plain email without a verified provider idToken is rejected (401)
+    process.env.ENABLE_SOCIAL_AUTH = 'true';
+    try {
+      const noTokenRes = await fetch(`${baseUrl}/api/auth/social-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'google',
+          email: 'salma.mobile@gmail.com',
+          firstName: 'Salma',
+          lastName: 'Idrissi',
+        }),
+      });
+      const noTokenData = await noTokenRes.json();
+      assert.equal(
+        noTokenRes.status,
+        401,
+        'Social login without idToken must be rejected with 401'
+      );
+      assert.equal(noTokenData.code, 'PROVIDER_TOKEN_REQUIRED');
+
+      // Forged / unverified JWT must be rejected (401 INVALID_PROVIDER_TOKEN)
+      const forgedTokenRes = await fetch(`${baseUrl}/api/auth/social-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'google',
+          email: 'youssef.alami@example.ma',
+          idToken: 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.forgedpayload.forgedsignature',
+        }),
+      });
+      const forgedTokenData = await forgedTokenRes.json();
+      assert.equal(forgedTokenRes.status, 401);
+      assert.equal(forgedTokenData.code, 'INVALID_PROVIDER_TOKEN');
+
+      // Ensure no account was created for salma.mobile@gmail.com
+      assert.equal(
+        dbInstance.getUserByEmail('salma.mobile@gmail.com'),
+        null,
+        'Unverified social login must never create a user in DB'
+      );
+    } finally {
+      delete process.env.ENABLE_SOCIAL_AUTH;
+    }
   });
 
-  it('7. persists users, listings, subscriptions, and transactions in SQLite across database restarts', async () => {
+  it('7. requires a valid single-use cryptographic token to mark an email as verified', async () => {
+    // Login as regular user (whose emailVerified is initially false)
+    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'youssef.alami@example.ma',
+        password: 'NewSecurePassword2026!',
+      }),
+    });
+    const loginData = await loginRes.json();
+    assert.equal(loginRes.status, 200);
+    assert.equal(loginData.user.emailVerified, false);
+    const userToken = loginData.token as string;
+
+    // A) Calling /api/auth/verify-email without a token must fail with 400
+    const noProofRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+      },
+      body: JSON.stringify({}),
+    });
+    const noProofData = await noProofRes.json();
+    assert.equal(noProofRes.status, 400);
+    assert.equal(noProofData.code, 'EMAIL_VERIFICATION_TOKEN_REQUIRED');
+
+    // B) Calling /api/auth/verify-email with a forged token must fail with 403
+    const forgedProofRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+      },
+      body: JSON.stringify({ verificationToken: 'forged-verification-token-123' }),
+    });
+    const forgedProofData = await forgedProofRes.json();
+    assert.equal(forgedProofRes.status, 403);
+    assert.equal(forgedProofData.code, 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN');
+
+    // C) Requesting a real verification token and consuming it succeeds once
+    const reqTokenRes = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+    const reqTokenData = await reqTokenRes.json();
+    assert.equal(reqTokenRes.status, 200);
+    assert.ok(reqTokenData.devVerificationToken);
+
+    const validVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+      },
+      body: JSON.stringify({ verificationToken: reqTokenData.devVerificationToken }),
+    });
+    const validVerifyData = await validVerifyRes.json();
+    assert.equal(validVerifyRes.status, 200);
+    assert.equal(validVerifyData.user.emailVerified, true);
+
+    // D) Replaying the same verification token a second time must fail with 403
+    const replayVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+      },
+      body: JSON.stringify({ verificationToken: reqTokenData.devVerificationToken }),
+    });
+    assert.equal(replayVerifyRes.status, 403);
+  });
+
+  it('8. persists users, listings, subscriptions, and transactions across database restarts and supports global session revocation', async () => {
+    // Test global session revocation
+    const revokedCount = await dbInstance.revokeAllSessions();
+    assert.ok(revokedCount >= 1, 'Should revoke active sessions');
+
     // Close current DB connection and open a brand-new connection to the same SQLite file
     dbInstance.close();
 
@@ -364,12 +466,7 @@ describe('Darna Security, Authentication, RBAC & SQLite Persistence Suite', () =
       persistedUser.passwordHash.startsWith('scrypt$'),
       'Persisted password hash must be scrypt'
     );
-
-    const persistedGmailUser = reopenedDb.getUserByEmail('salma.mobile@gmail.com');
-    assert.ok(persistedGmailUser, 'Google/Gmail user must persist in SQLite');
-
-    const persistedAppleUser = reopenedDb.getUserByEmail('mehdi.ios@icloud.com');
-    assert.ok(persistedAppleUser, 'Apple iOS user must persist in SQLite');
+    assert.equal(persistedUser.user.emailVerified, true);
 
     const persistedListings = reopenedDb.getAllListings();
     assert.ok(persistedListings.length >= 8, 'Existing listings must be preserved in SQLite');

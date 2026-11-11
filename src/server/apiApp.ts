@@ -87,49 +87,185 @@ export function createDarnaApiApp(customDbPath?: string): {
   }
 
   // ==========================================================================
-  // AUTHENTICATION ROUTES (Secured with scrypt, SHA-256 session tokens, no plaintext)
+  // SOCIAL AUTHENTICATION SECURITY POLICY & OFFICIAL TOKEN VERIFICATION
   // ==========================================================================
 
-  app.post('/api/auth/register', (req, res) => {
-    const { firstName, lastName, email, password, phone, advertiserType, termsAccepted } = req.body;
-    if (!firstName || !lastName || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Veuillez renseigner votre prénom, nom, adresse e-mail et mot de passe.',
-      });
+  /**
+   * Social login (Google & Apple) is strictly DISABLED in production and by default
+   * until all external provider credentials and security checks are explicitly enabled.
+   */
+  function isSocialAuthEnabled(): boolean {
+    if (process.env.NODE_ENV === 'production') {
+      return false;
+    }
+    return process.env.ENABLE_SOCIAL_AUTH === 'true';
+  }
+
+  /**
+   * Verifies a provider ID token using the official Firebase Admin SDK (`verifyIdToken`),
+   * strictly checking:
+   * - Cryptographic RS256 signature against official provider keys
+   * - Audience (`aud`) matching the configured project ID
+   * - Issuer (`iss`) matching `https://securetoken.google.com/<projectId>`
+   * - Expiration (`exp`) and issued-at (`iat`) timestamps
+   * - Email verification claim (`email_verified === true`)
+   * - Matching sign-in provider (`google.com` or `apple.com`)
+   */
+  async function verifyOfficialProviderIdToken(
+    idToken: string,
+    expectedProvider: 'google' | 'apple'
+  ): Promise<{
+    valid: boolean;
+    uid?: string;
+    email?: string;
+    emailVerified?: boolean;
+    firstName?: string;
+    lastName?: string;
+    errorMessage?: string;
+  }> {
+    if (!idToken || typeof idToken !== 'string' || idToken.trim().length < 20) {
+      return {
+        valid: false,
+        errorMessage: "Jeton d'identité du fournisseur manquant ou malformé.",
+      };
     }
 
-    const pwdCheck = validatePasswordStrength(String(password));
-    if (!pwdCheck.valid) {
-      return res.status(400).json({
-        success: false,
-        message: pwdCheck.message,
-      });
+    const expectedProjectId = process.env.FIREBASE_PROJECT_ID || 'fit-phantasmata-cbvhw';
+    const expectedIssuer = `https://securetoken.google.com/${expectedProjectId}`;
+
+    try {
+      // checkRevoked = true verifies token revocation status in addition to RS256 signature, aud, iss, exp
+      const decoded = await adminAuth.verifyIdToken(idToken.trim(), true);
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      if (!decoded || decoded.aud !== expectedProjectId) {
+        return {
+          valid: false,
+          errorMessage: "Audience (aud) du jeton invalide.",
+        };
+      }
+      if (decoded.iss !== expectedIssuer) {
+        return {
+          valid: false,
+          errorMessage: "Émetteur (iss) du jeton invalide.",
+        };
+      }
+      if (!decoded.exp || decoded.exp <= nowSec) {
+        return {
+          valid: false,
+          errorMessage: "Le jeton d'identité a expiré.",
+        };
+      }
+      if (!decoded.uid || !decoded.email) {
+        return {
+          valid: false,
+          errorMessage: "Le jeton ne contient pas d'identifiant unique (sub/uid) ou d'adresse e-mail.",
+        };
+      }
+      if (decoded.email_verified !== true) {
+        return {
+          valid: false,
+          errorMessage: "L'adresse e-mail associée au jeton n'est pas vérifiée par le fournisseur.",
+        };
+      }
+
+      const signInProvider = decoded.firebase?.sign_in_provider || '';
+      const expectedFirebaseProvider =
+        expectedProvider === 'apple' ? 'apple.com' : 'google.com';
+      if (signInProvider && signInProvider !== expectedFirebaseProvider) {
+        return {
+          valid: false,
+          errorMessage: `Le fournisseur du jeton (${signInProvider}) ne correspond pas à ${expectedFirebaseProvider}.`,
+        };
+      }
+
+      const nameParts = String(decoded.name || '').trim().split(/\s+/).filter(Boolean);
+      return {
+        valid: true,
+        uid: decoded.uid,
+        email: String(decoded.email).trim().toLowerCase(),
+        emailVerified: true,
+        firstName: nameParts[0] || '',
+        lastName: nameParts.slice(1).join(' '),
+      };
+    } catch {
+      return {
+        valid: false,
+        errorMessage:
+          "Échec de la vérification cryptographique du jeton (signature, audience, émetteur ou expiration invalide).",
+      };
+    }
+  }
+
+  /**
+   * Provisions or links a social-authenticated user ONLY when a verified provider token
+   * (`verifiedByProviderToken === true`, `emailVerifiedByProvider === true`, and non-empty `providerUid`)
+   * has been cryptographically validated. Never accepts a plain email address without proof.
+   */
+  async function findOrCreateSocialUser(params: {
+    provider: 'google' | 'apple';
+    providerUid: string;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    advertiserType?: 'particulier' | 'professionnel';
+    verifiedByProviderToken: boolean;
+    emailVerifiedByProvider: boolean;
+  }): Promise<{
+    user?: User;
+    token?: string;
+    errorStatus?: number;
+    errorCode?: string;
+    errorMessage?: string;
+  }> {
+    if (
+      params.verifiedByProviderToken !== true ||
+      params.emailVerifiedByProvider !== true ||
+      !params.providerUid ||
+      String(params.providerUid).trim().length === 0
+    ) {
+      return {
+        errorStatus: 401,
+        errorCode: 'UNVERIFIED_PROVIDER_TOKEN',
+        errorMessage:
+          "Refus de sécurité : aucune session ne peut être créée ou liée à un compte sans un jeton d'identité cryptographiquement vérifié par le fournisseur.",
+      };
     }
 
-    if (!termsAccepted) {
-      return res.status(400).json({
-        success: false,
-        message: "Vous devez accepter les conditions d'utilisation et la politique de confidentialité.",
-      });
+    const normalizedEmail = String(params.email || '').trim().toLowerCase();
+    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return {
+        errorStatus: 400,
+        errorCode: 'INVALID_EMAIL',
+        errorMessage: 'Veuillez fournir une adresse e-mail valide issue du jeton vérifié.',
+      };
     }
 
-    const normalizedEmail = String(email).trim().toLowerCase();
     const existing = db.getUserByEmail(normalizedEmail);
     if (existing) {
-      return res.status(409).json({
-        success: false,
-        message: 'Un compte existe déjà avec cette adresse e-mail. Veuillez vous connecter.',
-      });
+      // Only link to an existing account if its email was already verified or verified by the provider token
+      const updatedUser: User = {
+        ...existing.user,
+        emailVerified: true,
+        verified: true,
+      };
+      const saved = await db.updateUser(updatedUser);
+      const token = await db.createSession(saved.id);
+      return { user: saved, token };
     }
 
-    // Never trust client-supplied role: only configured ADMIN_EMAILS can receive 'admin'
-    const isAuthorizedAdminEmail = isConfiguredAdminEmail(normalizedEmail);
-    const role: User['role'] = isAuthorizedAdminEmail
-      ? 'admin'
-      : advertiserType === 'professionnel'
-      ? 'professionnel'
-      : 'particulier';
+    const emailLocal = normalizedEmail.split('@')[0] || 'Utilisateur';
+    const cleanFirst =
+      String(params.firstName || '').trim() ||
+      emailLocal.charAt(0).toUpperCase() + emailLocal.slice(1);
+    const cleanLast =
+      String(params.lastName || '').trim() ||
+      (params.provider === 'apple' ? 'Apple' : 'Google');
+
+    const isAdmin = isConfiguredAdminEmail(normalizedEmail);
+    const advType =
+      params.advertiserType === 'professionnel' ? 'professionnel' : 'particulier';
+    const role: User['role'] = isAdmin ? 'admin' : advType;
 
     const plans = db.getAllPlans();
     const defaultPlan = plans.find((p) => p.id === 'particulier') || plans[0];
@@ -137,73 +273,172 @@ export function createDarnaApiApp(customDbPath?: string): {
     const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
 
     const newUser: User = {
-      id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      firstName: String(firstName).trim(),
-      lastName: String(lastName).trim(),
-      name: `${String(firstName).trim()} ${String(lastName).trim()}`,
+      id: `user-${params.provider}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      firstName: cleanFirst,
+      lastName: cleanLast,
+      name: `${cleanFirst} ${cleanLast}`.trim(),
       email: normalizedEmail,
-      phone: phone ? String(phone).trim() : '',
+      phone: '',
       role,
-      advertiserType: advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
-      verified: isAuthorizedAdminEmail,
-      emailVerified: isAuthorizedAdminEmail,
+      advertiserType: advType,
+      verified: true,
+      emailVerified: true,
       favorites: [],
       subscription: {
         planId: defaultPlan.id,
         planName: defaultPlan.name,
         status: 'active',
-        maxListings: isAuthorizedAdminEmail ? 999 : defaultPlan.maxListings,
+        maxListings: isAdmin ? 999 : defaultPlan.maxListings,
         startedAt: nowIso,
         expiresAt: nextYearIso,
       },
       createdAt: nowIso.split('T')[0],
     };
 
-    const savedUser = db.createUser(newUser, String(password));
-    const token = db.createSession(savedUser.id);
+    const randomSocialSecret = `social_${params.provider}_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2)}A1!`;
+    const savedUser = await db.createUser(newUser, randomSocialSecret);
+    const token = await db.createSession(savedUser.id);
+    return { user: savedUser, token };
+  }
 
-    res.status(201).json({
-      success: true,
-      user: savedUser,
-      token,
-    });
+  // ==========================================================================
+  // AUTHENTICATION ROUTES (Secured with scrypt, SHA-256 session tokens, no plaintext)
+  // ==========================================================================
+
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      const { firstName, lastName, email, password, phone, advertiserType, termsAccepted } = req.body;
+      if (!firstName || !lastName || !email || !password) {
+        return res.status(400).json({
+          success: false,
+          message: 'Veuillez renseigner votre prénom, nom, adresse e-mail et mot de passe.',
+        });
+      }
+
+      const pwdCheck = validatePasswordStrength(String(password));
+      if (!pwdCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          message: pwdCheck.message,
+        });
+      }
+
+      if (!termsAccepted) {
+        return res.status(400).json({
+          success: false,
+          message: "Vous devez accepter les conditions d'utilisation et la politique de confidentialité.",
+        });
+      }
+
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const existing = db.getUserByEmail(normalizedEmail);
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: 'Un compte existe déjà avec cette adresse e-mail. Veuillez vous connecter.',
+        });
+      }
+
+      // Never trust client-supplied role: only configured ADMIN_EMAILS can receive 'admin'
+      const isAuthorizedAdminEmail = isConfiguredAdminEmail(normalizedEmail);
+      const role: User['role'] = isAuthorizedAdminEmail
+        ? 'admin'
+        : advertiserType === 'professionnel'
+        ? 'professionnel'
+        : 'particulier';
+
+      const plans = db.getAllPlans();
+      const defaultPlan = plans.find((p) => p.id === 'particulier') || plans[0];
+      const nowIso = new Date().toISOString();
+      const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
+      const newUser: User = {
+        id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        firstName: String(firstName).trim(),
+        lastName: String(lastName).trim(),
+        name: `${String(firstName).trim()} ${String(lastName).trim()}`,
+        email: normalizedEmail,
+        phone: phone ? String(phone).trim() : '',
+        role,
+        advertiserType: advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
+        verified: isAuthorizedAdminEmail,
+        emailVerified: isAuthorizedAdminEmail,
+        favorites: [],
+        subscription: {
+          planId: defaultPlan.id,
+          planName: defaultPlan.name,
+          status: 'active',
+          maxListings: isAuthorizedAdminEmail ? 999 : defaultPlan.maxListings,
+          startedAt: nowIso,
+          expiresAt: nextYearIso,
+        },
+        createdAt: nowIso.split('T')[0],
+      };
+
+      const savedUser = await db.createUser(newUser, String(password));
+      const token = await db.createSession(savedUser.id);
+
+      return res.status(201).json({
+        success: true,
+        user: savedUser,
+        token,
+      });
+    } catch (err: any) {
+      console.error('Error in POST /api/auth/register:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "Erreur de persistance vers la base de données PostgreSQL. L'inscription n'a pas été confirmée.",
+      });
+    }
   });
 
-  app.post('/api/auth/login', (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Veuillez saisir votre adresse e-mail et votre mot de passe.',
-      });
-    }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const now = Date.now();
-    const attemptEntry = loginRateLimiter.get(normalizedEmail);
-    if (attemptEntry && now < attemptEntry.resetAt && attemptEntry.count >= 8) {
-      return res.status(429).json({
-        success: false,
-        message: 'Trop de tentatives de connexion échouées. Veuillez réessayer dans quelques minutes.',
-      });
-    }
-
-    const user = db.verifyUserCredentials(normalizedEmail, String(password));
-    if (!user) {
-      if (!attemptEntry || now >= attemptEntry.resetAt) {
-        loginRateLimiter.set(normalizedEmail, { count: 1, resetAt: now + 5 * 60_000 });
-      } else {
-        attemptEntry.count += 1;
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const { email, password } = req.body;
+      if (!email || !password) {
+        return res.status(400).json({
+          success: false,
+          message: 'Veuillez saisir votre adresse e-mail et votre mot de passe.',
+        });
       }
-      return res.status(401).json({
+
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const now = Date.now();
+      const attemptEntry = loginRateLimiter.get(normalizedEmail);
+      if (attemptEntry && now < attemptEntry.resetAt && attemptEntry.count >= 8) {
+        return res.status(429).json({
+          success: false,
+          message: 'Trop de tentatives de connexion échouées. Veuillez réessayer dans quelques minutes.',
+        });
+      }
+
+      const user = db.verifyUserCredentials(normalizedEmail, String(password));
+      if (!user) {
+        if (!attemptEntry || now >= attemptEntry.resetAt) {
+          loginRateLimiter.set(normalizedEmail, { count: 1, resetAt: now + 5 * 60_000 });
+        } else {
+          attemptEntry.count += 1;
+        }
+        return res.status(401).json({
+          success: false,
+          message: 'Adresse e-mail ou mot de passe incorrect.',
+        });
+      }
+
+      loginRateLimiter.delete(normalizedEmail);
+      const token = await db.createSession(user.id);
+      return res.json({ success: true, user, token });
+    } catch (err: any) {
+      console.error('Error in POST /api/auth/login:', err);
+      return res.status(503).json({
         success: false,
-        message: 'Adresse e-mail ou mot de passe incorrect.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de persistance lors de la création de session.',
       });
     }
-
-    loginRateLimiter.delete(normalizedEmail);
-    const token = db.createSession(user.id);
-    res.json({ success: true, user, token });
   });
 
   /**
@@ -219,21 +454,96 @@ export function createDarnaApiApp(customDbPath?: string): {
     });
   });
 
-  app.post('/api/auth/verify-email', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({ success: false, message: 'Non connecté.' });
+  /**
+   * Step 1 of Email Verification:
+   * Generates a single-use SHA-256 hashed cryptographic verification token valid for 30 minutes.
+   */
+  app.post('/api/auth/request-email-verification', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({ success: false, message: 'Non connecté.' });
+      }
+      const rawToken = await db.createEmailVerificationToken(viewer.id, viewer.email);
+      const smtpConfigured = Boolean(process.env.SMTP_HOST);
+      return res.json({
+        success: true,
+        smtpConfigured,
+        message: smtpConfigured
+          ? 'Un jeton de vérification à usage unique a été envoyé à votre adresse e-mail.'
+          : 'Jeton de vérification généré (serveur SMTP non configuré : utilisez le jeton de vérification en environnement de test).',
+        ...(process.env.NODE_ENV !== 'production' && !smtpConfigured && rawToken
+          ? { devVerificationToken: rawToken }
+          : {}),
+      });
+    } catch (err) {
+      console.error('Error in POST /api/auth/request-email-verification:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Impossible de générer le jeton de vérification e-mail.',
+      });
     }
-    viewer.emailVerified = true;
-    const updated = db.updateUser(viewer);
-    res.json({ success: true, user: updated });
   });
 
   /**
-   * Construct OAuth Authorization URL for Google/Gmail or Apple (iOS/Web) popup flow.
-   * Uses APP_URL environment variable for exact redirect_uri construction in iframe environment.
+   * Step 2 of Email Verification:
+   * Strictly requires a valid, non-expired single-use cryptographic `verificationToken`.
+   * Rejects any request that attempts to mark an email as verified without proof.
+   */
+  app.post('/api/auth/verify-email', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({ success: false, message: 'Non connecté.' });
+      }
+      const { verificationToken } = req.body || {};
+      if (!verificationToken || typeof verificationToken !== 'string' || !verificationToken.trim()) {
+        return res.status(400).json({
+          success: false,
+          code: 'EMAIL_VERIFICATION_TOKEN_REQUIRED',
+          message:
+            'Un jeton de vérification cryptographique valide est requis pour marquer une adresse e-mail comme vérifiée.',
+        });
+      }
+
+      const verifiedUser = await db.consumeEmailVerificationToken(
+        viewer.id,
+        viewer.email,
+        verificationToken.trim()
+      );
+      if (!verifiedUser) {
+        return res.status(403).json({
+          success: false,
+          code: 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN',
+          message: 'Le jeton de vérification e-mail est invalide, expiré ou déjà utilisé.',
+        });
+      }
+
+      return res.json({ success: true, user: verifiedUser });
+    } catch (err) {
+      console.error('Error in POST /api/auth/verify-email:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de persistance lors de la vérification e-mail.',
+      });
+    }
+  });
+
+  /**
+   * OAuth URL endpoint — disabled in production and by default until social auth is enabled.
    */
   app.get('/api/auth/oauth/:provider/url', (req, res) => {
+    if (!isSocialAuthEnabled()) {
+      return res.status(403).json({
+        success: false,
+        code: 'SOCIAL_AUTH_DISABLED',
+        message:
+          'Les connexions sociales Google et Apple sont actuellement désactivées côté serveur par mesure de sécurité.',
+      });
+    }
+
     const provider = req.params.provider === 'apple' ? 'apple' : 'google';
     const baseUrl = (
       process.env.APP_URL ||
@@ -296,176 +606,57 @@ export function createDarnaApiApp(customDbPath?: string): {
   });
 
   /**
-   * Helper to provision or retrieve a social-authenticated user (Google/Gmail or Apple ID)
-   * and issue a cryptographic session token in the persistent SQLite database.
-   */
-  function findOrCreateSocialUser(params: {
-    provider: 'google' | 'apple';
-    email: string;
-    firstName?: string;
-    lastName?: string;
-    advertiserType?: 'particulier' | 'professionnel';
-    verifiedByProviderToken?: boolean;
-  }): { user?: User; token?: string; errorStatus?: number; errorMessage?: string } {
-    const normalizedEmail = String(params.email || '').trim().toLowerCase();
-    if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-      return {
-        errorStatus: 400,
-        errorMessage: 'Veuillez saisir une adresse e-mail valide.',
-      };
-    }
-
-    const existing = db.getUserByEmail(normalizedEmail);
-    if (existing) {
-      // Protect administrator accounts from unverified social login spoofing
-      if (existing.user.role === 'admin' && !params.verifiedByProviderToken) {
-        return {
-          errorStatus: 403,
-          errorMessage:
-            'Les comptes administrateurs doivent se connecter avec leur mot de passe sécurisé ou un jeton OAuth vérifié.',
-        };
-      }
-      const updatedUser: User = {
-        ...existing.user,
-        emailVerified: true,
-        verified: true,
-      };
-      const saved = db.updateUser(updatedUser);
-      const token = db.createSession(saved.id);
-      return { user: saved, token };
-    }
-
-    const emailLocal = normalizedEmail.split('@')[0] || 'Utilisateur';
-    const cleanFirst =
-      String(params.firstName || '').trim() ||
-      emailLocal.charAt(0).toUpperCase() + emailLocal.slice(1);
-    const cleanLast =
-      String(params.lastName || '').trim() ||
-      (params.provider === 'apple' ? 'Apple' : 'Gmail');
-
-    const isAdmin =
-      Boolean(params.verifiedByProviderToken) && isConfiguredAdminEmail(normalizedEmail);
-    const advType =
-      params.advertiserType === 'professionnel' ? 'professionnel' : 'particulier';
-    const role: User['role'] = isAdmin ? 'admin' : advType;
-
-    const plans = db.getAllPlans();
-    const defaultPlan = plans.find((p) => p.id === 'particulier') || plans[0];
-    const nowIso = new Date().toISOString();
-    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
-
-    const newUser: User = {
-      id: `user-${params.provider}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      firstName: cleanFirst,
-      lastName: cleanLast,
-      name: `${cleanFirst} ${cleanLast}`.trim(),
-      email: normalizedEmail,
-      phone: '',
-      role,
-      advertiserType: advType,
-      verified: true,
-      emailVerified: true,
-      favorites: [],
-      subscription: {
-        planId: defaultPlan.id,
-        planName: defaultPlan.name,
-        status: 'active',
-        maxListings: isAdmin ? 999 : defaultPlan.maxListings,
-        startedAt: nowIso,
-        expiresAt: nextYearIso,
-      },
-      createdAt: nowIso.split('T')[0],
-    };
-
-    // Generate a random 32-byte cryptographic secret hashed with scrypt so no plaintext password exists
-    const randomSocialSecret = `social_${params.provider}_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2)}A1!`;
-    const savedUser = db.createUser(newUser, randomSocialSecret);
-    const token = db.createSession(savedUser.id);
-    return { user: savedUser, token };
-  }
-
-  /**
    * OAuth Popup Callback Handler (/auth/callback and /auth/callback/)
-   * Sends postMessage({ type: 'OAUTH_AUTH_SUCCESS', user, token }, '*') to opener window and closes popup.
+   * Disabled in production and by default; never accepts plain email parameters.
    */
   const oauthCallbackHandler = async (req: express.Request, res: express.Response) => {
+    if (!isSocialAuthEnabled()) {
+      return res.status(403).json({
+        success: false,
+        code: 'SOCIAL_AUTH_DISABLED',
+        message:
+          'Les connexions sociales Google et Apple sont désactivées côté serveur par mesure de sécurité.',
+      });
+    }
+
     try {
-      const code = String(req.query.code || req.body?.code || '');
+      const idToken = String(req.query.id_token || req.body?.id_token || '');
       const state = String(req.query.state || req.body?.state || 'google');
       const provider: 'google' | 'apple' = state === 'apple' ? 'apple' : 'google';
-      const baseUrl = (
-        process.env.APP_URL ||
-        'https://ais-dev-y46ket62kvdjqfadnsiutg-79125794117.europe-west3.run.app'
-      ).replace(/\/$/, '');
-      const redirectUri = `${baseUrl}/auth/callback`;
 
-      let email = String(req.query.email || req.body?.email || '');
-      let firstName = String(req.query.firstName || '');
-      let lastName = String(req.query.lastName || '');
-      let verifiedByProviderToken = false;
-
-      if (
-        provider === 'google' &&
-        code &&
-        process.env.GOOGLE_CLIENT_ID &&
-        process.env.GOOGLE_CLIENT_SECRET
-      ) {
-        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            code,
-            client_id: process.env.GOOGLE_CLIENT_ID,
-            client_secret: process.env.GOOGLE_CLIENT_SECRET,
-            redirect_uri: redirectUri,
-            grant_type: 'authorization_code',
-          }),
+      if (!idToken) {
+        return res.status(401).json({
+          success: false,
+          code: 'ID_TOKEN_REQUIRED',
+          message: "Jeton d'identité OAuth signé requis. Aucune adresse e-mail non vérifiée n'est acceptée.",
         });
-        const tokenData = (await tokenRes.json()) as any;
-        if (tokenData.access_token) {
-          const profileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` },
-          });
-          const profile = (await profileRes.json()) as any;
-          if (profile.email) {
-            email = profile.email;
-            firstName = profile.given_name || profile.name || '';
-            lastName = profile.family_name || '';
-            verifiedByProviderToken = true;
-          }
-        }
       }
 
-      if (!email) {
-        return res.status(400).send(`
-          <html>
-            <body style="font-family: sans-serif; padding: 24px; text-align: center;">
-              <p>Impossible de récupérer l'adresse e-mail depuis le fournisseur OAuth.</p>
-              <script>setTimeout(() => window.close(), 2500);</script>
-            </body>
-          </html>
-        `);
+      const verifiedToken = await verifyOfficialProviderIdToken(idToken, provider);
+      if (!verifiedToken.valid || !verifiedToken.email || !verifiedToken.uid) {
+        return res.status(401).json({
+          success: false,
+          code: 'INVALID_PROVIDER_TOKEN',
+          message: verifiedToken.errorMessage || 'Jeton OAuth invalide.',
+        });
       }
 
-      const result = findOrCreateSocialUser({
+      const result = await findOrCreateSocialUser({
         provider,
-        email,
-        firstName,
-        lastName,
-        verifiedByProviderToken,
+        providerUid: verifiedToken.uid,
+        email: verifiedToken.email,
+        firstName: verifiedToken.firstName,
+        lastName: verifiedToken.lastName,
+        verifiedByProviderToken: true,
+        emailVerifiedByProvider: Boolean(verifiedToken.emailVerified),
       });
 
       if (!result.user || !result.token) {
-        return res.status(result.errorStatus || 400).send(`
-          <html>
-            <body style="font-family: sans-serif; padding: 24px; text-align: center;">
-              <p>${result.errorMessage || 'Erreur lors de la connexion OAuth.'}</p>
-              <script>setTimeout(() => window.close(), 2500);</script>
-            </body>
-          </html>
-        `);
+        return res.status(result.errorStatus || 401).json({
+          success: false,
+          code: result.errorCode || 'SOCIAL_AUTH_FAILED',
+          message: result.errorMessage || 'Erreur lors de la connexion OAuth.',
+        });
       }
 
       const payloadJson = JSON.stringify({
@@ -475,24 +666,27 @@ export function createDarnaApiApp(customDbPath?: string): {
         token: result.token,
       });
 
-      res.send(`
+      return res.send(`
         <html>
           <body style="font-family: sans-serif; padding: 24px; text-align: center;">
             <script>
               if (window.opener) {
-                window.opener.postMessage(${payloadJson}, '*');
+                window.opener.postMessage(${payloadJson}, window.location.origin);
                 window.close();
               } else {
                 window.location.href = '/';
               }
             </script>
-            <p>Authentification réussie. Cette fenêtre va se fermer automatiquement.</p>
+            <p>Authentification vérifiée. Cette fenêtre va se fermer automatiquement.</p>
           </body>
         </html>
       `);
     } catch (error) {
       console.error('OAuth callback error:', error);
-      res.status(500).send('Erreur lors du retour OAuth.');
+      return res.status(500).json({
+        success: false,
+        message: 'Erreur lors du retour OAuth.',
+      });
     }
   };
 
@@ -500,80 +694,67 @@ export function createDarnaApiApp(customDbPath?: string): {
   app.post(['/auth/callback', '/auth/callback/'], express.urlencoded({ extended: true }), oauthCallbackHandler);
 
   /**
-   * Direct Social Authentication Endpoint for Google / Gmail (Web & Mobile) and Apple (iOS / Web).
-   * Verifies Google ID token if provided, or authenticates the user's Gmail / Apple ID account
-   * and persists it in SQLite.
+   * Direct Social Authentication Endpoint (/api/auth/social-login).
+   * - Disabled in production and by default (`403 SOCIAL_AUTH_DISABLED`).
+   * - Even when enabled in test/staging, strictly requires a cryptographically verified `idToken`
+   *   validated via `verifyOfficialProviderIdToken` (RS256 signature, `aud`, `iss`, `exp`, `email_verified`).
+   * - All plain-email fallbacks are permanently removed.
    */
   app.post('/api/auth/social-login', async (req, res) => {
+    if (!isSocialAuthEnabled()) {
+      return res.status(403).json({
+        success: false,
+        code: 'SOCIAL_AUTH_DISABLED',
+        message:
+          'Les connexions Google et Apple sont désactivées côté serveur tant que la configuration OAuth de production n’est pas activée.',
+      });
+    }
+
     try {
-      const { provider, email, firstName, lastName, advertiserType, idToken } = req.body || {};
+      const { provider, advertiserType, idToken } = req.body || {};
       const cleanProvider: 'google' | 'apple' = provider === 'apple' ? 'apple' : 'google';
 
-      let resolvedEmail = String(email || '').trim().toLowerCase();
-      let resolvedFirst = String(firstName || '').trim();
-      let resolvedLast = String(lastName || '').trim();
-      let resolvedUid = '';
-      let verifiedByProviderToken = false;
-
-      if (idToken) {
-        try {
-          const decoded = await adminAuth.verifyIdToken(String(idToken));
-          if (decoded.email) {
-            resolvedEmail = String(decoded.email).toLowerCase();
-            resolvedUid = decoded.uid;
-            if (decoded.name && !resolvedFirst) {
-              const parts = String(decoded.name).split(' ');
-              resolvedFirst = parts[0] || '';
-              resolvedLast = parts.slice(1).join(' ');
-            }
-            verifiedByProviderToken = true;
-          }
-        } catch {
-          if (cleanProvider === 'google') {
-            const verifyRes = await fetch(
-              `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(
-                String(idToken)
-              )}`
-            );
-            if (verifyRes.ok) {
-              const tokenInfo = (await verifyRes.json()) as any;
-              if (tokenInfo.email) {
-                resolvedEmail = String(tokenInfo.email).toLowerCase();
-                resolvedFirst = tokenInfo.given_name || resolvedFirst;
-                resolvedLast = tokenInfo.family_name || resolvedLast;
-                verifiedByProviderToken = true;
-              }
-            }
-          }
-        }
+      if (!idToken || typeof idToken !== 'string') {
+        return res.status(401).json({
+          success: false,
+          code: 'PROVIDER_TOKEN_REQUIRED',
+          message:
+            "Un jeton d'identité signé par le fournisseur (idToken) est obligatoire. La connexion par simple adresse e-mail est interdite.",
+        });
       }
 
-      const result = findOrCreateSocialUser({
+      const verified = await verifyOfficialProviderIdToken(idToken, cleanProvider);
+      if (!verified.valid || !verified.email || !verified.uid || !verified.emailVerified) {
+        return res.status(401).json({
+          success: false,
+          code: 'INVALID_PROVIDER_TOKEN',
+          message:
+            verified.errorMessage ||
+            "Jeton d'identité invalide, expiré ou non vérifié par le fournisseur.",
+        });
+      }
+
+      const result = await findOrCreateSocialUser({
         provider: cleanProvider,
-        email: resolvedEmail,
-        firstName: resolvedFirst,
-        lastName: resolvedLast,
+        providerUid: verified.uid,
+        email: verified.email,
+        firstName: verified.firstName,
+        lastName: verified.lastName,
         advertiserType,
-        verifiedByProviderToken,
+        verifiedByProviderToken: true,
+        emailVerifiedByProvider: true,
       });
 
       if (!result.user || !result.token) {
-        return res.status(result.errorStatus || 400).json({
+        return res.status(result.errorStatus || 401).json({
           success: false,
+          code: result.errorCode || 'SOCIAL_AUTH_REJECTED',
           message: result.errorMessage || 'Impossible de finaliser la connexion sociale.',
         });
       }
 
       if (!customDbPath && isCloudSqlConfigured()) {
-        try {
-          await getOrCreateUser(
-            resolvedUid || result.user.id,
-            result.user.email,
-            result.user
-          );
-        } catch (dbErr) {
-          console.error('Error syncing social user to Cloud SQL:', dbErr);
-        }
+        await getOrCreateUser(verified.uid, result.user.email, result.user);
       }
 
       return res.json({
@@ -586,7 +767,7 @@ export function createDarnaApiApp(customDbPath?: string): {
       console.error('Social login error:', error);
       return res.status(500).json({
         success: false,
-        message: 'Erreur serveur lors de la connexion Google / Apple.',
+        message: 'Erreur serveur lors de la vérification de la connexion sociale.',
       });
     }
   });
@@ -596,30 +777,38 @@ export function createDarnaApiApp(customDbPath?: string): {
    * Generates a single-use, 15-minute cryptographic reset token (hashed in DB).
    * Does not reveal whether the email exists.
    */
-  app.post('/api/auth/request-password-reset', (req, res) => {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({
+  app.post('/api/auth/request-password-reset', async (req, res) => {
+    try {
+      const { email } = req.body;
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          message: 'Veuillez indiquer votre adresse e-mail.',
+        });
+      }
+
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const rawResetToken = await db.createPasswordResetToken(normalizedEmail);
+      const smtpConfigured = Boolean(process.env.SMTP_HOST);
+
+      return res.json({
+        success: true,
+        smtpConfigured,
+        message: smtpConfigured
+          ? 'Si un compte est associé à cette adresse e-mail, un code de réinitialisation sécurisé valable 15 minutes vous a été envoyé.'
+          : 'Demande de réinitialisation enregistrée (serveur SMTP non configuré : utilisez le jeton de vérification généré en environnement de développement/test).',
+        ...(process.env.NODE_ENV !== 'production' && !smtpConfigured && rawResetToken
+          ? { devResetToken: rawResetToken }
+          : {}),
+      });
+    } catch (err) {
+      console.error('Error in POST /api/auth/request-password-reset:', err);
+      return res.status(503).json({
         success: false,
-        message: 'Veuillez indiquer votre adresse e-mail.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de persistance lors de la génération du jeton de réinitialisation.',
       });
     }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const rawResetToken = db.createPasswordResetToken(normalizedEmail);
-    const smtpConfigured = Boolean(process.env.SMTP_HOST);
-
-    return res.json({
-      success: true,
-      smtpConfigured,
-      message: smtpConfigured
-        ? 'Si un compte est associé à cette adresse e-mail, un code de réinitialisation sécurisé valable 15 minutes vous a été envoyé.'
-        : 'Demande de réinitialisation enregistrée (serveur SMTP non configuré : utilisez le jeton de vérification généré en environnement de développement/test).',
-      // Only expose the reset token in non-production when SMTP is not configured
-      ...(process.env.NODE_ENV !== 'production' && !smtpConfigured && rawResetToken
-        ? { devResetToken: rawResetToken }
-        : {}),
-    });
   });
 
   /**
@@ -627,50 +816,88 @@ export function createDarnaApiApp(customDbPath?: string): {
    * Requires a valid, non-expired single-use resetToken + strong newPassword.
    * Rejects any attempt to overwrite a password without a valid resetToken.
    */
-  app.post('/api/auth/reset-password', (req, res) => {
-    const { email, resetToken, newPassword } = req.body;
-    if (!email || !resetToken || !newPassword) {
-      return res.status(400).json({
+  app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+      const { email, resetToken, newPassword } = req.body;
+      if (!email || !resetToken || !newPassword) {
+        return res.status(400).json({
+          success: false,
+          code: 'RESET_TOKEN_REQUIRED',
+          message:
+            'Pour réinitialiser votre mot de passe, vous devez fournir votre adresse e-mail, un code/jeton de réinitialisation valide et votre nouveau mot de passe.',
+        });
+      }
+
+      const pwdCheck = validatePasswordStrength(String(newPassword));
+      if (!pwdCheck.valid) {
+        return res.status(400).json({
+          success: false,
+          message: pwdCheck.message,
+        });
+      }
+
+      const consumed = await db.consumePasswordResetToken(
+        String(email),
+        String(resetToken),
+        String(newPassword)
+      );
+      if (!consumed) {
+        return res.status(403).json({
+          success: false,
+          code: 'INVALID_OR_EXPIRED_RESET_TOKEN',
+          message: 'Le code de réinitialisation est invalide, expiré ou déjà utilisé.',
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Votre mot de passe a été mis à jour de façon sécurisée. Vous pouvez maintenant vous connecter.',
+      });
+    } catch (err) {
+      console.error('Error in POST /api/auth/reset-password:', err);
+      return res.status(503).json({
         success: false,
-        code: 'RESET_TOKEN_REQUIRED',
-        message:
-          'Pour réinitialiser votre mot de passe, vous devez fournir votre adresse e-mail, un code/jeton de réinitialisation valide et votre nouveau mot de passe.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de persistance lors de la réinitialisation du mot de passe.',
       });
     }
-
-    const pwdCheck = validatePasswordStrength(String(newPassword));
-    if (!pwdCheck.valid) {
-      return res.status(400).json({
-        success: false,
-        message: pwdCheck.message,
-      });
-    }
-
-    const consumed = db.consumePasswordResetToken(
-      String(email),
-      String(resetToken),
-      String(newPassword)
-    );
-    if (!consumed) {
-      return res.status(403).json({
-        success: false,
-        code: 'INVALID_OR_EXPIRED_RESET_TOKEN',
-        message: 'Le code de réinitialisation est invalide, expiré ou déjà utilisé.',
-      });
-    }
-
-    res.json({
-      success: true,
-      message: 'Votre mot de passe a été mis à jour de façon sécurisée. Vous pouvez maintenant vous connecter.',
-    });
   });
 
-  app.post('/api/auth/logout', (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (authHeader?.startsWith('Bearer ')) {
-      db.deleteSession(authHeader.slice(7).trim());
+  app.post('/api/auth/logout', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        await db.deleteSession(authHeader.slice(7).trim());
+      }
+      return res.json({ success: true });
+    } catch (err) {
+      console.error('Error in POST /api/auth/logout:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur lors de la révocation de la session.',
+      });
     }
-    res.json({ success: true });
+  });
+
+  app.post('/api/admin/sessions/revoke-all', async (req, res) => {
+    const admin = requireAdmin(req, res);
+    if (!admin) return;
+    try {
+      const revokedCount = await db.revokeAllSessions();
+      return res.json({
+        success: true,
+        revokedCount,
+        message: 'Toutes les sessions actives ont été révoquées avec succès.',
+      });
+    } catch (err) {
+      console.error('Error in POST /api/admin/sessions/revoke-all:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur lors de la révocation globale des sessions.',
+      });
+    }
   });
 
   app.get('/api/auth/me', (req, res) => {
@@ -681,23 +908,32 @@ export function createDarnaApiApp(customDbPath?: string): {
     res.json({ success: true, user: viewer });
   });
 
-  app.post('/api/auth/favorites', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({
+  app.post('/api/auth/favorites', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({
+          success: false,
+          message: 'Créez un compte ou connectez-vous pour continuer.',
+        });
+      }
+      const { listingId } = req.body;
+      if (!listingId) {
+        return res.status(400).json({ success: false, message: 'ID annonce manquant.' });
+      }
+      const favs = viewer.favorites || [];
+      const exists = favs.includes(listingId);
+      viewer.favorites = exists ? favs.filter((id) => id !== listingId) : [...favs, listingId];
+      await db.updateUser(viewer);
+      return res.json({ success: true, favorites: viewer.favorites });
+    } catch (err) {
+      console.error('Error in POST /api/auth/favorites:', err);
+      return res.status(503).json({
         success: false,
-        message: 'Créez un compte ou connectez-vous pour continuer.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors de la mise à jour des favoris.',
       });
     }
-    const { listingId } = req.body;
-    if (!listingId) {
-      return res.status(400).json({ success: false, message: 'ID annonce manquant.' });
-    }
-    const favs = viewer.favorites || [];
-    const exists = favs.includes(listingId);
-    viewer.favorites = exists ? favs.filter((id) => id !== listingId) : [...favs, listingId];
-    db.updateUser(viewer);
-    res.json({ success: true, favorites: viewer.favorites });
   });
 
   // ==========================================================================
@@ -757,7 +993,7 @@ export function createDarnaApiApp(customDbPath?: string): {
     res.json({ success: true, listings: visibleListings });
   });
 
-  app.get('/api/listings/:id', (req, res) => {
+  app.get('/api/listings/:id', async (req, res) => {
     const viewer = getAuthUser(req);
     const listing = db.getListingById(req.params.id);
     if (!listing) {
@@ -771,7 +1007,11 @@ export function createDarnaApiApp(customDbPath?: string): {
       });
     }
     listing.viewsCount = (listing.viewsCount || 0) + 1;
-    db.updateListing(listing);
+    try {
+      await db.updateListing(listing);
+    } catch (err) {
+      console.error('Error updating viewsCount in Cloud SQL:', err);
+    }
     res.json({ success: true, listing: formatted });
   });
 
@@ -819,7 +1059,7 @@ export function createDarnaApiApp(customDbPath?: string): {
     });
   });
 
-  app.post('/api/listings', (req, res) => {
+  app.post('/api/listings', async (req, res) => {
     const viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({
@@ -862,96 +1102,129 @@ export function createDarnaApiApp(customDbPath?: string): {
         isDemo: Boolean(req.body.isDemo),
         flaggedForContactInText: flagged,
       };
-      db.createListing(newListing);
-      res.status(201).json({ success: true, listing: newListing });
+      await db.createListing(newListing);
+      return res.status(201).json({ success: true, listing: newListing });
     } catch (err: any) {
-      res.status(400).json({ success: false, message: err.message });
+      console.error('Error in POST /api/listings:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message:
+          "La synchronisation avec la base de données PostgreSQL a échoué. L'annonce n'a pas pu être enregistrée.",
+      });
     }
   });
 
-  app.put('/api/listings/:id', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({
-        success: false,
-        message: 'Créez un compte ou connectez-vous pour continuer.',
-      });
-    }
-    const existing = db.getListingById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
-    }
-    if (existing.userId !== viewer.id && viewer.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: "Vous n'êtes pas autorisé à modifier l'annonce d'un autre utilisateur.",
-      });
-    }
+  app.put('/api/listings/:id', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({
+          success: false,
+          message: 'Créez un compte ou connectez-vous pour continuer.',
+        });
+      }
+      const existing = db.getListingById(req.params.id);
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
+      }
+      if (existing.userId !== viewer.id && viewer.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: "Vous n'êtes pas autorisé à modifier l'annonce d'un autre utilisateur.",
+        });
+      }
 
-    // Prevent non-admins from forging paid boost or changing listing owner
-    const updatedListing: Listing = {
-      ...existing,
-      ...req.body,
-      id: existing.id,
-      userId: existing.userId,
-      boost: viewer.role === 'admin' && req.body.boost !== undefined ? req.body.boost : existing.boost,
-      updatedAt: new Date().toISOString(),
-    };
-    const saved = db.updateListing(updatedListing);
-    res.json({ success: true, listing: saved });
+      // Prevent non-admins from forging paid boost or changing listing owner
+      const updatedListing: Listing = {
+        ...existing,
+        ...req.body,
+        id: existing.id,
+        userId: existing.userId,
+        boost: viewer.role === 'admin' && req.body.boost !== undefined ? req.body.boost : existing.boost,
+        updatedAt: new Date().toISOString(),
+      };
+      const saved = await db.updateListing(updatedListing);
+      return res.json({ success: true, listing: saved });
+    } catch (err) {
+      console.error('Error in PUT /api/listings/:id:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "La synchronisation PostgreSQL a échoué. La modification n'a pas été enregistrée.",
+      });
+    }
   });
 
-  app.delete('/api/listings/:id', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({
+  app.delete('/api/listings/:id', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({
+          success: false,
+          message: 'Créez un compte ou connectez-vous pour continuer.',
+        });
+      }
+      const target = db.getListingById(req.params.id);
+      if (!target) {
+        return res.status(404).json({ success: false, message: 'Annonce introuvable' });
+      }
+      if (target.userId !== viewer.id && viewer.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: "Vous n'êtes pas autorisé à supprimer l'annonce d'un autre utilisateur.",
+        });
+      }
+      await db.deleteListing(req.params.id);
+      return res.json({ success: true, message: 'Annonce supprimée avec succès' });
+    } catch (err) {
+      console.error('Error in DELETE /api/listings/:id:', err);
+      return res.status(503).json({
         success: false,
-        message: 'Créez un compte ou connectez-vous pour continuer.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: "La synchronisation PostgreSQL a échoué. La suppression n'a pas été confirmée.",
       });
     }
-    const target = db.getListingById(req.params.id);
-    if (!target) {
-      return res.status(404).json({ success: false, message: 'Annonce introuvable' });
-    }
-    if (target.userId !== viewer.id && viewer.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: "Vous n'êtes pas autorisé à supprimer l'annonce d'un autre utilisateur.",
-      });
-    }
-    db.deleteListing(req.params.id);
-    res.json({ success: true, message: 'Annonce supprimée avec succès' });
   });
 
   // ==========================================================================
   // PROTECTED ADMIN, MODERATION, REPORTS & USER MANAGEMENT ROUTES
   // ==========================================================================
 
-  app.post('/api/listings/:id/moderate', (req, res) => {
+  app.post('/api/listings/:id/moderate', async (req, res) => {
     const admin = requireAdmin(req, res);
     if (!admin) return;
 
-    const { action, reason } = req.body;
-    const listing = db.getListingById(req.params.id);
-    if (!listing) {
-      return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
-    }
+    try {
+      const { action, reason } = req.body;
+      const listing = db.getListingById(req.params.id);
+      if (!listing) {
+        return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
+      }
 
-    if (action === 'approve') {
-      listing.status = 'publiee';
-      delete listing.rejectionReason;
-    } else if (action === 'reject') {
-      listing.status = 'refusee';
-      listing.rejectionReason = reason || 'Non conforme aux critères de publication Darna.';
-    } else if (action === 'hide') {
-      listing.status = 'masquee';
-      listing.rejectionReason = reason || 'Masquée suite à un signalement.';
-    } else if (action === 'expire') {
-      listing.status = 'expiree';
-    }
+      if (action === 'approve') {
+        listing.status = 'publiee';
+        delete listing.rejectionReason;
+      } else if (action === 'reject') {
+        listing.status = 'refusee';
+        listing.rejectionReason = reason || 'Non conforme aux critères de publication Darna.';
+      } else if (action === 'hide') {
+        listing.status = 'masquee';
+        listing.rejectionReason = reason || 'Masquée suite à un signalement.';
+      } else if (action === 'expire') {
+        listing.status = 'expiree';
+      }
 
-    const updated = db.updateListing(listing);
-    res.json({ success: true, listing: updated });
+      const updated = await db.updateListing(listing);
+      return res.json({ success: true, listing: updated });
+    } catch (err) {
+      console.error('Error in POST /api/listings/:id/moderate:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors de la modération.',
+      });
+    }
   });
 
   app.get('/api/reports', (req, res) => {
@@ -960,35 +1233,53 @@ export function createDarnaApiApp(customDbPath?: string): {
     res.json({ success: true, reports: db.getAllReports() });
   });
 
-  app.post('/api/reports', (req, res) => {
-    if (!req.body.listingId) {
-      return res.status(400).json({ success: false, message: 'Identifiant annonce requis.' });
+  app.post('/api/reports', async (req, res) => {
+    try {
+      if (!req.body.listingId) {
+        return res.status(400).json({ success: false, message: 'Identifiant annonce requis.' });
+      }
+      const newReport: ListingReport = {
+        id: `rep-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        listingId: req.body.listingId,
+        listingTitle: req.body.listingTitle || 'Annonce',
+        reason: req.body.reason || 'inapproprié',
+        comment: req.body.comment || '',
+        reporterEmail: req.body.reporterEmail,
+        createdAt: new Date().toISOString(),
+        status: 'en_attente',
+      };
+      await db.createReport(newReport);
+      return res.status(201).json({ success: true, report: newReport });
+    } catch (err) {
+      console.error('Error in POST /api/reports:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "Erreur de synchronisation PostgreSQL lors de l'envoi du signalement.",
+      });
     }
-    const newReport: ListingReport = {
-      id: `rep-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      listingId: req.body.listingId,
-      listingTitle: req.body.listingTitle || 'Annonce',
-      reason: req.body.reason || 'inapproprié',
-      comment: req.body.comment || '',
-      reporterEmail: req.body.reporterEmail,
-      createdAt: new Date().toISOString(),
-      status: 'en_attente',
-    };
-    db.createReport(newReport);
-    res.status(201).json({ success: true, report: newReport });
   });
 
-  app.post('/api/reports/:id/resolve', (req, res) => {
+  app.post('/api/reports/:id/resolve', async (req, res) => {
     const admin = requireAdmin(req, res);
     if (!admin) return;
 
-    const report = db.getReportById(req.params.id);
-    if (!report) {
-      return res.status(404).json({ success: false, message: 'Signalement introuvable' });
+    try {
+      const report = db.getReportById(req.params.id);
+      if (!report) {
+        return res.status(404).json({ success: false, message: 'Signalement introuvable' });
+      }
+      report.status = req.body.action === 'dismiss' ? 'rejete' : 'resolu';
+      const updated = await db.updateReport(report);
+      return res.json({ success: true, report: updated });
+    } catch (err) {
+      console.error('Error in POST /api/reports/:id/resolve:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors du traitement du signalement.',
+      });
     }
-    report.status = req.body.action === 'dismiss' ? 'rejete' : 'resolu';
-    const updated = db.updateReport(report);
-    res.json({ success: true, report: updated });
   });
 
   app.get('/api/users', (req, res) => {
@@ -997,21 +1288,30 @@ export function createDarnaApiApp(customDbPath?: string): {
     res.json({ success: true, users: db.getAllUsers() });
   });
 
-  app.put('/api/admin/users/:id/role', (req, res) => {
+  app.put('/api/admin/users/:id/role', async (req, res) => {
     const admin = requireAdmin(req, res);
     if (!admin) return;
 
-    const target = db.getUserById(req.params.id);
-    if (!target) {
-      return res.status(404).json({ success: false, message: 'Utilisateur introuvable.' });
+    try {
+      const target = db.getUserById(req.params.id);
+      if (!target) {
+        return res.status(404).json({ success: false, message: 'Utilisateur introuvable.' });
+      }
+      const { role } = req.body;
+      if (role !== 'particulier' && role !== 'professionnel' && role !== 'admin') {
+        return res.status(400).json({ success: false, message: 'Rôle invalide.' });
+      }
+      target.role = role;
+      const updated = await db.updateUser(target);
+      return res.json({ success: true, user: updated });
+    } catch (err) {
+      console.error('Error in PUT /api/admin/users/:id/role:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors de la mise à jour du rôle.',
+      });
     }
-    const { role } = req.body;
-    if (role !== 'particulier' && role !== 'professionnel' && role !== 'admin') {
-      return res.status(400).json({ success: false, message: 'Rôle invalide.' });
-    }
-    target.role = role;
-    const updated = db.updateUser(target);
-    res.json({ success: true, user: updated });
   });
 
   // ==========================================================================
@@ -1093,422 +1393,467 @@ export function createDarnaApiApp(customDbPath?: string): {
     });
   });
 
-  app.post('/api/admin/plans', (req, res) => {
+  app.post('/api/admin/plans', async (req, res) => {
     const admin = requireAdmin(req, res);
     if (!admin) return;
 
-    const { name, price, period = 'mois', maxListings, features, isCustomQuote } = req.body;
-    if (!name || String(name).trim().length < 2) {
-      return res.status(400).json({
-        success: false,
-        message: "Le nom de l'offre est obligatoire.",
-      });
-    }
-    const slugId = String(name)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)/g, '');
-    const existingPlans = db.getAllPlans();
-    const id = existingPlans.some((p) => p.id === slugId) ? `${slugId}-${Date.now()}` : slugId;
-
-    const newPlan: SubscriptionPlan = {
-      id,
-      name: String(name).trim(),
-      price: isCustomQuote ? null : Math.max(0, Number(price) || 0),
-      period: period === 'an' ? 'an' : 'mois',
-      maxListings: Math.max(1, Number(maxListings) || 5),
-      features: Array.isArray(features)
-        ? features.map((f: any) => String(f).trim()).filter(Boolean)
-        : ['Publication d’annonces vérifiées'],
-      isCustomQuote: Boolean(isCustomQuote),
-    };
-
-    db.createPlan(newPlan);
-    res.status(201).json({ success: true, plan: newPlan, plans: db.getAllPlans() });
-  });
-
-  app.put('/api/admin/plans/:id', (req, res) => {
-    const admin = requireAdmin(req, res);
-    if (!admin) return;
-
-    const existing = db.getPlanById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ success: false, message: 'Offre introuvable.' });
-    }
-
-    const isCustomQuote =
-      req.body.isCustomQuote !== undefined ? Boolean(req.body.isCustomQuote) : existing.isCustomQuote;
-    const updatedPrice = isCustomQuote
-      ? null
-      : req.body.price !== undefined
-      ? Math.max(0, Number(req.body.price))
-      : existing.price;
-    const updatedMaxListings =
-      req.body.maxListings !== undefined
-        ? Math.max(1, Number(req.body.maxListings))
-        : existing.maxListings;
-    const updatedName =
-      req.body.name !== undefined && String(req.body.name).trim().length > 0
-        ? String(req.body.name).trim()
-        : existing.name;
-    const updatedFeatures = Array.isArray(req.body.features)
-      ? req.body.features.map((f: any) => String(f).trim()).filter(Boolean)
-      : existing.features;
-
-    const updatedPlan: SubscriptionPlan = {
-      ...existing,
-      name: updatedName,
-      price: updatedPrice,
-      maxListings: updatedMaxListings,
-      features: updatedFeatures,
-      isCustomQuote,
-    };
-
-    db.updatePlan(updatedPlan);
-
-    // Propagate updated maxListings & planName to users currently subscribed to this plan
-    for (const u of db.getAllUsers()) {
-      if (u.subscription && u.subscription.planId === existing.id && u.subscription.status === 'active') {
-        u.subscription.maxListings = updatedMaxListings;
-        u.subscription.planName = updatedName;
-        db.updateUser(u);
-      }
-    }
-
-    res.json({ success: true, plan: updatedPlan, plans: db.getAllPlans() });
-  });
-
-  app.put('/api/admin/boost-options/:id', (req, res) => {
-    const admin = requireAdmin(req, res);
-    if (!admin) return;
-
-    const existing = db.getBoostOptionById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({
-        success: false,
-        message: 'Option de mise en avant introuvable.',
-      });
-    }
-
-    const updatedBoost = {
-      ...existing,
-      name:
-        req.body.name !== undefined && String(req.body.name).trim()
-          ? String(req.body.name).trim()
-          : existing.name,
-      description:
-        req.body.description !== undefined && String(req.body.description).trim()
-          ? String(req.body.description).trim()
-          : existing.description,
-      price:
-        req.body.price !== undefined
-          ? Math.max(1, Number(req.body.price))
-          : existing.price,
-      durationDays:
-        req.body.durationDays !== undefined
-          ? Math.max(1, Number(req.body.durationDays))
-          : existing.durationDays,
-    };
-
-    db.updateBoostOption(updatedBoost);
-    res.json({
-      success: true,
-      boostOption: updatedBoost,
-      boostOptions: db.getAllBoostOptions(),
-    });
-  });
-
-  app.post('/api/payments/checkout', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({
-        success: false,
-        message: 'Créez un compte ou connectez-vous pour souscrire une offre ou mettre en avant une annonce.',
-      });
-    }
-
-    const {
-      type,
-      optionId,
-      targetId,
-      idempotencyKey,
-      testScenario = 'success',
-      paymentMethodType = 'cmi_card',
-      cardNumber,
-    } = req.body;
-
-    if (cardNumber && String(cardNumber).replace(/\D/g, '').length >= 12) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Sécurité PCI-DSS : ne transmettez jamais de numéro de carte bancaire complet au serveur. Utilisez le jeton sécurisé du prestataire en mode test.',
-      });
-    }
-
-    if (!type || !optionId || !idempotencyKey) {
-      return res.status(400).json({
-        success: false,
-        message: 'Paramètres de paiement incomplets.',
-      });
-    }
-
-    const existingTx = db.getTransactionByIdempotencyKey(String(idempotencyKey));
-    if (existingTx && existingTx.status === 'paye') {
-      return res.status(409).json({
-        success: false,
-        code: 'DUPLICATE_PAYMENT',
-        message:
-          'Protection anti-double paiement : ce paiement a déjà été enregistré et confirmé. Aucun second débit n’a été effectué.',
-        transaction: existingTx,
-      });
-    }
-
-    const now = new Date();
-    const nowIso = now.toISOString();
-    const methodLabel =
-      paymentMethodType === 'payzone'
-        ? 'Payzone Maroc (Mode Test •••• 1111)'
-        : 'Carte CMI / Visa Maroc (Mode Test •••• 4242)';
-
-    if (type === 'subscription') {
-      const plan = db.getPlanById(String(optionId));
-      if (!plan) {
-        return res.status(404).json({ success: false, message: 'Offre d’abonnement introuvable.' });
-      }
-      if (plan.isCustomQuote || plan.price === null) {
+    try {
+      const { name, price, period = 'mois', maxListings, features, isCustomQuote } = req.body;
+      if (!name || String(name).trim().length < 2) {
         return res.status(400).json({
           success: false,
-          message:
-            'L’offre Entreprise est disponible uniquement sur devis personnalisé. Contactez notre service grands comptes.',
+          message: "Le nom de l'offre est obligatoire.",
         });
       }
+      const slugId = String(name)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+      const existingPlans = db.getAllPlans();
+      const id = existingPlans.some((p) => p.id === slugId) ? `${slugId}-${Date.now()}` : slugId;
 
-      const userTxs = db.getTransactionsByUserId(viewer.id);
-      const recentIdenticalSubTx = userTxs.find(
-        (t) =>
-          t.type === 'subscription' &&
-          t.optionId === plan.id &&
-          t.status === 'paye' &&
-          now.getTime() - new Date(t.createdAt).getTime() < 60_000
-      );
-      if (recentIdenticalSubTx) {
-        return res.status(409).json({
-          success: false,
-          code: 'DUPLICATE_PAYMENT',
-          message: `Protection anti-double paiement : votre abonnement « ${plan.name} » vient déjà d'être activé.`,
-          transaction: recentIdenticalSubTx,
-        });
-      }
-
-      const tx: PaymentTransaction = {
-        id: `tx-sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        idempotencyKey: String(idempotencyKey),
-        userId: viewer.id,
-        userName: viewer.name,
-        userEmail: viewer.email,
-        type: 'subscription',
-        targetId: plan.id,
-        targetLabel: `Abonnement ${plan.name}`,
-        optionId: plan.id,
-        amount: plan.price,
-        currency: 'MAD',
-        status: testScenario === 'failed' ? 'echoue' : 'paye',
-        provider: 'test_cmi_sandbox',
-        paymentMethodLabel: plan.price === 0 ? 'Activation gratuite (0 MAD)' : methodLabel,
-        failureReason:
-          testScenario === 'failed'
-            ? 'Transaction refusée par la banque émettrice (Simulation d’échec Mode Test).'
-            : undefined,
-        createdAt: nowIso,
-        confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+      const newPlan: SubscriptionPlan = {
+        id,
+        name: String(name).trim(),
+        price: isCustomQuote ? null : Math.max(0, Number(price) || 0),
+        period: period === 'an' ? 'an' : 'mois',
+        maxListings: Math.max(1, Number(maxListings) || 5),
+        features: Array.isArray(features)
+          ? features.map((f: any) => String(f).trim()).filter(Boolean)
+          : ['Publication d’annonces vérifiées'],
+        isCustomQuote: Boolean(isCustomQuote),
       };
 
-      db.createTransaction(tx);
-
-      if (tx.status === 'echoue') {
-        return res.status(402).json({
-          success: false,
-          status: 'echoue',
-          message:
-            'Le paiement a échoué (simulation Mode Test). Votre abonnement n’a pas été modifié.',
-          transaction: tx,
-        });
-      }
-
-      const expiresAt = new Date(now.getTime() + 30 * 24 * 3600 * 1000).toISOString();
-      viewer.subscription = {
-        planId: plan.id,
-        planName: plan.name,
-        status: 'active',
-        maxListings: plan.maxListings,
-        startedAt: nowIso,
-        expiresAt,
-        transactionId: tx.id,
-      };
-      if (plan.id !== 'particulier' && viewer.role === 'particulier') {
-        viewer.role = 'professionnel';
-        viewer.advertiserType = 'professionnel';
-      }
-      const updatedUser = db.updateUser(viewer);
-
-      return res.json({
-        success: true,
-        status: 'paye',
-        message: `Paiement confirmé (Mode Test). Votre offre « ${plan.name} » est désormais active !`,
-        transaction: tx,
-        user: updatedUser,
-        quota: getUserListingQuota(updatedUser, db.getAllListings(), db.getAllPlans()),
+      await db.createPlan(newPlan);
+      return res.status(201).json({ success: true, plan: newPlan, plans: db.getAllPlans() });
+    } catch (err) {
+      console.error('Error in POST /api/admin/plans:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "Erreur de synchronisation PostgreSQL lors de la création de l'offre.",
       });
     }
+  });
 
-    if (type === 'boost') {
-      const boostOpt = db.getBoostOptionById(String(optionId as BoostOptionId));
-      if (!boostOpt) {
+  app.put('/api/admin/plans/:id', async (req, res) => {
+    const admin = requireAdmin(req, res);
+    if (!admin) return;
+
+    try {
+      const existing = db.getPlanById(req.params.id);
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'Offre introuvable.' });
+      }
+
+      const isCustomQuote =
+        req.body.isCustomQuote !== undefined ? Boolean(req.body.isCustomQuote) : existing.isCustomQuote;
+      const updatedPrice = isCustomQuote
+        ? null
+        : req.body.price !== undefined
+        ? Math.max(0, Number(req.body.price))
+        : existing.price;
+      const updatedMaxListings =
+        req.body.maxListings !== undefined
+          ? Math.max(1, Number(req.body.maxListings))
+          : existing.maxListings;
+      const updatedName =
+        req.body.name !== undefined && String(req.body.name).trim().length > 0
+          ? String(req.body.name).trim()
+          : existing.name;
+      const updatedFeatures = Array.isArray(req.body.features)
+        ? req.body.features.map((f: any) => String(f).trim()).filter(Boolean)
+        : existing.features;
+
+      const updatedPlan: SubscriptionPlan = {
+        ...existing,
+        name: updatedName,
+        price: updatedPrice,
+        maxListings: updatedMaxListings,
+        features: updatedFeatures,
+        isCustomQuote,
+      };
+
+      await db.updatePlan(updatedPlan);
+
+      // Propagate updated maxListings & planName to users currently subscribed to this plan
+      for (const u of db.getAllUsers()) {
+        if (u.subscription && u.subscription.planId === existing.id && u.subscription.status === 'active') {
+          u.subscription.maxListings = updatedMaxListings;
+          u.subscription.planName = updatedName;
+          await db.updateUser(u);
+        }
+      }
+
+      return res.json({ success: true, plan: updatedPlan, plans: db.getAllPlans() });
+    } catch (err) {
+      console.error('Error in PUT /api/admin/plans/:id:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "Erreur de synchronisation PostgreSQL lors de la mise à jour de l'offre.",
+      });
+    }
+  });
+
+  app.put('/api/admin/boost-options/:id', async (req, res) => {
+    const admin = requireAdmin(req, res);
+    if (!admin) return;
+
+    try {
+      const existing = db.getBoostOptionById(req.params.id);
+      if (!existing) {
         return res.status(404).json({
           success: false,
           message: 'Option de mise en avant introuvable.',
         });
       }
-      const listing = db.getListingById(String(targetId));
-      if (!listing) {
-        return res.status(404).json({
+
+      const updatedBoost = {
+        ...existing,
+        name:
+          req.body.name !== undefined && String(req.body.name).trim()
+            ? String(req.body.name).trim()
+            : existing.name,
+        description:
+          req.body.description !== undefined && String(req.body.description).trim()
+            ? String(req.body.description).trim()
+            : existing.description,
+        price:
+          req.body.price !== undefined
+            ? Math.max(1, Number(req.body.price))
+            : existing.price,
+        durationDays:
+          req.body.durationDays !== undefined
+            ? Math.max(1, Number(req.body.durationDays))
+            : existing.durationDays,
+      };
+
+      await db.updateBoostOption(updatedBoost);
+      return res.json({
+        success: true,
+        boostOption: updatedBoost,
+        boostOptions: db.getAllBoostOptions(),
+      });
+    } catch (err) {
+      console.error('Error in PUT /api/admin/boost-options/:id:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors de la modification du boost.',
+      });
+    }
+  });
+
+  app.post('/api/payments/checkout', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({
           success: false,
-          message: 'Annonce cible introuvable.',
-        });
-      }
-      if (listing.userId !== viewer.id && viewer.role !== 'admin') {
-        return res.status(403).json({
-          success: false,
-          message: 'Vous ne pouvez mettre en avant que vos propres annonces.',
+          message: 'Créez un compte ou connectez-vous pour souscrire une offre ou mettre en avant une annonce.',
         });
       }
 
-      if (
-        listing.boost &&
-        listing.boost.status === 'active' &&
-        listing.boost.optionId === boostOpt.id &&
-        new Date(listing.boost.expiresAt).getTime() > now.getTime()
-      ) {
+      const {
+        type,
+        optionId,
+        targetId,
+        idempotencyKey,
+        testScenario = 'success',
+        paymentMethodType = 'cmi_card',
+        cardNumber,
+      } = req.body;
+
+      if (cardNumber && String(cardNumber).replace(/\D/g, '').length >= 12) {
+        return res.status(400).json({
+          success: false,
+          message:
+            'Sécurité PCI-DSS : ne transmettez jamais de numéro de carte bancaire complet au serveur. Utilisez le jeton sécurisé du prestataire en mode test.',
+        });
+      }
+
+      if (!type || !optionId || !idempotencyKey) {
+        return res.status(400).json({
+          success: false,
+          message: 'Paramètres de paiement incomplets.',
+        });
+      }
+
+      const existingTx = db.getTransactionByIdempotencyKey(String(idempotencyKey));
+      if (existingTx && existingTx.status === 'paye') {
         return res.status(409).json({
           success: false,
           code: 'DUPLICATE_PAYMENT',
-          message: `Protection anti-double paiement : cette annonce bénéficie déjà de l’option « ${boostOpt.name} » active.`,
-        });
-      }
-
-      const tx: PaymentTransaction = {
-        id: `tx-boost-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        idempotencyKey: String(idempotencyKey),
-        userId: viewer.id,
-        userName: viewer.name,
-        userEmail: viewer.email,
-        type: 'boost',
-        targetId: listing.id,
-        targetLabel: `${boostOpt.name} — ${listing.title}`,
-        optionId: boostOpt.id,
-        amount: boostOpt.price,
-        currency: 'MAD',
-        status: testScenario === 'failed' ? 'echoue' : 'paye',
-        provider: 'test_cmi_sandbox',
-        paymentMethodLabel: methodLabel,
-        failureReason:
-          testScenario === 'failed'
-            ? 'Autorisation bancaire refusée (Simulation d’échec Mode Test).'
-            : undefined,
-        createdAt: nowIso,
-        confirmedAt: testScenario === 'failed' ? undefined : nowIso,
-      };
-
-      db.createTransaction(tx);
-
-      if (tx.status === 'echoue') {
-        return res.status(402).json({
-          success: false,
-          status: 'echoue',
           message:
-            'Le paiement a échoué (simulation Mode Test). La mise en avant n’a pas été activée sur votre annonce.',
-          transaction: tx,
+            'Protection anti-double paiement : ce paiement a déjà été enregistré et confirmé. Aucun second débit n’a été effectué.',
+          transaction: existingTx,
         });
       }
 
-      const expiresAt = new Date(
-        now.getTime() + boostOpt.durationDays * 24 * 3600 * 1000
-      ).toISOString();
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const methodLabel =
+        paymentMethodType === 'payzone'
+          ? 'Payzone Maroc (Mode Test •••• 1111)'
+          : 'Carte CMI / Visa Maroc (Mode Test •••• 4242)';
 
-      listing.boost = {
-        optionId: boostOpt.id,
-        optionName: boostOpt.name,
-        status: 'active',
-        startedAt: nowIso,
-        expiresAt,
-        transactionId: tx.id,
-      };
-      const updatedListing = db.updateListing(listing);
+      if (type === 'subscription') {
+        const plan = db.getPlanById(String(optionId));
+        if (!plan) {
+          return res.status(404).json({ success: false, message: 'Offre d’abonnement introuvable.' });
+        }
+        if (plan.isCustomQuote || plan.price === null) {
+          return res.status(400).json({
+            success: false,
+            message:
+              'L’offre Entreprise est disponible uniquement sur devis personnalisé. Contactez notre service grands comptes.',
+          });
+        }
 
-      return res.json({
-        success: true,
-        status: 'paye',
-        message: `Paiement confirmé (Mode Test). Votre annonce affiche désormais la mention « Sponsorisé » (${boostOpt.name} — ${boostOpt.durationDays} jours) !`,
-        transaction: tx,
-        listing: updatedListing,
+        const userTxs = db.getTransactionsByUserId(viewer.id);
+        const recentIdenticalSubTx = userTxs.find(
+          (t) =>
+            t.type === 'subscription' &&
+            t.optionId === plan.id &&
+            t.status === 'paye' &&
+            now.getTime() - new Date(t.createdAt).getTime() < 60_000
+        );
+        if (recentIdenticalSubTx) {
+          return res.status(409).json({
+            success: false,
+            code: 'DUPLICATE_PAYMENT',
+            message: `Protection anti-double paiement : votre abonnement « ${plan.name} » vient déjà d'être activé.`,
+            transaction: recentIdenticalSubTx,
+          });
+        }
+
+        const tx: PaymentTransaction = {
+          id: `tx-sub-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          idempotencyKey: String(idempotencyKey),
+          userId: viewer.id,
+          userName: viewer.name,
+          userEmail: viewer.email,
+          type: 'subscription',
+          targetId: plan.id,
+          targetLabel: `Abonnement ${plan.name}`,
+          optionId: plan.id,
+          amount: plan.price,
+          currency: 'MAD',
+          status: testScenario === 'failed' ? 'echoue' : 'paye',
+          provider: 'test_cmi_sandbox',
+          paymentMethodLabel: plan.price === 0 ? 'Activation gratuite (0 MAD)' : methodLabel,
+          failureReason:
+            testScenario === 'failed'
+              ? 'Transaction refusée par la banque émettrice (Simulation d’échec Mode Test).'
+              : undefined,
+          createdAt: nowIso,
+          confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+        };
+
+        await db.createTransaction(tx);
+
+        if (tx.status === 'echoue') {
+          return res.status(402).json({
+            success: false,
+            status: 'echoue',
+            message:
+              'Le paiement a échoué (simulation Mode Test). Votre abonnement n’a pas été modifié.',
+            transaction: tx,
+          });
+        }
+
+        const expiresAt = new Date(now.getTime() + 30 * 24 * 3600 * 1000).toISOString();
+        viewer.subscription = {
+          planId: plan.id,
+          planName: plan.name,
+          status: 'active',
+          maxListings: plan.maxListings,
+          startedAt: nowIso,
+          expiresAt,
+          transactionId: tx.id,
+        };
+        if (plan.id !== 'particulier' && viewer.role === 'particulier') {
+          viewer.role = 'professionnel';
+          viewer.advertiserType = 'professionnel';
+        }
+        const updatedUser = await db.updateUser(viewer);
+
+        return res.json({
+          success: true,
+          status: 'paye',
+          message: `Paiement confirmé (Mode Test). Votre offre « ${plan.name} » est désormais active !`,
+          transaction: tx,
+          user: updatedUser,
+          quota: getUserListingQuota(updatedUser, db.getAllListings(), db.getAllPlans()),
+        });
+      }
+
+      if (type === 'boost') {
+        const boostOpt = db.getBoostOptionById(String(optionId as BoostOptionId));
+        if (!boostOpt) {
+          return res.status(404).json({
+            success: false,
+            message: 'Option de mise en avant introuvable.',
+          });
+        }
+        const listing = db.getListingById(String(targetId));
+        if (!listing) {
+          return res.status(404).json({
+            success: false,
+            message: 'Annonce cible introuvable.',
+          });
+        }
+        if (listing.userId !== viewer.id && viewer.role !== 'admin') {
+          return res.status(403).json({
+            success: false,
+            message: 'Vous ne pouvez mettre en avant que vos propres annonces.',
+          });
+        }
+
+        if (
+          listing.boost &&
+          listing.boost.status === 'active' &&
+          listing.boost.optionId === boostOpt.id &&
+          new Date(listing.boost.expiresAt).getTime() > now.getTime()
+        ) {
+          return res.status(409).json({
+            success: false,
+            code: 'DUPLICATE_PAYMENT',
+            message: `Protection anti-double paiement : cette annonce bénéficie déjà de l’option « ${boostOpt.name} » active.`,
+          });
+        }
+
+        const tx: PaymentTransaction = {
+          id: `tx-boost-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          idempotencyKey: String(idempotencyKey),
+          userId: viewer.id,
+          userName: viewer.name,
+          userEmail: viewer.email,
+          type: 'boost',
+          targetId: listing.id,
+          targetLabel: `${boostOpt.name} — ${listing.title}`,
+          optionId: boostOpt.id,
+          amount: boostOpt.price,
+          currency: 'MAD',
+          status: testScenario === 'failed' ? 'echoue' : 'paye',
+          provider: 'test_cmi_sandbox',
+          paymentMethodLabel: methodLabel,
+          failureReason:
+            testScenario === 'failed'
+              ? 'Autorisation bancaire refusée (Simulation d’échec Mode Test).'
+              : undefined,
+          createdAt: nowIso,
+          confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+        };
+
+        await db.createTransaction(tx);
+
+        if (tx.status === 'echoue') {
+          return res.status(402).json({
+            success: false,
+            status: 'echoue',
+            message:
+              'Le paiement a échoué (simulation Mode Test). La mise en avant n’a pas été activée sur votre annonce.',
+            transaction: tx,
+          });
+        }
+
+        const expiresAt = new Date(
+          now.getTime() + boostOpt.durationDays * 24 * 3600 * 1000
+        ).toISOString();
+
+        listing.boost = {
+          optionId: boostOpt.id,
+          optionName: boostOpt.name,
+          status: 'active',
+          startedAt: nowIso,
+          expiresAt,
+          transactionId: tx.id,
+        };
+        const updatedListing = await db.updateListing(listing);
+
+        return res.json({
+          success: true,
+          status: 'paye',
+          message: `Paiement confirmé (Mode Test). Votre annonce affiche désormais la mention « Sponsorisé » (${boostOpt.name} — ${boostOpt.durationDays} jours) !`,
+          transaction: tx,
+          listing: updatedListing,
+        });
+      }
+
+      return res.status(400).json({ success: false, message: 'Type de transaction non reconnu.' });
+    } catch (err) {
+      console.error('Error in POST /api/payments/checkout:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: "La synchronisation PostgreSQL a échoué. La transaction n'a pas été validée.",
       });
     }
-
-    return res.status(400).json({ success: false, message: 'Type de transaction non reconnu.' });
   });
 
-  app.post('/api/payments/:id/refund', (req, res) => {
+  app.post('/api/payments/:id/refund', async (req, res) => {
     const admin = requireAdmin(req, res);
     if (!admin) return;
 
-    const tx = db.getTransactionById(req.params.id);
-    if (!tx) {
-      return res.status(404).json({ success: false, message: 'Transaction introuvable.' });
-    }
-    if (tx.status !== 'paye') {
-      return res.status(400).json({
+    try {
+      const tx = db.getTransactionById(req.params.id);
+      if (!tx) {
+        return res.status(404).json({ success: false, message: 'Transaction introuvable.' });
+      }
+      if (tx.status !== 'paye') {
+        return res.status(400).json({
+          success: false,
+          message: 'Seul un paiement confirmé (« payé ») peut faire l’objet d’un remboursement.',
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      tx.status = 'rembourse';
+      tx.refundedAt = nowIso;
+      const updatedTx = await db.updateTransaction(tx);
+
+      if (tx.type === 'subscription') {
+        const targetUser = db.getUserById(tx.userId);
+        const plans = db.getAllPlans();
+        const freePlan = plans.find((p) => p.id === 'particulier') || plans[0];
+        if (targetUser) {
+          targetUser.subscription = {
+            planId: freePlan.id,
+            planName: freePlan.name,
+            status: 'refunded',
+            maxListings: freePlan.maxListings,
+            startedAt: nowIso,
+            expiresAt: nowIso,
+          };
+          await db.updateUser(targetUser);
+        }
+      } else if (tx.type === 'boost') {
+        const targetListing = db.getListingById(tx.targetId);
+        if (targetListing && targetListing.boost) {
+          targetListing.boost = {
+            ...targetListing.boost,
+            status: 'revoked',
+          };
+          await db.updateListing(targetListing);
+        }
+      }
+
+      return res.json({
+        success: true,
+        message: `Transaction ${updatedTx.id} remboursée (${updatedTx.amount} MAD). L’option associée a été désactivée.`,
+        transaction: updatedTx,
+        revenueSummary: calculateRevenueSummary(db.getAllTransactions()),
+      });
+    } catch (err) {
+      console.error('Error in POST /api/payments/:id/refund:', err);
+      return res.status(503).json({
         success: false,
-        message: 'Seul un paiement confirmé (« payé ») peut faire l’objet d’un remboursement.',
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur de synchronisation PostgreSQL lors du remboursement.',
       });
     }
-
-    const nowIso = new Date().toISOString();
-    tx.status = 'rembourse';
-    tx.refundedAt = nowIso;
-    const updatedTx = db.updateTransaction(tx);
-
-    if (tx.type === 'subscription') {
-      const targetUser = db.getUserById(tx.userId);
-      const plans = db.getAllPlans();
-      const freePlan = plans.find((p) => p.id === 'particulier') || plans[0];
-      if (targetUser) {
-        targetUser.subscription = {
-          planId: freePlan.id,
-          planName: freePlan.name,
-          status: 'refunded',
-          maxListings: freePlan.maxListings,
-          startedAt: nowIso,
-          expiresAt: nowIso,
-        };
-        db.updateUser(targetUser);
-      }
-    } else if (tx.type === 'boost') {
-      const targetListing = db.getListingById(tx.targetId);
-      if (targetListing && targetListing.boost) {
-        targetListing.boost = {
-          ...targetListing.boost,
-          status: 'revoked',
-        };
-        db.updateListing(targetListing);
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `Transaction ${updatedTx.id} remboursée (${updatedTx.amount} MAD). L’option associée a été désactivée.`,
-      transaction: updatedTx,
-      revenueSummary: calculateRevenueSummary(db.getAllTransactions()),
-    });
   });
 
   // ==========================================================================
@@ -1528,7 +1873,7 @@ export function createDarnaApiApp(customDbPath?: string): {
     }
     try {
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-tts',
+        model: 'gemini-2.5-flash-preview-tts',
         contents: [
           {
             role: 'user',
@@ -1624,11 +1969,11 @@ export function createDarnaApiApp(customDbPath?: string): {
       });
     }
 
-    let modelName = 'gemini-3.8-flash';
+    let modelName = 'gemini-2.5-flash';
     let systemInstruction = '';
 
     if (roleType === 'legal') {
-      modelName = 'gemini-4-argon';
+      modelName = 'gemini-2.5-pro';
       systemInstruction = `Tu es l'Expert Juridique Spécialiste de la Location Immobilière au Maroc pour la plateforme Darna.
 Tu maîtrises parfaitement :
 - La Loi n° 67-12 organisant les rapports contractuels entre bailleurs et locataires des locaux à usage d'habitation ou à usage professionnel au Maroc.
@@ -1645,7 +1990,7 @@ Fournis des estimations rapides, concises et précises du loyer mensuel en Dirha
 - Le type de bien, la superficie en m², le standing et l'état meublé ou vide.
 Sois direct, donne des fourchettes réalistes (ex: 6 500 - 8 000 MAD / mois) et les facteurs d'influence.`;
     } else {
-      modelName = 'gemini-3.8-flash';
+      modelName = 'gemini-2.5-flash';
       systemInstruction = `Tu es l'Assistant Recherche et Vie de Quartier Darna au Maroc.
 Tu aides les futurs locataires et les propriétaires au Maroc :
 - Conseils sur les quartiers (ambiance, écoles, transports, commerces, sécurité) à Casablanca, Rabat, Marrakech, Tanger, etc.
@@ -1667,9 +2012,9 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
           config: { systemInstruction },
         });
       } catch (err: any) {
-        if (modelName === 'gemini-4-argon') {
+        if (modelName === 'gemini-2.5-pro') {
           response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
+            model: 'gemini-2.5-flash',
             contents,
             config: { systemInstruction },
           });

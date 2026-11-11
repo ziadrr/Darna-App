@@ -185,6 +185,30 @@ export async function deleteSessionFromCloudSql(tokenHash: string): Promise<void
   }
 }
 
+export async function deleteUserSessionsFromCloudSql(userUid: string): Promise<void> {
+  if (!isCloudSqlConfigured()) return;
+  try {
+    await db.delete(sessions).where(eq(sessions.userUid, userUid));
+  } catch (error) {
+    console.error('Database query failed in deleteUserSessionsFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function revokeAllSessionsInCloudSql(): Promise<void> {
+  if (!isCloudSqlConfigured()) return;
+  try {
+    await db.delete(sessions);
+  } catch (error) {
+    console.error('Database query failed in revokeAllSessionsInCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
 export async function syncPasswordResetTokenToCloudSql(
   tokenHash: string,
   userUid: string,
@@ -386,6 +410,7 @@ export async function fetchAllCloudSqlState() {
     const [
       userRows,
       sessionRows,
+      resetRows,
       listingRows,
       reportRows,
       planRows,
@@ -394,6 +419,7 @@ export async function fetchAllCloudSqlState() {
     ] = await Promise.all([
       db.select().from(users),
       db.select().from(sessions),
+      db.select().from(passwordResetTokens),
       db.select().from(listings).orderBy(desc(listings.createdAt)),
       db.select().from(reports).orderBy(desc(reports.createdAt)),
       db.select().from(subscriptionPlans).orderBy(asc(subscriptionPlans.sortOrder)),
@@ -410,6 +436,13 @@ export async function fetchAllCloudSqlState() {
         tokenHash: s.tokenHash,
         userUid: s.userUid,
         expiresAt: Number(s.expiresAt),
+      })),
+      resetTokens: resetRows.map((rt) => ({
+        tokenHash: rt.tokenHash,
+        userUid: rt.userUid,
+        email: rt.email,
+        expiresAt: Number(rt.expiresAt),
+        used: rt.used,
       })),
       listings: listingRows.map((l) => JSON.parse(l.dataJson) as Listing),
       reports: reportRows.map((r) => JSON.parse(r.dataJson) as ListingReport),
