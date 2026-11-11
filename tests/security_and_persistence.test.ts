@@ -489,6 +489,20 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     });
     assert.equal(noProofRes.status, 400);
 
+    // B2) Calling /api/auth/verify-email with an invalid or expired code fails with 403 and clear message
+    const badCodeRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${userToken}`,
+      },
+      body: JSON.stringify({ verificationToken: '000000-code-invalide-ou-expire' }),
+    });
+    const badCodeData = await badCodeRes.json();
+    assert.equal(badCodeRes.status, 403);
+    assert.equal(badCodeData.code, 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN');
+    assert.match(badCodeData.message, /invalide|expiré/i);
+
     // C) Enable local SMTP server, request email verification, and verify token is delivered by SMTP (never in HTTP JSON)
     process.env.SMTP_HOST = '127.0.0.1';
     process.env.SMTP_PORT = String(smtpPort);
@@ -596,5 +610,34 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.ok(persistedUser, 'Registered user must persist across DB restarts');
     assert.equal(persistedUser.user.emailVerified, true);
     reopenedDb.close();
+  });
+
+  it('9. refuses to fall back silently to local SQLite in production when PostgreSQL is not configured', async () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedSqlHost = process.env.SQL_HOST;
+    const savedSqlUser = process.env.SQL_USER;
+    const savedSqlPassword = process.env.SQL_PASSWORD;
+    const savedSqlDbName = process.env.SQL_DB_NAME;
+
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.SQL_HOST;
+      delete process.env.SQL_USER;
+      delete process.env.SQL_PASSWORD;
+      delete process.env.SQL_DB_NAME;
+
+      assert.throws(
+        () => new DarnaPersistentDb(),
+        /POSTGRESQL_REQUIRED_IN_PRODUCTION/,
+        'Must throw POSTGRESQL_REQUIRED_IN_PRODUCTION in production when PostgreSQL is unconfigured'
+      );
+    } finally {
+      if (savedNodeEnv !== undefined) process.env.NODE_ENV = savedNodeEnv;
+      else delete process.env.NODE_ENV;
+      if (savedSqlHost !== undefined) process.env.SQL_HOST = savedSqlHost;
+      if (savedSqlUser !== undefined) process.env.SQL_USER = savedSqlUser;
+      if (savedSqlPassword !== undefined) process.env.SQL_PASSWORD = savedSqlPassword;
+      if (savedSqlDbName !== undefined) process.env.SQL_DB_NAME = savedSqlDbName;
+    }
   });
 });

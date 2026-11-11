@@ -1091,6 +1091,31 @@ export default function App() {
 
       {/* MAIN CONTAINER */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-7">
+        {/* Email Verification Reminder Banner for Unverified Users */}
+        {currentUser && !currentUser.emailVerified && (
+          <div
+            role="region"
+            aria-label="Vérification de votre adresse e-mail"
+            className="p-4 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs"
+          >
+            <div className="space-y-0.5">
+              <p className="text-xs font-extrabold text-stone-900">
+                Votre adresse e-mail ({currentUser.email}) n’est pas encore vérifiée.
+              </p>
+              <p className="text-[11px] text-stone-600">
+                Demandez un code par e-mail ou saisissez le code de vérification reçu dans votre profil.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsProfileModalOpen(true)}
+              className="px-4 py-2 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold shrink-0 self-start sm:self-auto transition-colors"
+            >
+              Vérifier mon adresse e-mail / Saisir mon code
+            </button>
+          </div>
+        )}
+
         {/* VIEW 1: HOME VIEW */}
         {currentView === 'home' && (
           <div className="space-y-7 animate-fade-in">
@@ -1603,6 +1628,7 @@ export default function App() {
           isOpen={isProfileModalOpen}
           onClose={() => setIsProfileModalOpen(false)}
           currentUser={currentUser}
+          authToken={authToken}
           myListings={listings.filter((l) => l.userId === currentUser.id)}
           allListings={listings}
           plans={plans}
@@ -1625,6 +1651,7 @@ export default function App() {
           onToggleListingStatus={handleToggleListingStatus}
           onDeleteListing={handleDeleteListing}
           onVerifyEmail={handleVerifyEmail}
+          onUserUpdated={(updatedUser) => setCurrentUser(updatedUser)}
           onLogout={handleLogout}
         />
       )}

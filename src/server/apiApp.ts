@@ -31,7 +31,7 @@ import {
 
 export function createDarnaApiApp(
   customDbPath?: string,
-  options?: { enableCloudSqlSync?: boolean }
+  options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
 ): {
   app: express.Express;
   db: DarnaPersistentDb;
@@ -40,18 +40,72 @@ export function createDarnaApiApp(
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // Ensure Cloud SQL PostgreSQL state is hydrated before serving /api requests,
-  // while keeping root HTML '/' route non-blocking for container cold-boot health checks.
-  app.use('/api', async (_req, _res, next) => {
+  // Ensure Cloud SQL PostgreSQL state is hydrated before serving /api requests.
+  // In production, never fall back silently to a local SQLite database if PostgreSQL is unconfigured.
+  app.use('/api', async (_req, res, next) => {
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !customDbPath &&
+      !options?.allowLocalFallbackInProd &&
+      !isCloudSqlConfigured()
+    ) {
+      return res.status(503).json({
+        success: false,
+        code: 'POSTGRESQL_REQUIRED_IN_PRODUCTION',
+        message:
+          "En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré. Le repli silencieux sur une base locale est interdit.",
+      });
+    }
+
     try {
       await Promise.race([
         db.ensureCloudSqlHydrated(),
         new Promise((resolve) => setTimeout(resolve, 4000)),
       ]);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to hydrate Cloud SQL state:', err);
+      if (
+        process.env.NODE_ENV === 'production' ||
+        String(err?.message || '').includes('POSTGRESQL_REQUIRED_IN_PRODUCTION')
+      ) {
+        return res.status(503).json({
+          success: false,
+          code: 'DATABASE_SYNC_FAILED',
+          message:
+            'Impossible de synchroniser avec PostgreSQL (Cloud SQL). Le repli sur une base locale est interdit en production.',
+        });
+      }
     }
     next();
+  });
+
+  app.get('/api/system/status', (_req, res) => {
+    const cloudSqlConfigured = isCloudSqlConfigured();
+    const emailConfigured = isEmailServiceConfigured();
+    return res.json({
+      success: true,
+      nodeEnv: process.env.NODE_ENV || 'development',
+      persistence: {
+        postgresqlConfigured: cloudSqlConfigured,
+        postgresqlSyncEnabled: db.isCloudSqlSyncEnabled(),
+        productionLocalFallbackAllowed: false,
+        storageEngine: db.isCloudSqlSyncEnabled() ? 'postgresql_cloudsql' : 'sqlite_local',
+      },
+      email: {
+        configured: emailConfigured,
+        smtpHostConfigured: Boolean(process.env.SMTP_HOST?.trim()),
+        resendConfigured: Boolean(process.env.RESEND_API_KEY?.trim()),
+      },
+      auth: {
+        googleEnabled: false,
+        appleEnabled: false,
+        activeSessionsCount: db.getActiveSessionCount(),
+      },
+      payments: {
+        mode: 'simulation',
+        realPaymentsEnabled: false,
+      },
+    });
   });
 
   const apiKey = process.env.GEMINI_API_KEY || '';

@@ -50,7 +50,17 @@ export class DarnaPersistentDb {
   private lastCloudSqlSyncAt = 0;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
 
-  constructor(customDbPath?: string, options?: { enableCloudSqlSync?: boolean }) {
+  constructor(
+    customDbPath?: string,
+    options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
+  ) {
+    const isProd = process.env.NODE_ENV === 'production';
+    if (isProd && !customDbPath && !options?.allowLocalFallbackInProd && !isCloudSqlConfigured()) {
+      throw new Error(
+        'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré. Le repli silencieux sur une base locale est interdit.'
+      );
+    }
+
     this.enableCloudSqlSync =
       options?.enableCloudSqlSync !== undefined
         ? Boolean(options.enableCloudSqlSync && isCloudSqlConfigured())
@@ -81,10 +91,27 @@ export class DarnaPersistentDb {
     this.simulateCloudSqlFailure = fail;
   }
 
+  public isCloudSqlSyncEnabled(): boolean {
+    return this.enableCloudSqlSync;
+  }
+
+  public getActiveSessionCount(): number {
+    const nowIso = new Date().toISOString();
+    const row = this.db
+      .prepare('SELECT COUNT(*) as cnt FROM sessions WHERE expires_at > ?')
+      .get(nowIso) as { cnt: number } | undefined;
+    return Number(row?.cnt || 0);
+  }
+
   private assertCloudSqlWritable(): void {
     if (this.simulateCloudSqlFailure) {
       throw new Error(
         'CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible, écriture annulée.'
+      );
+    }
+    if (process.env.NODE_ENV === 'production' && !this.enableCloudSqlSync && !isCloudSqlConfigured()) {
+      throw new Error(
+        'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré.'
       );
     }
   }
@@ -96,6 +123,11 @@ export class DarnaPersistentDb {
   public async ensureCloudSqlHydrated(forceRefresh = false): Promise<void> {
     if (this.simulateCloudSqlFailure) {
       throw new Error('CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible.');
+    }
+    if (process.env.NODE_ENV === 'production' && !this.enableCloudSqlSync && !isCloudSqlConfigured()) {
+      throw new Error(
+        'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré.'
+      );
     }
     if (!this.enableCloudSqlSync) return;
     const now = Date.now();
