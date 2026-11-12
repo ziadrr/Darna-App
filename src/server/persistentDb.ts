@@ -269,13 +269,15 @@ export class DarnaPersistentDb {
 
         this.db.prepare('DELETE FROM transactions').run();
         for (const tx of state.transactions) {
+          const rawKey = tx.idempotencyKey || tx.id;
+          const scopedKey = rawKey.startsWith(`${tx.userId}:`) ? rawKey : `${tx.userId}:${rawKey}`;
           this.db
             .prepare(
               'INSERT OR REPLACE INTO transactions (id, idempotency_key, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
             )
             .run(
               tx.id,
-              tx.idempotencyKey || tx.id,
+              scopedKey,
               tx.userId,
               tx.status,
               new Date(tx.createdAt || nowIso).getTime() || Date.now(),
@@ -1042,7 +1044,26 @@ export class DarnaPersistentDb {
     return row ? (JSON.parse(row.data_json) as PaymentTransaction) : null;
   }
 
-  public getTransactionByIdempotencyKey(key: string): PaymentTransaction | null {
+  public getTransactionByUserAndIdempotencyKey(
+    userId: string,
+    key: string
+  ): PaymentTransaction | null {
+    const scopedKey = `${userId}:${key}`;
+    const row = this.db
+      .prepare(
+        'SELECT data_json FROM transactions WHERE user_id = ? AND (idempotency_key = ? OR idempotency_key = ?)'
+      )
+      .get(userId, scopedKey, key) as { data_json: string } | undefined;
+    return row ? (JSON.parse(row.data_json) as PaymentTransaction) : null;
+  }
+
+  public getTransactionByIdempotencyKey(
+    key: string,
+    userId?: string
+  ): PaymentTransaction | null {
+    if (userId) {
+      return this.getTransactionByUserAndIdempotencyKey(userId, key);
+    }
     const row = this.db
       .prepare('SELECT data_json FROM transactions WHERE idempotency_key = ?')
       .get(key) as { data_json: string } | undefined;
@@ -1052,9 +1073,12 @@ export class DarnaPersistentDb {
   public async createTransaction(tx: PaymentTransaction): Promise<PaymentTransaction> {
     this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
+    const scopedKey = tx.idempotencyKey.startsWith(`${tx.userId}:`)
+      ? tx.idempotencyKey
+      : `${tx.userId}:${tx.idempotencyKey}`;
 
     if (this.enableCloudSqlSync) {
-      await syncTransactionToCloudSql(tx);
+      await syncTransactionToCloudSql({ ...tx, idempotencyKey: scopedKey }, tx);
     }
 
     this.db
@@ -1063,7 +1087,7 @@ export class DarnaPersistentDb {
       )
       .run(
         tx.id,
-        tx.idempotencyKey,
+        scopedKey,
         tx.userId,
         tx.status,
         Date.now(),

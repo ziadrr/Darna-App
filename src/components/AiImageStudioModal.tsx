@@ -50,11 +50,16 @@ export const AiImageStudioModal: React.FC<AiImageStudioModalProps> = ({
     setError(null);
 
     try {
+      const token = localStorage.getItem('darna_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
       const response = await fetch('/api/generate-image', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          prompt,
+          prompt: prompt.trim().slice(0, 500),
           imageSize,
           aspectRatio,
         }),

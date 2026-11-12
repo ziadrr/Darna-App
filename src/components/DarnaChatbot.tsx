@@ -91,11 +91,18 @@ export const DarnaChatbot: React.FC<DarnaChatbotProps> = ({ isOpen, onClose }) =
     setIsLoading(true);
 
     try {
+      const token = localStorage.getItem('darna_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
-          messages: newHistory.map((m) => ({ role: m.role, text: m.text })),
+          messages: newHistory
+            .slice(-20)
+            .map((m) => ({ role: m.role, text: m.text.slice(0, 2000) })),
           roleType,
         }),
       });

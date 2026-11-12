@@ -84,7 +84,7 @@ export default function App() {
   );
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
-  const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
+  const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register' | 'verify'>('login');
   const [authReasonMessage, setAuthReasonMessage] = useState<string | undefined>(undefined);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
 
@@ -1071,19 +1071,33 @@ export default function App() {
                 </span>
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  setPendingAction(null);
-                  setAuthReasonMessage(undefined);
-                  setAuthInitialMode('login');
-                  setIsAuthModalOpen(true);
-                }}
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all whitespace-nowrap shrink-0"
-              >
-                <LogIn className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
-                <span>Se connecter</span>
-              </button>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingAction(null);
+                    setAuthReasonMessage(undefined);
+                    setAuthInitialMode('verify');
+                    setIsAuthModalOpen(true);
+                  }}
+                  className="hidden md:flex items-center gap-1.5 px-3 py-2 rounded-full bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 text-xs font-bold transition-all whitespace-nowrap shrink-0"
+                >
+                  <span>Vérifier mon mail</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingAction(null);
+                    setAuthReasonMessage(undefined);
+                    setAuthInitialMode('login');
+                    setIsAuthModalOpen(true);
+                  }}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all whitespace-nowrap shrink-0"
+                >
+                  <LogIn className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
+                  <span>Se connecter</span>
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -1091,27 +1105,22 @@ export default function App() {
 
       {/* MAIN CONTAINER */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-7">
-        {/* Email Verification Reminder Banner for Unverified Users */}
+        {/* Simple Email Verification Reminder Banner for Unverified Users */}
         {currentUser && !currentUser.emailVerified && (
           <div
             role="region"
             aria-label="Vérification de votre adresse e-mail"
-            className="p-4 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs"
+            className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 flex flex-wrap items-center justify-between gap-3 shadow-2xs"
           >
-            <div className="space-y-0.5">
-              <p className="text-xs font-extrabold text-stone-900">
-                Votre adresse e-mail ({currentUser.email}) n’est pas encore vérifiée.
-              </p>
-              <p className="text-[11px] text-stone-600">
-                Demandez un code par e-mail ou saisissez le code de vérification reçu dans votre profil.
-              </p>
-            </div>
+            <p className="text-xs font-bold text-stone-900">
+              Adresse e-mail non vérifiée ({currentUser.email})
+            </p>
             <button
               type="button"
               onClick={() => setIsProfileModalOpen(true)}
-              className="px-4 py-2 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold shrink-0 self-start sm:self-auto transition-colors"
+              className="px-3.5 py-1.5 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold shrink-0 transition-colors"
             >
-              Vérifier mon adresse e-mail / Saisir mon code
+              Vérifier mon mail
             </button>
           </div>
         )}

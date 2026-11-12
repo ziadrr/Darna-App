@@ -1,4 +1,7 @@
+import crypto from 'node:crypto';
 import express from 'express';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { GoogleGenAI } from '@google/genai';
 import type {
   Listing,
@@ -29,6 +32,21 @@ import {
   sendPasswordResetMessage,
 } from './mailer.ts';
 
+export function computePaymentWebhookHmac(
+  payload: {
+    transactionId: string;
+    status: string;
+    amount: number;
+    currency?: string;
+  },
+  storeKey: string
+): string {
+  const canonical = `${payload.transactionId}:${payload.status}:${Number(payload.amount)}:${
+    payload.currency || 'MAD'
+  }`;
+  return crypto.createHmac('sha256', storeKey).update(canonical).digest('hex');
+}
+
 export function createDarnaApiApp(
   customDbPath?: string,
   options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
@@ -38,7 +56,80 @@ export function createDarnaApiApp(
 } {
   const db = new DarnaPersistentDb(customDbPath, options);
   const app = express();
-  app.use(express.json({ limit: '25mb' }));
+
+  // Trust Cloud Run / reverse proxy first hop for accurate client IP detection
+  app.set('trust proxy', 1);
+
+  // Security headers via Helmet with CSP compatible with Leaflet, Google Fonts, Unsplash, and Firebase
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        useDefaults: true,
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https://apis.google.com'],
+          styleSrc: [
+            "'self'",
+            "'unsafe-inline'",
+            'https://fonts.googleapis.com',
+            'https://unpkg.com',
+          ],
+          fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+          imgSrc: [
+            "'self'",
+            'data:',
+            'blob:',
+            'https:',
+            'http:',
+            'https://*.tile.openstreetmap.org',
+            'https://unpkg.com',
+            'https://images.unsplash.com',
+          ],
+          mediaSrc: ["'self'", 'data:', 'blob:'],
+          connectSrc: [
+            "'self'",
+            'https://*.googleapis.com',
+            'https://*.firebaseio.com',
+            'https://*.firebaseapp.com',
+            'https://*.tile.openstreetmap.org',
+            'wss:',
+            'ws:',
+          ],
+          frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  // Default 1MB JSON body limit; allow 15MB only on listing creation/update routes that carry image data
+  const defaultJsonParser = express.json({ limit: '1mb' });
+  const listingJsonParser = express.json({ limit: '15mb' });
+
+  app.use((req, res, next) => {
+    const isListingUploadRoute =
+      (req.method === 'POST' && req.path === '/api/listings') ||
+      (req.method === 'PUT' && /^\/api\/listings\/[^/]+$/.test(req.path));
+    const parser = isListingUploadRoute ? listingJsonParser : defaultJsonParser;
+    parser(req, res, (err: any) => {
+      if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+        return res.status(413).json({
+          success: false,
+          code: 'PAYLOAD_TOO_LARGE',
+          message:
+            'La taille de la requête dépasse la limite autorisée (1 Mo maximum par défaut).',
+        });
+      }
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_JSON_PAYLOAD',
+          message: 'Format JSON de la requête invalide.',
+        });
+      }
+      next();
+    });
+  });
 
   // Ensure Cloud SQL PostgreSQL state is hydrated before serving /api requests.
   // In production, never fall back silently to a local SQLite database if PostgreSQL is unconfigured.
@@ -119,9 +210,105 @@ export function createDarnaApiApp(
     },
   });
 
+  function getClientIp(req: express.Request): string {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) {
+      return forwarded.split(',')[0].trim();
+    }
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+  }
+
   // Rate limiters
   const contactRateLimiter = new Map<string, { count: number; resetAt: number }>();
   const loginRateLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiChatUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiChatIpLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiTtsUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiTtsIpLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiImageUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const aiImageIpLimiter = new Map<string, { count: number; resetAt: number }>();
+
+  function consumeDualRateLimit(
+    userMap: Map<string, { count: number; resetAt: number }>,
+    ipMap: Map<string, { count: number; resetAt: number }>,
+    userId: string,
+    clientIp: string,
+    maxRequests: number,
+    windowMs: number
+  ): { allowed: boolean; blockedBy?: 'user' | 'ip' } {
+    const now = Date.now();
+    const userEntry = userMap.get(userId);
+    const ipEntry = ipMap.get(clientIp);
+
+    const userCount = userEntry && now < userEntry.resetAt ? userEntry.count : 0;
+    const ipCount = ipEntry && now < ipEntry.resetAt ? ipEntry.count : 0;
+
+    if (userCount >= maxRequests) {
+      return { allowed: false, blockedBy: 'user' };
+    }
+    if (ipCount >= maxRequests) {
+      return { allowed: false, blockedBy: 'ip' };
+    }
+
+    if (!userEntry || now >= userEntry.resetAt) {
+      userMap.set(userId, { count: 1, resetAt: now + windowMs });
+    } else {
+      userEntry.count += 1;
+    }
+
+    if (!ipEntry || now >= ipEntry.resetAt) {
+      ipMap.set(clientIp, { count: 1, resetAt: now + windowMs });
+    } else {
+      ipEntry.count += 1;
+    }
+
+    return { allowed: true };
+  }
+
+  // Express-rate-limit middlewares for sensitive auth endpoints
+  const registerRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: () => Number(process.env.AUTH_REGISTER_RATE_LIMIT || 25),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: (req) => getClientIp(req),
+    message: {
+      success: false,
+      code: 'RATE_LIMIT_EXCEEDED',
+      message:
+        'Trop de tentatives de création de compte depuis cette adresse IP. Veuillez réessayer dans quelques minutes.',
+    },
+  });
+
+  const requestPasswordResetRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: () => Number(process.env.AUTH_RESET_REQUEST_RATE_LIMIT || 10),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: (req) =>
+      `${getClientIp(req)}:${String(req.body?.email || '').trim().toLowerCase()}`,
+    message: {
+      success: false,
+      code: 'RATE_LIMIT_EXCEEDED',
+      message:
+        'Trop de demandes de réinitialisation de mot de passe. Veuillez patienter quelques minutes avant de réessayer.',
+    },
+  });
+
+  const resetPasswordRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: () => Number(process.env.AUTH_RESET_CONFIRM_RATE_LIMIT || 10),
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: (req) =>
+      `${getClientIp(req)}:${String(req.body?.email || '').trim().toLowerCase()}`,
+    message: {
+      success: false,
+      code: 'RATE_LIMIT_EXCEEDED',
+      message:
+        'Trop de tentatives de réinitialisation de mot de passe. Veuillez patienter quelques minutes avant de réessayer.',
+    },
+  });
 
   function getAuthUser(req: express.Request): User | null {
     const authHeader = req.headers.authorization;
@@ -370,7 +557,7 @@ export function createDarnaApiApp(
   // AUTHENTICATION ROUTES (Secured with scrypt, SHA-256 session tokens, no plaintext)
   // ==========================================================================
 
-  app.post('/api/auth/register', async (req, res) => {
+  app.post('/api/auth/register', registerRateLimiter, async (req, res) => {
     try {
       const { firstName, lastName, email, password, phone, advertiserType, termsAccepted } = req.body;
       if (!firstName || !lastName || !email || !password) {
@@ -469,11 +656,15 @@ export function createDarnaApiApp(
       }
 
       const normalizedEmail = String(email).trim().toLowerCase();
+      const clientIp = getClientIp(req);
+      const loginKey = `${clientIp}:${normalizedEmail}`;
+      const maxLoginAttempts = Number(process.env.AUTH_LOGIN_MAX_ATTEMPTS || 8);
       const now = Date.now();
-      const attemptEntry = loginRateLimiter.get(normalizedEmail);
-      if (attemptEntry && now < attemptEntry.resetAt && attemptEntry.count >= 8) {
+      const attemptEntry = loginRateLimiter.get(loginKey);
+      if (attemptEntry && now < attemptEntry.resetAt && attemptEntry.count >= maxLoginAttempts) {
         return res.status(429).json({
           success: false,
+          code: 'RATE_LIMIT_EXCEEDED',
           message: 'Trop de tentatives de connexion échouées. Veuillez réessayer dans quelques minutes.',
         });
       }
@@ -481,7 +672,7 @@ export function createDarnaApiApp(
       const user = db.verifyUserCredentials(normalizedEmail, String(password));
       if (!user) {
         if (!attemptEntry || now >= attemptEntry.resetAt) {
-          loginRateLimiter.set(normalizedEmail, { count: 1, resetAt: now + 5 * 60_000 });
+          loginRateLimiter.set(loginKey, { count: 1, resetAt: now + 5 * 60_000 });
         } else {
           attemptEntry.count += 1;
         }
@@ -491,7 +682,7 @@ export function createDarnaApiApp(
         });
       }
 
-      loginRateLimiter.delete(normalizedEmail);
+      loginRateLimiter.delete(loginKey);
       const token = await db.createSession(user.id);
       return res.json({ success: true, user, token });
     } catch (err: any) {
@@ -519,6 +710,7 @@ export function createDarnaApiApp(
 
   /**
    * Step 1 of Email Verification:
+   * Works both BEFORE login (when `email` is provided in body) and AFTER login (via Bearer token).
    * Generates a single-use SHA-256 hashed cryptographic verification token and sends it
    * via the configured SMTP / transactional email provider.
    * Never claims an email was sent if no email delivery occurred, and never returns the token in HTTP responses.
@@ -526,8 +718,17 @@ export function createDarnaApiApp(
   app.post('/api/auth/request-email-verification', async (req, res) => {
     try {
       const viewer = getAuthUser(req);
-      if (!viewer) {
-        return res.status(401).json({ success: false, message: 'Non connecté.' });
+      const bodyEmail =
+        typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+
+      const targetUser = viewer || (bodyEmail ? db.getUserByEmail(bodyEmail)?.user || null : null);
+
+      if (! viewer && !bodyEmail) {
+        return res.status(401).json({
+          success: false,
+          emailSent: false,
+          message: 'Veuillez indiquer votre adresse e-mail pour recevoir un code de vérification.',
+        });
       }
 
       if (!isEmailServiceConfigured()) {
@@ -541,10 +742,19 @@ export function createDarnaApiApp(
         });
       }
 
-      const rawToken = await db.createEmailVerificationToken(viewer.id, viewer.email);
+      if (!targetUser) {
+        return res.status(404).json({
+          success: false,
+          emailSent: false,
+          code: 'USER_NOT_FOUND',
+          message: "Aucun compte Darna ne correspond à cette adresse e-mail. Créez d'abord votre compte.",
+        });
+      }
+
+      const rawToken = await db.createEmailVerificationToken(targetUser.id, targetUser.email);
       const mailResult = await sendEmailVerificationMessage({
-        toEmail: viewer.email,
-        userName: viewer.name,
+        toEmail: targetUser.email,
+        userName: targetUser.name,
         verificationToken: rawToken,
       });
 
@@ -566,7 +776,7 @@ export function createDarnaApiApp(
         smtpConfigured: true,
         provider: mailResult.provider,
         message:
-          'Un e-mail contenant votre jeton de vérification à usage unique (valable 15 minutes) a été envoyé à votre adresse.',
+          'Code de vérification envoyé par e-mail (valable 15 minutes).',
       });
     } catch (err) {
       console.error('Error in POST /api/auth/request-email-verification:', err);
@@ -581,15 +791,26 @@ export function createDarnaApiApp(
 
   /**
    * Step 2 of Email Verification:
+   * Works both BEFORE login (with `{ email, verificationToken }`) and AFTER login (via Bearer token).
    * Strictly requires a valid, non-expired single-use cryptographic `verificationToken`.
    * Rejects any request that attempts to mark an email as verified without proof.
    */
   app.post('/api/auth/verify-email', async (req, res) => {
     try {
       const viewer = getAuthUser(req);
-      if (!viewer) {
-        return res.status(401).json({ success: false, message: 'Non connecté.' });
+      const bodyEmail =
+        typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+      const targetUser = viewer || (bodyEmail ? db.getUserByEmail(bodyEmail)?.user || null : null);
+
+      if (!targetUser) {
+        return res.status(401).json({
+          success: false,
+          message: bodyEmail
+            ? 'Aucun compte trouvé pour cette adresse e-mail.'
+            : 'Veuillez indiquer votre adresse e-mail ou vous connecter.',
+        });
       }
+
       const { verificationToken } = req.body || {};
       if (!verificationToken || typeof verificationToken !== 'string' || !verificationToken.trim()) {
         return res.status(400).json({
@@ -601,19 +822,23 @@ export function createDarnaApiApp(
       }
 
       const verifiedUser = await db.consumeEmailVerificationToken(
-        viewer.id,
-        viewer.email,
+        targetUser.id,
+        targetUser.email,
         verificationToken.trim()
       );
       if (!verifiedUser) {
         return res.status(403).json({
           success: false,
           code: 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN',
-          message: 'Le jeton de vérification e-mail est invalide, expiré ou déjà utilisé.',
+          message: 'Code de vérification invalide ou expiré.',
         });
       }
 
-      return res.json({ success: true, user: verifiedUser });
+      return res.json({
+        success: true,
+        user: verifiedUser,
+        message: 'Votre adresse e-mail est maintenant vérifiée !',
+      });
     } catch (err) {
       console.error('Error in POST /api/auth/verify-email:', err);
       return res.status(503).json({
@@ -871,85 +1096,89 @@ export function createDarnaApiApp(
    * Never claims an email was sent unless SMTP/transactional delivery actually succeeded,
    * and never returns the reset token in HTTP responses.
    */
-  app.post('/api/auth/request-password-reset', async (req, res) => {
-    try {
-      const { email } = req.body;
-      if (!email) {
-        return res.status(400).json({
-          success: false,
-          emailSent: false,
-          message: 'Veuillez indiquer votre adresse e-mail.',
-        });
-      }
+  app.post(
+    '/api/auth/request-password-reset',
+    requestPasswordResetRateLimiter,
+    async (req, res) => {
+      try {
+        const { email } = req.body;
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            emailSent: false,
+            message: 'Veuillez indiquer votre adresse e-mail.',
+          });
+        }
 
-      if (!isEmailServiceConfigured()) {
+        if (!isEmailServiceConfigured()) {
+          return res.status(503).json({
+            success: false,
+            emailSent: false,
+            smtpConfigured: false,
+            code: 'EMAIL_SERVICE_NOT_CONFIGURED',
+            message:
+              "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP_HOST) n'est pas encore configuré.",
+          });
+        }
+
+        const normalizedEmail = String(email).trim().toLowerCase();
+        const userRecord = db.getUserByEmail(normalizedEmail);
+        const rawResetToken = await db.createPasswordResetToken(normalizedEmail);
+
+        if (!rawResetToken || !userRecord) {
+          return res.status(200).json({
+            success: true,
+            emailSent: false,
+            smtpConfigured: true,
+            message:
+              "Demande traitée. Aucun envoi n'a eu lieu (aucun compte actif ne correspond à cette adresse).",
+          });
+        }
+
+        const mailResult = await sendPasswordResetMessage({
+          toEmail: normalizedEmail,
+          userName: userRecord.user.name || 'Membre Darna',
+          resetToken: rawResetToken,
+        });
+
+        if (!mailResult.sent) {
+          return res.status(502).json({
+            success: false,
+            emailSent: false,
+            smtpConfigured: mailResult.configured,
+            code: 'EMAIL_SEND_FAILED',
+            message:
+              mailResult.errorMessage ||
+              "Échec de l'envoi de l'e-mail de réinitialisation : aucun e-mail n'a pu être acheminé.",
+          });
+        }
+
+        return res.json({
+          success: true,
+          emailSent: true,
+          smtpConfigured: true,
+          provider: mailResult.provider,
+          message:
+            'Un e-mail contenant votre code de réinitialisation sécurisé (valable 15 minutes) a été envoyé.',
+        });
+      } catch (err) {
+        console.error('Error in POST /api/auth/request-password-reset:', err);
         return res.status(503).json({
           success: false,
           emailSent: false,
-          smtpConfigured: false,
-          code: 'EMAIL_SERVICE_NOT_CONFIGURED',
-          message:
-            "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP_HOST) n'est pas encore configuré.",
+          code: 'DATABASE_SYNC_FAILED',
+          message: 'Erreur de persistance lors de la génération du jeton de réinitialisation.',
         });
       }
-
-      const normalizedEmail = String(email).trim().toLowerCase();
-      const userRecord = db.getUserByEmail(normalizedEmail);
-      const rawResetToken = await db.createPasswordResetToken(normalizedEmail);
-
-      if (!rawResetToken || !userRecord) {
-        return res.status(200).json({
-          success: true,
-          emailSent: false,
-          smtpConfigured: true,
-          message:
-            "Demande traitée. Aucun envoi n'a eu lieu (aucun compte actif ne correspond à cette adresse).",
-        });
-      }
-
-      const mailResult = await sendPasswordResetMessage({
-        toEmail: normalizedEmail,
-        userName: userRecord.user.name || 'Membre Darna',
-        resetToken: rawResetToken,
-      });
-
-      if (!mailResult.sent) {
-        return res.status(502).json({
-          success: false,
-          emailSent: false,
-          smtpConfigured: mailResult.configured,
-          code: 'EMAIL_SEND_FAILED',
-          message:
-            mailResult.errorMessage ||
-            "Échec de l'envoi de l'e-mail de réinitialisation : aucun e-mail n'a pu être acheminé.",
-        });
-      }
-
-      return res.json({
-        success: true,
-        emailSent: true,
-        smtpConfigured: true,
-        provider: mailResult.provider,
-        message:
-          'Un e-mail contenant votre code de réinitialisation sécurisé (valable 15 minutes) a été envoyé.',
-      });
-    } catch (err) {
-      console.error('Error in POST /api/auth/request-password-reset:', err);
-      return res.status(503).json({
-        success: false,
-        emailSent: false,
-        code: 'DATABASE_SYNC_FAILED',
-        message: 'Erreur de persistance lors de la génération du jeton de réinitialisation.',
-      });
     }
-  });
+  );
 
   /**
    * Step 2 of Secure Password Reset:
    * Requires a valid, non-expired single-use resetToken + strong newPassword.
    * Rejects any attempt to overwrite a password without a valid resetToken.
    */
-  app.post('/api/auth/reset-password', async (req, res) => {
+  app.post('/api/auth/reset-password', resetPasswordRateLimiter, async (req, res) => {
     try {
       const { email, resetToken, newPassword } = req.body;
       if (!email || !resetToken || !newPassword) {
@@ -1688,15 +1917,40 @@ export function createDarnaApiApp(
         });
       }
 
+      // Transaction status must NEVER depend on a client-supplied status field
+      if (req.body?.status !== undefined) {
+        return res.status(400).json({
+          success: false,
+          code: 'CLIENT_STATUS_FORBIDDEN',
+          message: 'Sécurité paiement : le statut de la transaction ne peut jamais être fourni par le client.',
+        });
+      }
+
       const {
         type,
         optionId,
         targetId,
         idempotencyKey,
-        testScenario = 'success',
+        testScenario,
         paymentMethodType = 'cmi_card',
         cardNumber,
       } = req.body;
+
+      // testScenario is ONLY accepted if PAYMENT_GATEWAY_MODE=test AND NODE_ENV !== 'production'
+      const gatewayMode =
+        process.env.PAYMENT_GATEWAY_MODE ||
+        (process.env.NODE_ENV === 'production' ? 'production' : 'test');
+      const isTestScenarioAllowed =
+        gatewayMode === 'test' && process.env.NODE_ENV !== 'production';
+
+      if (testScenario !== undefined && !isTestScenarioAllowed) {
+        return res.status(403).json({
+          success: false,
+          code: 'TEST_SCENARIO_FORBIDDEN',
+          message:
+            "Le paramètre testScenario n'est accepté que si PAYMENT_GATEWAY_MODE=test et NODE_ENV !== 'production'.",
+        });
+      }
 
       if (cardNumber && String(cardNumber).replace(/\D/g, '').length >= 12) {
         return res.status(400).json({
@@ -1713,13 +1967,17 @@ export function createDarnaApiApp(
         });
       }
 
-      const existingTx = db.getTransactionByIdempotencyKey(String(idempotencyKey));
-      if (existingTx && existingTx.status === 'paye') {
+      // Bind idempotencyKey strictly to the authenticated user (viewer.id)
+      const existingTx = db.getTransactionByUserAndIdempotencyKey(
+        viewer.id,
+        String(idempotencyKey)
+      );
+      if (existingTx && (existingTx.status === 'paye' || existingTx.status === 'en_attente')) {
         return res.status(409).json({
           success: false,
           code: 'DUPLICATE_PAYMENT',
           message:
-            'Protection anti-double paiement : ce paiement a déjà été enregistré et confirmé. Aucun second débit n’a été effectué.',
+            'Protection anti-double paiement : ce paiement a déjà été enregistré pour votre compte. Aucun second débit n’a été effectué.',
           transaction: existingTx,
         });
       }
@@ -1730,6 +1988,23 @@ export function createDarnaApiApp(
         paymentMethodType === 'payzone'
           ? 'Payzone Maroc (Mode Test •••• 1111)'
           : 'Carte CMI / Visa Maroc (Mode Test •••• 4242)';
+
+      // Determine transaction status strictly on the server:
+      // - In production or when PAYMENT_GATEWAY_MODE !== 'test', transactions start as 'en_attente'
+      //   and can only transition to 'paye' via /api/payments/webhook with a verified HMAC signature.
+      // - In non-production test mode, testScenario ('success' | 'failed') is evaluated server-side.
+      const resolvedScenario = isTestScenarioAllowed
+        ? testScenario === 'failed'
+          ? 'failed'
+          : 'success'
+        : 'pending_webhook';
+
+      const initialStatus: PaymentTransaction['status'] =
+        resolvedScenario === 'pending_webhook'
+          ? 'en_attente'
+          : resolvedScenario === 'failed'
+          ? 'echoue'
+          : 'paye';
 
       if (type === 'subscription') {
         const plan = db.getPlanById(String(optionId));
@@ -1773,15 +2048,15 @@ export function createDarnaApiApp(
           optionId: plan.id,
           amount: plan.price,
           currency: 'MAD',
-          status: testScenario === 'failed' ? 'echoue' : 'paye',
+          status: initialStatus,
           provider: 'test_cmi_sandbox',
           paymentMethodLabel: plan.price === 0 ? 'Activation gratuite (0 MAD)' : methodLabel,
           failureReason:
-            testScenario === 'failed'
+            initialStatus === 'echoue'
               ? 'Transaction refusée par la banque émettrice (Simulation d’échec Mode Test).'
               : undefined,
           createdAt: nowIso,
-          confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+          confirmedAt: initialStatus === 'paye' ? nowIso : undefined,
         };
 
         await db.createTransaction(tx);
@@ -1792,6 +2067,16 @@ export function createDarnaApiApp(
             status: 'echoue',
             message:
               'Le paiement a échoué (simulation Mode Test). Votre abonnement n’a pas été modifié.',
+            transaction: tx,
+          });
+        }
+
+        if (tx.status === 'en_attente') {
+          return res.status(202).json({
+            success: true,
+            status: 'en_attente',
+            message:
+              'Transaction créée en attente de confirmation HMAC par la passerelle de paiement CMI.',
             transaction: tx,
           });
         }
@@ -1869,15 +2154,15 @@ export function createDarnaApiApp(
           optionId: boostOpt.id,
           amount: boostOpt.price,
           currency: 'MAD',
-          status: testScenario === 'failed' ? 'echoue' : 'paye',
+          status: initialStatus,
           provider: 'test_cmi_sandbox',
           paymentMethodLabel: methodLabel,
           failureReason:
-            testScenario === 'failed'
+            initialStatus === 'echoue'
               ? 'Autorisation bancaire refusée (Simulation d’échec Mode Test).'
               : undefined,
           createdAt: nowIso,
-          confirmedAt: testScenario === 'failed' ? undefined : nowIso,
+          confirmedAt: initialStatus === 'paye' ? nowIso : undefined,
         };
 
         await db.createTransaction(tx);
@@ -1888,6 +2173,16 @@ export function createDarnaApiApp(
             status: 'echoue',
             message:
               'Le paiement a échoué (simulation Mode Test). La mise en avant n’a pas été activée sur votre annonce.',
+            transaction: tx,
+          });
+        }
+
+        if (tx.status === 'en_attente') {
+          return res.status(202).json({
+            success: true,
+            status: 'en_attente',
+            message:
+              'Transaction créée en attente de confirmation HMAC par la passerelle de paiement CMI.',
             transaction: tx,
           });
         }
@@ -1922,6 +2217,167 @@ export function createDarnaApiApp(
         success: false,
         code: 'DATABASE_SYNC_FAILED',
         message: "La synchronisation PostgreSQL a échoué. La transaction n'a pas été validée.",
+      });
+    }
+  });
+
+  /**
+   * Payment Gateway Webhook (/api/payments/webhook)
+   * Verifies HMAC-SHA256 signature using CMI_STORE_KEY before transitioning a transaction to 'paye'
+   * and activating the user's subscription or listing boost.
+   */
+  app.post('/api/payments/webhook', async (req, res) => {
+    try {
+      const storeKey = process.env.CMI_STORE_KEY?.trim();
+      if (!storeKey) {
+        return res.status(503).json({
+          success: false,
+          code: 'WEBHOOK_SECRET_NOT_CONFIGURED',
+          message: "La clé secrète CMI_STORE_KEY n'est pas configurée sur le serveur.",
+        });
+      }
+
+      const providedSignature = String(
+        req.headers['x-cmi-signature'] || req.body?.signature || ''
+      ).trim();
+      if (!providedSignature) {
+        return res.status(401).json({
+          success: false,
+          code: 'MISSING_WEBHOOK_SIGNATURE',
+          message: 'Signature HMAC de la passerelle de paiement manquante.',
+        });
+      }
+
+      const { transactionId, status, amount, currency = 'MAD' } = req.body || {};
+      if (!transactionId || (status !== 'paye' && status !== 'echoue')) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_WEBHOOK_PAYLOAD',
+          message: 'Paramètres du webhook CMI invalides (transactionId et statut requis).',
+        });
+      }
+
+      const tx = db.getTransactionById(String(transactionId));
+      if (!tx) {
+        return res.status(404).json({
+          success: false,
+          code: 'TRANSACTION_NOT_FOUND',
+          message: 'Transaction introuvable.',
+        });
+      }
+
+      const effectiveAmount = amount !== undefined ? Number(amount) : tx.amount;
+      if (Number(effectiveAmount) !== Number(tx.amount)) {
+        return res.status(400).json({
+          success: false,
+          code: 'AMOUNT_MISMATCH',
+          message: 'Le montant signé ne correspond pas au montant de la transaction.',
+        });
+      }
+
+      const expectedCanonicalHmac = computePaymentWebhookHmac(
+        {
+          transactionId: String(transactionId),
+          status: String(status),
+          amount: effectiveAmount,
+          currency: String(currency),
+        },
+        storeKey
+      );
+
+      const expectedBuf = Buffer.from(expectedCanonicalHmac, 'utf8');
+      const providedBuf = Buffer.from(providedSignature, 'utf8');
+      const isSignatureValid =
+        expectedBuf.length === providedBuf.length &&
+        crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+      if (!isSignatureValid) {
+        return res.status(401).json({
+          success: false,
+          code: 'INVALID_WEBHOOK_SIGNATURE',
+          message: 'Signature HMAC CMI invalide : authentification du webhook refusée.',
+        });
+      }
+
+      if (tx.status === 'paye') {
+        return res.json({
+          success: true,
+          status: 'paye',
+          message: 'Transaction déjà confirmée.',
+          transaction: tx,
+        });
+      }
+
+      const now = new Date();
+      const nowIso = now.toISOString();
+
+      if (status === 'echoue') {
+        tx.status = 'echoue';
+        tx.failureReason = 'Paiement refusé par la passerelle CMI.';
+        const updatedTx = await db.updateTransaction(tx);
+        return res.json({
+          success: true,
+          status: 'echoue',
+          message: 'Statut d’échec enregistré suite au webhook CMI.',
+          transaction: updatedTx,
+        });
+      }
+
+      tx.status = 'paye';
+      tx.confirmedAt = nowIso;
+      const updatedTx = await db.updateTransaction(tx);
+
+      if (tx.type === 'subscription') {
+        const plan = db.getPlanById(tx.optionId);
+        const targetUser = db.getUserById(tx.userId);
+        if (plan && targetUser) {
+          const expiresAt = new Date(now.getTime() + 30 * 24 * 3600 * 1000).toISOString();
+          targetUser.subscription = {
+            planId: plan.id,
+            planName: plan.name,
+            status: 'active',
+            maxListings: plan.maxListings,
+            startedAt: nowIso,
+            expiresAt,
+            transactionId: tx.id,
+          };
+          if (plan.id !== 'particulier' && targetUser.role === 'particulier') {
+            targetUser.role = 'professionnel';
+            targetUser.advertiserType = 'professionnel';
+          }
+          await db.updateUser(targetUser);
+        }
+      } else if (tx.type === 'boost') {
+        const boostOpt = db.getBoostOptionById(tx.optionId);
+        const listing = db.getListingById(tx.targetId);
+        if (boostOpt && listing) {
+          const expiresAt = new Date(
+            now.getTime() + boostOpt.durationDays * 24 * 3600 * 1000
+          ).toISOString();
+          listing.boost = {
+            optionId: boostOpt.id,
+            optionName: boostOpt.name,
+            status: 'active',
+            startedAt: nowIso,
+            expiresAt,
+            transactionId: tx.id,
+          };
+          await db.updateListing(listing);
+        }
+      }
+
+      return res.json({
+        success: true,
+        status: 'paye',
+        message: 'Paiement confirmé par signature HMAC CMI et avantage activé.',
+        transaction: updatedTx,
+      });
+    } catch (err) {
+      console.error('Error in POST /api/payments/webhook:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Erreur serveur lors du traitement du webhook de paiement.',
       });
     }
   });
@@ -1991,19 +2447,67 @@ export function createDarnaApiApp(
 
   // ==========================================================================
   // GEMINI AI FEATURES (TTS, IMAGE GENERATION, CHATBOT)
+  // Secured with Auth (401), Dual User + IP Rate Limits (429), Input Whitelists (400),
+  // and Generic Error Responses (500)
   // ==========================================================================
 
+  const ALLOWED_TTS_VOICES = new Set(['Kore', 'Aoede', 'Puck', 'Charon', 'Fenrir']);
+  const ALLOWED_IMAGE_SIZES = new Set(['1K', '2K', '4K']);
+  const ALLOWED_ASPECT_RATIOS = new Set(['1:1', '3:4', '4:3', '9:16', '16:9']);
+  const ALLOWED_CHAT_ROLES = new Set(['user', 'model']);
+  const ALLOWED_CHAT_ROLE_TYPES = new Set(['legal', 'advisor', 'estimate']);
+
   app.post('/api/tts', async (req, res) => {
-    const { text, voice } = req.body;
-    if (!text) {
-      return res.status(400).json({ success: false, message: 'Le texte est requis' });
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Veuillez vous connecter pour utiliser la synthèse vocale IA.',
+      });
     }
+
+    const { text, voice = 'Kore' } = req.body || {};
+    if (typeof text !== 'string' || text.trim().length === 0 || text.length > 500) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_TTS_INPUT',
+        message: 'Le texte à lire est requis et ne doit pas dépasser 500 caractères.',
+      });
+    }
+    if (typeof voice !== 'string' || !ALLOWED_TTS_VOICES.has(voice)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_TTS_VOICE',
+        message: 'La voix sélectionnée ne figure pas dans la liste autorisée.',
+      });
+    }
+
+    const ttsMaxPerHour = Number(process.env.AI_TTS_HOURLY_LIMIT || 30);
+    const rateCheck = consumeDualRateLimit(
+      aiTtsUserLimiter,
+      aiTtsIpLimiter,
+      viewer.id,
+      getClientIp(req),
+      ttsMaxPerHour,
+      60 * 60 * 1000
+    );
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message:
+          'Limite de synthèse vocale atteinte (maximum 30 générations par heure). Veuillez réessayer plus tard.',
+      });
+    }
+
     if (!apiKey) {
       return res.status(503).json({
         success: false,
-        message: "Clé API Gemini non configurée dans l'environnement.",
+        message: "Le service de synthèse vocale IA est temporairement indisponible.",
       });
     }
+
     try {
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash-preview-tts',
@@ -2012,7 +2516,7 @@ export function createDarnaApiApp(
             role: 'user',
             parts: [
               {
-                text: String(text).slice(0, 500),
+                text: text.trim(),
                 speechMetadata: {
                   style: 'Voix chaleureuse, posée, professionnelle, visite guidée immobilière.',
                 },
@@ -2024,7 +2528,7 @@ export function createDarnaApiApp(
           responseModalities: ['AUDIO'],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: voice || 'Kore' },
+              prebuiltVoiceConfig: { voiceName: voice },
             },
           },
         },
@@ -2039,29 +2543,77 @@ export function createDarnaApiApp(
         mimeType: 'audio/wav',
       });
     } catch (err: any) {
+      console.error('Error in POST /api/tts:', err);
       res.status(500).json({
         success: false,
-        message: err.message || 'Erreur lors de la synthèse vocale Gemini.',
+        message: 'Une erreur est survenue lors de la synthèse vocale. Veuillez réessayer plus tard.',
       });
     }
   });
 
   app.post('/api/generate-image', async (req, res) => {
-    const { prompt, imageSize = '1K', aspectRatio = '4:3' } = req.body;
-    if (!prompt) {
-      return res.status(400).json({ success: false, message: 'Le prompt est requis' });
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: "Veuillez vous connecter pour utiliser le studio de génération d'images IA.",
+      });
     }
+
+    const { prompt, imageSize = '1K', aspectRatio = '4:3' } = req.body || {};
+    if (typeof prompt !== 'string' || prompt.trim().length === 0 || prompt.length > 500) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_IMAGE_PROMPT',
+        message: 'Le prompt est requis et ne doit pas dépasser 500 caractères.',
+      });
+    }
+    if (typeof imageSize !== 'string' || !ALLOWED_IMAGE_SIZES.has(imageSize)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_IMAGE_SIZE',
+        message: "La taille d'image demandée n'est pas autorisée (valeurs permises : 1K, 2K, 4K).",
+      });
+    }
+    if (typeof aspectRatio !== 'string' || !ALLOWED_ASPECT_RATIOS.has(aspectRatio)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_ASPECT_RATIO',
+        message: "Le format d'image demandé n'est pas autorisé (valeurs permises : 1:1, 3:4, 4:3, 9:16, 16:9).",
+      });
+    }
+
+    const imageMaxPerDay = Number(process.env.AI_IMAGE_DAILY_LIMIT || 5);
+    const rateCheck = consumeDualRateLimit(
+      aiImageUserLimiter,
+      aiImageIpLimiter,
+      viewer.id,
+      getClientIp(req),
+      imageMaxPerDay,
+      24 * 60 * 60 * 1000
+    );
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message:
+          "Limite quotidienne de génération d'images atteinte (maximum 5 images par jour). Veuillez réessayer demain.",
+      });
+    }
+
     if (!apiKey) {
       return res.status(503).json({
         success: false,
-        message: "Clé API Gemini non configurée dans l'environnement.",
+        message: "Le service de génération d'images IA est temporairement indisponible.",
       });
     }
+
     try {
       const response = await ai.models.generateContent({
         model: 'gemini-3-pro-image-preview',
         contents: {
-          parts: [{ text: `High-end Moroccan interior design or architecture: ${prompt}` }],
+          parts: [{ text: `High-end Moroccan interior design or architecture: ${prompt.trim()}` }],
         },
         config: {
           imageConfig: {
@@ -2083,22 +2635,82 @@ export function createDarnaApiApp(
       }
       res.json({ success: true, imageUrl, imageSize });
     } catch (err: any) {
+      console.error('Error in POST /api/generate-image:', err);
       res.status(500).json({
         success: false,
-        message: err.message || "Erreur lors de la génération de l'image.",
+        message: "Une erreur est survenue lors de la génération de l'image. Veuillez réessayer plus tard.",
       });
     }
   });
 
   app.post('/api/chat', async (req, res) => {
-    const { messages, roleType = 'advisor' } = req.body;
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ success: false, message: 'Historique de conversation invalide' });
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: "Veuillez vous connecter pour discuter avec l'assistant IA Darna.",
+      });
     }
+
+    const { messages, roleType = 'advisor' } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0 || messages.length > 20) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_CHAT_MESSAGES',
+        message: "L'historique de conversation doit contenir entre 1 et 20 messages.",
+      });
+    }
+
+    for (const msg of messages) {
+      if (
+        !msg ||
+        typeof msg !== 'object' ||
+        typeof msg.role !== 'string' ||
+        !ALLOWED_CHAT_ROLES.has(msg.role) ||
+        typeof msg.text !== 'string' ||
+        msg.text.trim().length === 0 ||
+        msg.text.length > 2000
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_CHAT_MESSAGE_ITEM',
+          message:
+            "Chaque message doit avoir un rôle ('user' ou 'model') et un texte compris entre 1 et 2000 caractères.",
+        });
+      }
+    }
+
+    if (typeof roleType !== 'string' || !ALLOWED_CHAT_ROLE_TYPES.has(roleType)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_CHAT_ROLE_TYPE',
+        message: "Le mode de conseiller demandé n'est pas valide.",
+      });
+    }
+
+    const chatMaxPerHour = Number(process.env.AI_CHAT_HOURLY_LIMIT || 20);
+    const rateCheck = consumeDualRateLimit(
+      aiChatUserLimiter,
+      aiChatIpLimiter,
+      viewer.id,
+      getClientIp(req),
+      chatMaxPerHour,
+      60 * 60 * 1000
+    );
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message:
+          "Limite de requêtes atteinte pour l'assistant IA (maximum 20 messages par heure). Veuillez réessayer plus tard.",
+      });
+    }
+
     if (!apiKey) {
       return res.status(503).json({
         success: false,
-        message: "Clé API Gemini non configurée dans l'environnement.",
+        message: "Le service d'assistant IA est temporairement indisponible.",
       });
     }
 
@@ -2133,8 +2745,8 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     }
 
     try {
-      const contents = messages.map((m: any) => ({
-        role: m.role === 'model' ? 'model' : 'user',
+      const contents = messages.map((m: { role: 'user' | 'model'; text: string }) => ({
+        role: m.role,
         parts: [{ text: m.text }],
       }));
       let response;
@@ -2161,9 +2773,10 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         modelUsed: modelName,
       });
     } catch (err: any) {
+      console.error('Error in POST /api/chat:', err);
       res.status(500).json({
         success: false,
-        message: err.message || "Erreur lors de la communication avec l'assistant IA.",
+        message: "Une erreur est survenue lors de la communication avec l'assistant IA. Veuillez réessayer plus tard.",
       });
     }
   });

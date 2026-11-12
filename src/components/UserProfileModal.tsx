@@ -175,12 +175,28 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   const usagePercent = Math.min(100, Math.round((quota.usedListings / Math.max(1, quota.maxListings)) * 100));
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/70 backdrop-blur-sm animate-fade-in">
-      <div className="bg-white rounded-3xl shadow-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-stone-200">
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/70 backdrop-blur-sm animate-fade-in cursor-pointer"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative bg-white rounded-3xl shadow-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-stone-200 cursor-default"
+      >
+        {/* Top-Right Close Cross (Always pinned at top right of the opened modal) */}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Fermer le profil"
+          className="absolute top-4 right-4 z-20 w-9 h-9 rounded-full bg-white hover:bg-stone-200 border border-stone-200 flex items-center justify-center text-stone-600 hover:text-stone-900 shadow-xs transition-colors"
+        >
+          <X className="w-5 h-5" />
+        </button>
+
         {/* Header */}
-        <div className="px-6 py-5 bg-[#FAF7F2] border-b border-stone-200 flex flex-wrap items-center justify-between gap-3">
+        <div className="px-6 py-5 pr-16 bg-[#FAF7F2] border-b border-stone-200 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="w-12 h-12 rounded-full bg-[#1E3D34] text-white flex items-center justify-center font-bold text-lg">
+            <div className="w-12 h-12 rounded-full bg-[#1E3D34] text-white flex items-center justify-center font-bold text-lg shrink-0">
               {currentUser.name.charAt(0)}
             </div>
             <div>
@@ -197,15 +213,9 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
                     <CheckCircle2 className="w-3 h-3" /> E-mail vérifié
                   </span>
                 ) : (
-                  <button
-                    type="button"
-                    onClick={handleRequestEmailCode}
-                    disabled={sendingCode}
-                    className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-amber-100 hover:bg-amber-200 text-amber-900 flex items-center gap-1 transition-colors"
-                  >
-                    <MailCheck className="w-3 h-3" />{' '}
-                    {sendingCode ? 'Envoi en cours...' : 'Envoyer un code de vérification'}
-                  </button>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 flex items-center gap-1">
+                    <MailCheck className="w-3 h-3" /> E-mail non vérifié
+                  </span>
                 )}
               </div>
               <p className="text-xs text-stone-500">
@@ -214,56 +224,67 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onLogout}
-              className="px-3 py-1.5 rounded-xl border border-stone-300 hover:border-red-300 hover:bg-red-50 text-stone-700 hover:text-red-700 text-xs font-bold flex items-center gap-1.5 transition-colors"
-            >
-              <LogOut className="w-3.5 h-3.5" />
-              <span>Se déconnecter</span>
-            </button>
-            <button
-              onClick={onClose}
-              aria-label="Fermer le profil"
-              className="w-8 h-8 rounded-full hover:bg-stone-200 flex items-center justify-center text-stone-500 transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={onLogout}
+            className="px-3 py-1.5 rounded-xl border border-stone-300 hover:border-red-300 hover:bg-red-50 text-stone-700 hover:text-red-700 text-xs font-bold flex items-center gap-1.5 transition-colors shrink-0"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Se déconnecter</span>
+          </button>
         </div>
 
-        {/* Complete Email Verification Journey Banner & Code Entry Form */}
+        {/* Simple, Compact Email Verification Bar */}
         {(!currentUser.emailVerified || verificationSuccess) && (
-          <div className="px-6 py-4 bg-amber-50/80 border-b border-amber-200 space-y-3">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div className="space-y-0.5">
-                <h4 className="text-xs font-extrabold text-stone-900 flex items-center gap-1.5">
-                  <MailCheck className="w-4 h-4 text-[#C15C3D]" />
-                  <span>Vérification de votre adresse e-mail ({currentUser.email})</span>
-                </h4>
-                <p className="text-[11px] text-stone-600">
-                  Étape 1 : demandez l’envoi d’un code à usage unique (valable 15 min) par e-mail. Étape 2 : saisissez le code reçu ci-dessous pour valider votre adresse.
-                </p>
-              </div>
-              {!currentUser.emailVerified && (
-                <button
-                  type="button"
-                  onClick={handleRequestEmailCode}
-                  disabled={sendingCode}
-                  className="px-3.5 py-2 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold shrink-0 transition-colors disabled:opacity-50"
+          <div className="px-6 py-3 bg-amber-50/70 border-b border-amber-200/80 space-y-2">
+            {!currentUser.emailVerified && (
+              <form
+                onSubmit={handleSubmitVerificationCode}
+                className="flex flex-col sm:flex-row sm:items-center gap-2"
+              >
+                <label
+                  htmlFor="email-verification-code-input"
+                  className="text-xs font-bold text-stone-800 flex items-center gap-1.5 shrink-0"
                 >
-                  {sendingCode ? 'Envoi...' : 'Recevoir mon code par e-mail'}
-                </button>
-              )}
-            </div>
+                  <MailCheck className="w-4 h-4 text-[#C15C3D]" />
+                  <span>Vérifier mon e-mail :</span>
+                </label>
+
+                <input
+                  id="email-verification-code-input"
+                  type="text"
+                  value={verificationCode}
+                  onChange={(e) => setVerificationCode(e.target.value)}
+                  placeholder="Code reçu par e-mail"
+                  className="flex-1 text-xs font-mono px-3 py-2 rounded-xl bg-white border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#1E3D34]"
+                />
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="submit"
+                    disabled={verifyingCode}
+                    className="px-3.5 py-2 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
+                  >
+                    {verifyingCode ? 'Validation...' : 'Valider le code'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRequestEmailCode}
+                    disabled={sendingCode}
+                    className="px-3.5 py-2 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
+                  >
+                    {sendingCode ? 'Envoi...' : 'Envoyer le code'}
+                  </button>
+                </div>
+              </form>
+            )}
 
             {verificationError && (
               <div
                 role="alert"
-                className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs flex items-start gap-2"
+                className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs flex items-center gap-2"
               >
-                <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
                 <span>{verificationError}</span>
               </div>
             )}
@@ -271,9 +292,9 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
             {verificationInfo && (
               <div
                 role="status"
-                className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-start gap-2"
+                className="px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-center gap-2"
               >
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                 <span>{verificationInfo}</span>
               </div>
             )}
@@ -281,42 +302,11 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
             {verificationSuccess && (
               <div
                 role="status"
-                className="p-3 rounded-xl bg-emerald-100 border border-emerald-300 text-emerald-950 text-xs font-semibold flex items-start gap-2"
+                className="px-3 py-2 rounded-xl bg-emerald-100 border border-emerald-300 text-emerald-950 text-xs font-semibold flex items-center gap-2"
               >
-                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
                 <span>{verificationSuccess}</span>
               </div>
-            )}
-
-            {!currentUser.emailVerified && (
-              <form
-                onSubmit={handleSubmitVerificationCode}
-                className="flex flex-col sm:flex-row items-stretch sm:items-end gap-2.5 pt-1"
-              >
-                <div className="flex-1">
-                  <label
-                    htmlFor="email-verification-code-input"
-                    className="block text-[11px] font-bold text-stone-700 mb-1"
-                  >
-                    Code de vérification reçu par e-mail
-                  </label>
-                  <input
-                    id="email-verification-code-input"
-                    type="text"
-                    value={verificationCode}
-                    onChange={(e) => setVerificationCode(e.target.value)}
-                    placeholder="Saisissez ou collez le code reçu par e-mail"
-                    className="w-full text-xs font-mono px-3.5 py-2 rounded-xl bg-white border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#1E3D34]"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={verifyingCode}
-                  className="px-4 py-2 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-xl text-xs font-bold shrink-0 transition-colors disabled:opacity-50"
-                >
-                  {verifyingCode ? 'Vérification...' : 'Valider le code de vérification'}
-                </button>
-              </form>
             )}
           </div>
         )}

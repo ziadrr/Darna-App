@@ -373,10 +373,12 @@ export async function syncBoostOptionToCloudSql(
 }
 
 export async function syncTransactionToCloudSql(
-  tx: PaymentTransaction
+  tx: PaymentTransaction,
+  rawTxForJson?: PaymentTransaction
 ): Promise<void> {
   if (!isCloudSqlConfigured()) return;
   try {
+    const jsonPayload = JSON.stringify(rawTxForJson || tx);
     await db
       .insert(transactions)
       .values({
@@ -385,14 +387,14 @@ export async function syncTransactionToCloudSql(
         type: tx.type,
         status: tx.status,
         idempotencyKey: tx.idempotencyKey || null,
-        dataJson: JSON.stringify(tx),
+        dataJson: jsonPayload,
       })
       .onConflictDoUpdate({
         target: transactions.id,
         set: {
           status: tx.status,
           idempotencyKey: tx.idempotencyKey || null,
-          dataJson: JSON.stringify(tx),
+          dataJson: jsonPayload,
           updatedAt: new Date(),
         },
       });

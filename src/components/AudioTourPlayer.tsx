@@ -40,13 +40,19 @@ export const AudioTourPlayer: React.FC<AudioTourPlayerProps> = ({ listing }) => 
     setIsLoading(true);
     setErrorMessage(null);
 
-    // Prepare text for the audio tour
-    const audioScript = `Bienvenue chez Darna. Visite de l'annonce : ${listing.title}, située à ${listing.district}, ${listing.city}. Loyer proposé à ${listing.price} Dirhams marocains par ${listing.period}. ${listing.surface} mètres carrés, ${listing.bedrooms ? listing.bedrooms + ' chambres' : ''}. Description : ${listing.description.slice(0, 300)}. Contactez directement l'annonceur sur Darna pour organiser une visite.`;
+    // Prepare text for the audio tour (max 500 chars for server validation)
+    const rawScript = `Bienvenue chez Darna. Visite de l'annonce : ${listing.title}, située à ${listing.district}, ${listing.city}. Loyer proposé à ${listing.price} Dirhams marocains par ${listing.period}. ${listing.surface} mètres carrés, ${listing.bedrooms ? listing.bedrooms + ' chambres' : ''}. Description : ${listing.description.slice(0, 220)}. Contactez directement l'annonceur sur Darna pour organiser une visite.`;
+    const audioScript = rawScript.slice(0, 500);
 
     try {
+      const token = localStorage.getItem('darna_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
       const response = await fetch('/api/tts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           text: audioScript,
           voice: selectedVoice,
