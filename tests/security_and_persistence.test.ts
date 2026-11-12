@@ -1196,5 +1196,247 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       'Unused src/middleware/auth.ts must be deleted'
     );
   });
+
+  it('14. uses req.ip (trust proxy = 1) in getClientIp so two requests with different spoofed X-Forwarded-For from the same connection count in the same quota', async () => {
+    process.env.AUTH_REGISTER_RATE_LIMIT = '2';
+    try {
+      // Behind 1 trusted reverse proxy (trust proxy = 1), the proxy appends the real client IP (198.51.100.250)
+      // while the client attempts to spoof different leftmost X-Forwarded-For values on the same connection.
+      const r1 = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '10.99.0.1, 198.51.100.250',
+        },
+        body: JSON.stringify({}),
+      });
+      assert.equal(r1.status, 400, '1st request counts as attempt 1/2');
+
+      const r2 = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '10.99.0.2, 198.51.100.250',
+        },
+        body: JSON.stringify({}),
+      });
+      assert.equal(
+        r2.status,
+        400,
+        '2nd request with different spoofed X-Forwarded-For counts as attempt 2/2 in the same quota'
+      );
+
+      const r3 = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '10.99.0.3, 198.51.100.250',
+        },
+        body: JSON.stringify({}),
+      });
+      assert.equal(
+        r3.status,
+        429,
+        '3rd request with yet another spoofed X-Forwarded-For must hit 429 from the same connection quota'
+      );
+    } finally {
+      delete process.env.AUTH_REGISTER_RATE_LIMIT;
+    }
+  });
+
+  it('15. prevents account enumeration on /api/auth/request-email-verification and /api/auth/verify-email (identical responses, silent send) and enforces per-IP & per-email rate limits', async () => {
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtpPort);
+
+    const smtpCountBefore = smtpServer.messages.length;
+
+    // 1. Request email verification for a NON-EXISTENT email -> must return 200 (never 404) and send 0 emails
+    const nonExistentEmail = 'inconnu.fantome@example.ma';
+    const unknownReqRes = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.231',
+      },
+      body: JSON.stringify({ email: nonExistentEmail }),
+    });
+    const unknownReqData = await unknownReqRes.json();
+    assert.equal(
+      unknownReqRes.status,
+      200,
+      'Must never return 404 for non-existent email on request-email-verification'
+    );
+    assert.equal(
+      smtpServer.messages.length,
+      smtpCountBefore,
+      'Must NOT send any SMTP email when account does not exist'
+    );
+
+    // 2. Request email verification for an EXISTING email -> must return the exact same JSON structure and silently send the email
+    const existingEmail = 'nadia.bennani@example.ma';
+    const existingReqRes = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.232',
+      },
+      body: JSON.stringify({ email: existingEmail }),
+    });
+    const existingReqData = await existingReqRes.json();
+    assert.equal(existingReqRes.status, 200);
+    assert.deepEqual(
+      existingReqData,
+      unknownReqData,
+      'Response payload must be 100% identical whether the account exists or not'
+    );
+    assert.equal(
+      smtpServer.messages.length,
+      smtpCountBefore + 1,
+      'Must silently send the SMTP email when the account exists'
+    );
+
+    // 3. /api/auth/verify-email returns the exact same 403 response for non-existent email vs existing email with wrong code
+    const unknownVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.233',
+      },
+      body: JSON.stringify({
+        email: nonExistentEmail,
+        verificationToken: '000000-wrong-token',
+      }),
+    });
+    const unknownVerifyData = await unknownVerifyRes.json();
+
+    const existingVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.234',
+      },
+      body: JSON.stringify({
+        email: existingEmail,
+        verificationToken: '000000-wrong-token',
+      }),
+    });
+    const existingVerifyData = await existingVerifyRes.json();
+
+    assert.equal(unknownVerifyRes.status, 403);
+    assert.equal(existingVerifyRes.status, 403);
+    assert.deepEqual(
+      unknownVerifyData,
+      existingVerifyData,
+      'verify-email response must be identical whether account exists or not'
+    );
+
+    // 4. Rate limit on POST /api/auth/request-email-verification (5 sends / hour)
+    const rateTestIp = '198.51.100.235';
+    for (let i = 0; i < 5; i++) {
+      const r = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': rateTestIp,
+        },
+        body: JSON.stringify({ email: `ratelimit-${i}@example.ma` }),
+      });
+      assert.equal(r.status, 200);
+    }
+    const sixthSendRes = await fetch(`${baseUrl}/api/auth/request-email-verification`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': rateTestIp,
+      },
+      body: JSON.stringify({ email: 'ratelimit-6@example.ma' }),
+    });
+    assert.equal(
+      sixthSendRes.status,
+      429,
+      '6th request-email-verification from same IP must return 429'
+    );
+
+    // 5. Rate limit on POST /api/auth/verify-email (10 verifications / 15 min)
+    const verifyRateIp = '198.51.100.236';
+    for (let i = 0; i < 10; i++) {
+      const r = await fetch(`${baseUrl}/api/auth/verify-email`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': verifyRateIp,
+        },
+        body: JSON.stringify({
+          email: 'verify-rate-target@example.ma',
+          verificationToken: `bad-token-${i}`,
+        }),
+      });
+      assert.equal(r.status, 403);
+    }
+    const eleventhVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': verifyRateIp,
+      },
+      body: JSON.stringify({
+        email: 'verify-rate-target@example.ma',
+        verificationToken: 'bad-token-11',
+      }),
+    });
+    assert.equal(
+      eleventhVerifyRes.status,
+      429,
+      '11th verify-email attempt must return 429'
+    );
+  });
+
+  it('16. tightens Helmet CSP in production: removes unsafe-eval, replaces unsafe-inline in script-src with SHA-256 hash of index.html script, restricts img-src to explicit domains, and removes ws:/wss: from connect-src', async () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      const res = await fetch(`${baseUrl}/api/system/status`);
+      const csp = res.headers.get('content-security-policy') || '';
+
+      const directives = Object.fromEntries(
+        csp
+          .split(';')
+          .map((d) => d.trim())
+          .filter(Boolean)
+          .map((d) => {
+            const parts = d.split(/\s+/);
+            return [parts[0], parts.slice(1)];
+          })
+      );
+
+      // 1. script-src: no unsafe-eval, no unsafe-inline, has SHA-256 hash of index.html inline script
+      const scriptSrc = directives['script-src'] || [];
+      assert.ok(!scriptSrc.includes("'unsafe-eval'"), "Production script-src must NOT contain 'unsafe-eval'");
+      assert.ok(!scriptSrc.includes("'unsafe-inline'"), "Production script-src must NOT contain 'unsafe-inline'");
+      assert.ok(
+        scriptSrc.some((v) => v.startsWith("'sha256-")),
+        'Production script-src must include SHA-256 hash for index.html inline script'
+      );
+
+      // 2. img-src: no wildcard https: or http:, explicit domains only
+      const imgSrc = directives['img-src'] || [];
+      assert.ok(!imgSrc.includes('https:'), 'img-src must NOT contain wildcard https:');
+      assert.ok(!imgSrc.includes('http:'), 'img-src must NOT contain wildcard http:');
+      assert.ok(imgSrc.includes('https://*.tile.openstreetmap.org'), 'img-src must allow OpenStreetMap');
+      assert.ok(imgSrc.includes('https://images.unsplash.com'), 'img-src must allow Unsplash');
+      assert.ok(imgSrc.includes('data:'), 'img-src must allow data:');
+      assert.ok(imgSrc.includes('blob:'), 'img-src must allow blob:');
+
+      // 3. connect-src: no ws: or wss: in production
+      const connectSrc = directives['connect-src'] || [];
+      assert.ok(!connectSrc.includes('ws:'), 'Production connect-src must NOT contain ws:');
+      assert.ok(!connectSrc.includes('wss:'), 'Production connect-src must NOT contain wss:');
+      assert.ok(connectSrc.includes('https://*.googleapis.com'), 'connect-src must allow Firebase/Google APIs');
+    } finally {
+      if (savedNodeEnv !== undefined) process.env.NODE_ENV = savedNodeEnv;
+      else delete process.env.NODE_ENV;
+    }
+  });
 });
+
 

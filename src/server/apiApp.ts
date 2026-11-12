@@ -47,6 +47,10 @@ export function computePaymentWebhookHmac(
   return crypto.createHmac('sha256', storeKey).update(canonical).digest('hex');
 }
 
+// SHA-256 hash of the inline fetch-protection script in index.html
+export const INDEX_INLINE_SCRIPT_SHA256 =
+  "'sha256-DMa42Zio9vPWS2jraEYgYmFl4E//+9MKWES3Gvn6SO0='";
+
 export function createDarnaApiApp(
   customDbPath?: string,
   options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
@@ -57,50 +61,87 @@ export function createDarnaApiApp(
   const db = new DarnaPersistentDb(customDbPath, options);
   const app = express();
 
-  // Trust Cloud Run / reverse proxy first hop for accurate client IP detection
+  // Trust Cloud Run / reverse proxy first hop for accurate client IP detection via req.ip
   app.set('trust proxy', 1);
 
-  // Security headers via Helmet with CSP compatible with Leaflet, Google Fonts, Unsplash, and Firebase
-  app.use(
-    helmet({
-      contentSecurityPolicy: {
-        useDefaults: true,
-        directives: {
-          defaultSrc: ["'self'"],
-          scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", 'https://apis.google.com'],
-          styleSrc: [
-            "'self'",
-            "'unsafe-inline'",
-            'https://fonts.googleapis.com',
-            'https://unpkg.com',
-          ],
-          fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
-          imgSrc: [
-            "'self'",
-            'data:',
-            'blob:',
-            'https:',
-            'http:',
-            'https://*.tile.openstreetmap.org',
-            'https://unpkg.com',
-            'https://images.unsplash.com',
-          ],
-          mediaSrc: ["'self'", 'data:', 'blob:'],
-          connectSrc: [
-            "'self'",
-            'https://*.googleapis.com',
-            'https://*.firebaseio.com',
-            'https://*.firebaseapp.com',
-            'https://*.tile.openstreetmap.org',
-            'wss:',
-            'ws:',
-          ],
-          frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
-        },
+  const sharedImgSrc = [
+    "'self'",
+    'data:',
+    'blob:',
+    'https://*.tile.openstreetmap.org',
+    'https://tile.openstreetmap.org',
+    'https://server.arcgisonline.com',
+    'https://images.unsplash.com',
+    'https://unpkg.com',
+  ];
+
+  const baseConnectSrc = [
+    "'self'",
+    'https://*.googleapis.com',
+    'https://*.firebaseio.com',
+    'https://*.firebaseapp.com',
+    'https://*.tile.openstreetmap.org',
+    'https://tile.openstreetmap.org',
+    'https://server.arcgisonline.com',
+  ];
+
+  const helmetProd = helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", INDEX_INLINE_SCRIPT_SHA256, 'https://apis.google.com'],
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https://fonts.googleapis.com',
+          'https://unpkg.com',
+        ],
+        fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+        imgSrc: sharedImgSrc,
+        mediaSrc: ["'self'", 'data:', 'blob:'],
+        connectSrc: baseConnectSrc,
+        frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
       },
-      crossOriginEmbedderPolicy: false,
-    })
-  );
+    },
+    crossOriginEmbedderPolicy: false,
+  });
+
+  const helmetDev = helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          INDEX_INLINE_SCRIPT_SHA256,
+          "'unsafe-eval'",
+          'https://apis.google.com',
+        ],
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https://fonts.googleapis.com',
+          'https://unpkg.com',
+        ],
+        fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+        imgSrc: sharedImgSrc,
+        mediaSrc: ["'self'", 'data:', 'blob:'],
+        connectSrc: [...baseConnectSrc, 'wss:', 'ws:'],
+        frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  });
+
+  // Security headers via Helmet: strict CSP in production (no unsafe-eval, no unsafe-inline in script-src,
+  // explicit img-src domains, no ws:/wss: in production connect-src)
+  app.use((req, res, next) => {
+    if (process.env.NODE_ENV === 'production') {
+      return helmetProd(req, res, next);
+    }
+    return helmetDev(req, res, next);
+  });
 
   // Default 1MB JSON body limit; allow 15MB only on listing creation/update routes that carry image data
   const defaultJsonParser = express.json({ limit: '1mb' });
@@ -211,16 +252,16 @@ export function createDarnaApiApp(
   });
 
   function getClientIp(req: express.Request): string {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (typeof forwarded === 'string' && forwarded.trim()) {
-      return forwarded.split(',')[0].trim();
-    }
     return req.ip || req.socket?.remoteAddress || 'unknown';
   }
 
   // Rate limiters
   const contactRateLimiter = new Map<string, { count: number; resetAt: number }>();
   const loginRateLimiter = new Map<string, { count: number; resetAt: number }>();
+  const emailVerifySendEmailLimiter = new Map<string, { count: number; resetAt: number }>();
+  const emailVerifySendIpLimiter = new Map<string, { count: number; resetAt: number }>();
+  const emailVerifyCheckEmailLimiter = new Map<string, { count: number; resetAt: number }>();
+  const emailVerifyCheckIpLimiter = new Map<string, { count: number; resetAt: number }>();
   const aiChatUserLimiter = new Map<string, { count: number; resetAt: number }>();
   const aiChatIpLimiter = new Map<string, { count: number; resetAt: number }>();
   const aiTtsUserLimiter = new Map<string, { count: number; resetAt: number }>();
@@ -711,23 +752,42 @@ export function createDarnaApiApp(
   /**
    * Step 1 of Email Verification:
    * Works both BEFORE login (when `email` is provided in body) and AFTER login (via Bearer token).
-   * Generates a single-use SHA-256 hashed cryptographic verification token and sends it
-   * via the configured SMTP / transactional email provider.
-   * Never claims an email was sent if no email delivery occurred, and never returns the token in HTTP responses.
+   * - Enforces rate limiting per IP AND per email (default: 5 sends / hour).
+   * - Never reveals whether an email address is registered: returns the exact same 200 response
+   *   whether the account exists or not, and silently sends the verification email only if the account exists.
+   * - Never claims an email was sent if SMTP is unconfigured (503), and never returns the token in HTTP responses.
    */
   app.post('/api/auth/request-email-verification', async (req, res) => {
     try {
       const viewer = getAuthUser(req);
       const bodyEmail =
         typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+      const effectiveEmail = viewer ? viewer.email.trim().toLowerCase() : bodyEmail;
 
-      const targetUser = viewer || (bodyEmail ? db.getUserByEmail(bodyEmail)?.user || null : null);
-
-      if (! viewer && !bodyEmail) {
+      if (!effectiveEmail) {
         return res.status(401).json({
           success: false,
           emailSent: false,
           message: 'Veuillez indiquer votre adresse e-mail pour recevoir un code de vérification.',
+        });
+      }
+
+      const maxSendPerHour = Number(process.env.AUTH_EMAIL_VERIFY_SEND_LIMIT || 5);
+      const sendRateCheck = consumeDualRateLimit(
+        emailVerifySendEmailLimiter,
+        emailVerifySendIpLimiter,
+        effectiveEmail,
+        getClientIp(req),
+        maxSendPerHour,
+        60 * 60 * 1000
+      );
+      if (!sendRateCheck.allowed) {
+        return res.status(429).json({
+          success: false,
+          emailSent: false,
+          code: 'RATE_LIMIT_EXCEEDED',
+          message:
+            "Trop de demandes d'envoi de code de vérification (maximum 5 par heure). Veuillez réessayer plus tard.",
         });
       }
 
@@ -742,41 +802,36 @@ export function createDarnaApiApp(
         });
       }
 
-      if (!targetUser) {
-        return res.status(404).json({
-          success: false,
-          emailSent: false,
-          code: 'USER_NOT_FOUND',
-          message: "Aucun compte Darna ne correspond à cette adresse e-mail. Créez d'abord votre compte.",
-        });
-      }
+      const targetUser = viewer || db.getUserByEmail(effectiveEmail)?.user || null;
 
-      const rawToken = await db.createEmailVerificationToken(targetUser.id, targetUser.email);
-      const mailResult = await sendEmailVerificationMessage({
-        toEmail: targetUser.email,
-        userName: targetUser.name,
-        verificationToken: rawToken,
-      });
-
-      if (!mailResult.sent) {
-        return res.status(502).json({
-          success: false,
-          emailSent: false,
-          smtpConfigured: mailResult.configured,
-          code: 'EMAIL_SEND_FAILED',
-          message:
-            mailResult.errorMessage ||
-            "Échec de l'envoi de l'e-mail de vérification : aucun e-mail n'a pu être acheminé.",
+      // Silent send only if the account actually exists; return the exact same response either way
+      if (targetUser) {
+        const rawToken = await db.createEmailVerificationToken(targetUser.id, targetUser.email);
+        const mailResult = await sendEmailVerificationMessage({
+          toEmail: targetUser.email,
+          userName: targetUser.name,
+          verificationToken: rawToken,
         });
+
+        if (!mailResult.sent) {
+          return res.status(502).json({
+            success: false,
+            emailSent: false,
+            smtpConfigured: mailResult.configured,
+            code: 'EMAIL_SEND_FAILED',
+            message:
+              mailResult.errorMessage ||
+              "Échec de l'envoi de l'e-mail de vérification : aucun e-mail n'a pu être acheminé.",
+          });
+        }
       }
 
       return res.json({
         success: true,
         emailSent: true,
         smtpConfigured: true,
-        provider: mailResult.provider,
         message:
-          'Code de vérification envoyé par e-mail (valable 15 minutes).',
+          'Si un compte correspond à cette adresse e-mail, un code de vérification (valable 15 minutes) a été envoyé.',
       });
     } catch (err) {
       console.error('Error in POST /api/auth/request-email-verification:', err);
@@ -792,22 +847,21 @@ export function createDarnaApiApp(
   /**
    * Step 2 of Email Verification:
    * Works both BEFORE login (with `{ email, verificationToken }`) and AFTER login (via Bearer token).
-   * Strictly requires a valid, non-expired single-use cryptographic `verificationToken`.
-   * Rejects any request that attempts to mark an email as verified without proof.
+   * - Enforces rate limiting per IP AND per email (default: 10 verifications / 15 min).
+   * - Returns the exact same 403 INVALID_OR_EXPIRED_VERIFICATION_TOKEN response whether the account
+   *   does not exist or the token is invalid/expired, preventing account enumeration.
    */
   app.post('/api/auth/verify-email', async (req, res) => {
     try {
       const viewer = getAuthUser(req);
       const bodyEmail =
         typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
-      const targetUser = viewer || (bodyEmail ? db.getUserByEmail(bodyEmail)?.user || null : null);
+      const effectiveEmail = viewer ? viewer.email.trim().toLowerCase() : bodyEmail;
 
-      if (!targetUser) {
+      if (!effectiveEmail) {
         return res.status(401).json({
           success: false,
-          message: bodyEmail
-            ? 'Aucun compte trouvé pour cette adresse e-mail.'
-            : 'Veuillez indiquer votre adresse e-mail ou vous connecter.',
+          message: 'Veuillez indiquer votre adresse e-mail ou vous connecter.',
         });
       }
 
@@ -821,11 +875,33 @@ export function createDarnaApiApp(
         });
       }
 
-      const verifiedUser = await db.consumeEmailVerificationToken(
-        targetUser.id,
-        targetUser.email,
-        verificationToken.trim()
+      const maxCheckPer15Min = Number(process.env.AUTH_EMAIL_VERIFY_CHECK_LIMIT || 10);
+      const checkRateLimit = consumeDualRateLimit(
+        emailVerifyCheckEmailLimiter,
+        emailVerifyCheckIpLimiter,
+        effectiveEmail,
+        getClientIp(req),
+        maxCheckPer15Min,
+        15 * 60 * 1000
       );
+      if (!checkRateLimit.allowed) {
+        return res.status(429).json({
+          success: false,
+          code: 'RATE_LIMIT_EXCEEDED',
+          message:
+            'Trop de tentatives de vérification du code (maximum 10 par 15 minutes). Veuillez patienter avant de réessayer.',
+        });
+      }
+
+      const targetUser = viewer || db.getUserByEmail(effectiveEmail)?.user || null;
+      const verifiedUser = targetUser
+        ? await db.consumeEmailVerificationToken(
+            targetUser.id,
+            targetUser.email,
+            verificationToken.trim()
+          )
+        : null;
+
       if (!verifiedUser) {
         return res.status(403).json({
           success: false,
