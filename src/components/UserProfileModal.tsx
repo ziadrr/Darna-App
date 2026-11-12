@@ -47,7 +47,7 @@ interface UserProfileModalProps {
   onOpenPricingPage: () => void;
   onToggleListingStatus: (listing: Listing) => Promise<void>;
   onDeleteListing: (id: string) => Promise<void>;
-  onVerifyEmail: () => Promise<void>;
+  onVerifyEmail: () => void;
   onUserUpdated?: (user: User) => void;
   onLogout: () => void;
 }
@@ -56,7 +56,6 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   isOpen,
   onClose,
   currentUser,
-  authToken,
   myListings,
   allListings,
   plans,
@@ -69,7 +68,7 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   onOpenPricingPage,
   onToggleListingStatus,
   onDeleteListing,
-  onUserUpdated,
+  onVerifyEmail,
   onLogout,
 }) => {
   const [activeTab, setActiveTab] = useState<'myAds' | 'subscription' | 'favorites'>('myAds');
@@ -77,95 +76,7 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
     'all' | 'publiee' | 'masquee' | 'en_attente' | 'brouillon'
   >('all');
 
-  // Complete Email Verification UI state
-  const [verificationCode, setVerificationCode] = useState('');
-  const [sendingCode, setSendingCode] = useState(false);
-  const [verifyingCode, setVerifyingCode] = useState(false);
-  const [verificationError, setVerificationError] = useState<string | null>(null);
-  const [verificationInfo, setVerificationInfo] = useState<string | null>(null);
-  const [verificationSuccess, setVerificationSuccess] = useState<string | null>(null);
-
   if (!isOpen) return null;
-
-  const handleRequestEmailCode = async () => {
-    const token = authToken || localStorage.getItem('darna_token');
-    if (!token) {
-      setVerificationError('Vous devez être connecté pour demander un code de vérification.');
-      return;
-    }
-    setSendingCode(true);
-    setVerificationError(null);
-    setVerificationInfo(null);
-    setVerificationSuccess(null);
-    try {
-      const res = await fetch('/api/auth/request-email-verification', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success || data.emailSent !== true) {
-        setVerificationError(
-          data.message ||
-            "Aucun e-mail n'a été envoyé : le service d'envoi d'e-mails (SMTP) n'est pas configuré."
-        );
-      } else {
-        setVerificationInfo(
-          data.message ||
-            'Un e-mail contenant votre code de vérification à usage unique (valable 15 minutes) a été envoyé.'
-        );
-      }
-    } catch {
-      setVerificationError("Erreur réseau lors de la demande d'envoi du code par e-mail.");
-    } finally {
-      setSendingCode(false);
-    }
-  };
-
-  const handleSubmitVerificationCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const token = authToken || localStorage.getItem('darna_token');
-    if (!token) {
-      setVerificationError('Vous devez être connecté pour vérifier votre adresse e-mail.');
-      return;
-    }
-    const cleanCode = verificationCode.trim();
-    if (!cleanCode) {
-      setVerificationError('Veuillez saisir le code de vérification reçu par e-mail.');
-      return;
-    }
-    setVerifyingCode(true);
-    setVerificationError(null);
-    setVerificationInfo(null);
-    setVerificationSuccess(null);
-    try {
-      const res = await fetch('/api/auth/verify-email', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ verificationToken: cleanCode }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        setVerificationError(
-          data.code === 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN'
-            ? 'Code de vérification invalide ou expiré : ce code est incorrect, a dépassé sa validité de 15 minutes ou a déjà été utilisé.'
-            : data.message || 'Code de vérification invalide ou expiré.'
-        );
-      } else {
-        setVerificationCode('');
-        setVerificationSuccess('Votre adresse e-mail est maintenant vérifiée avec succès !');
-        if (data.user && onUserUpdated) {
-          onUserUpdated(data.user);
-        }
-      }
-    } catch {
-      setVerificationError('Erreur réseau lors de la vérification du code.');
-    } finally {
-      setVerifyingCode(false);
-    }
-  };
 
   const filteredMyListings = myListings.filter((l) =>
     statusFilter === 'all' ? true : l.status === statusFilter
@@ -234,80 +145,22 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
           </button>
         </div>
 
-        {/* Simple, Compact Email Verification Bar */}
-        {(!currentUser.emailVerified || verificationSuccess) && (
-          <div className="px-6 py-3 bg-amber-50/70 border-b border-amber-200/80 space-y-2">
-            {!currentUser.emailVerified && (
-              <form
-                onSubmit={handleSubmitVerificationCode}
-                className="flex flex-col sm:flex-row sm:items-center gap-2"
-              >
-                <label
-                  htmlFor="email-verification-code-input"
-                  className="text-xs font-bold text-stone-800 flex items-center gap-1.5 shrink-0"
-                >
-                  <MailCheck className="w-4 h-4 text-[#C15C3D]" />
-                  <span>Vérifier mon e-mail :</span>
-                </label>
-
-                <input
-                  id="email-verification-code-input"
-                  type="text"
-                  value={verificationCode}
-                  onChange={(e) => setVerificationCode(e.target.value)}
-                  placeholder="Code reçu par e-mail"
-                  className="flex-1 text-xs font-mono px-3 py-2 rounded-xl bg-white border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#1E3D34]"
-                />
-
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="submit"
-                    disabled={verifyingCode}
-                    className="px-3.5 py-2 bg-[#C15C3D] hover:bg-[#a94f33] text-white rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
-                  >
-                    {verifyingCode ? 'Validation...' : 'Valider le code'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRequestEmailCode}
-                    disabled={sendingCode}
-                    className="px-3.5 py-2 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
-                  >
-                    {sendingCode ? 'Envoi...' : 'Envoyer le code'}
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {verificationError && (
-              <div
-                role="alert"
-                className="px-3 py-2 rounded-xl bg-red-50 border border-red-200 text-red-800 text-xs flex items-center gap-2"
-              >
-                <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
-                <span>{verificationError}</span>
-              </div>
-            )}
-
-            {verificationInfo && (
-              <div
-                role="status"
-                className="px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs flex items-center gap-2"
-              >
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                <span>{verificationInfo}</span>
-              </div>
-            )}
-
-            {verificationSuccess && (
-              <div
-                role="status"
-                className="px-3 py-2 rounded-xl bg-emerald-100 border border-emerald-300 text-emerald-950 text-xs font-semibold flex items-center gap-2"
-              >
-                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
-                <span>{verificationSuccess}</span>
-              </div>
-            )}
+        {/* Simple, Compact Email Verification Bar (opens the 6-box verification modal with automatic send) */}
+        {!currentUser.emailVerified && (
+          <div className="px-6 py-3 bg-amber-50/70 border-b border-amber-200/80 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs text-stone-800">
+              <MailCheck className="w-4 h-4 text-[#C15C3D] shrink-0" />
+              <span>
+                Vérifiez <strong>{currentUser.email}</strong> avec le code à 6 chiffres ou le lien magique envoyé par e-mail.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={onVerifyEmail}
+              className="px-3.5 py-1.5 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold transition-colors shrink-0"
+            >
+              Saisir mon code à 6 chiffres
+            </button>
           </div>
         )}
 

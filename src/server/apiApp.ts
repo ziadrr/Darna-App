@@ -85,7 +85,16 @@ export function createDarnaApiApp(
     'https://server.arcgisonline.com',
   ];
 
+  const allowedFrameAncestors = [
+    "'self'",
+    'https://aistudio.google.com',
+    'https://*.google.com',
+    'https://*.usercontent.goog',
+    'https://*.run.app',
+  ];
+
   const helmetProd = helmet({
+    frameguard: false,
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
@@ -102,19 +111,21 @@ export function createDarnaApiApp(
         mediaSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: baseConnectSrc,
         frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
+        frameAncestors: allowedFrameAncestors,
       },
     },
     crossOriginEmbedderPolicy: false,
   });
 
   const helmetDev = helmet({
+    frameguard: false,
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: [
           "'self'",
-          INDEX_INLINE_SCRIPT_SHA256,
+          "'unsafe-inline'",
           "'unsafe-eval'",
           'https://apis.google.com',
         ],
@@ -129,13 +140,14 @@ export function createDarnaApiApp(
         mediaSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: [...baseConnectSrc, 'wss:', 'ws:'],
         frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
+        frameAncestors: allowedFrameAncestors,
       },
     },
     crossOriginEmbedderPolicy: false,
   });
 
   // Security headers via Helmet: strict CSP in production (no unsafe-eval, no unsafe-inline in script-src,
-  // explicit img-src domains, no ws:/wss: in production connect-src)
+  // explicit img-src domains, no ws:/wss: in production connect-src, and AI Studio iframe preview allowed)
   app.use((req, res, next) => {
     if (process.env.NODE_ENV === 'production') {
       return helmetProd(req, res, next);
@@ -671,10 +683,29 @@ export function createDarnaApiApp(
       const savedUser = await db.createUser(newUser, String(password));
       const token = await db.createSession(savedUser.id);
 
+      // Automatically send the 6-digit verification code + magic link upon registration when SMTP is configured
+      let verificationEmailSent = false;
+      const smtpConfigured = isEmailServiceConfigured();
+      if (!savedUser.emailVerified && smtpConfigured) {
+        try {
+          const rawCode = await db.createEmailVerificationToken(savedUser.id, savedUser.email);
+          const mailResult = await sendEmailVerificationMessage({
+            toEmail: savedUser.email,
+            userName: savedUser.name,
+            verificationToken: rawCode,
+          });
+          verificationEmailSent = mailResult.sent;
+        } catch (mailErr) {
+          console.error('Automatic verification email on register failed:', mailErr);
+        }
+      }
+
       return res.status(201).json({
         success: true,
         user: savedUser,
         token,
+        verificationEmailSent,
+        smtpConfigured,
       });
     } catch (err: any) {
       console.error('Error in POST /api/auth/register:', err);
@@ -710,7 +741,7 @@ export function createDarnaApiApp(
         });
       }
 
-      const user = db.verifyUserCredentials(normalizedEmail, String(password));
+      let user = db.verifyUserCredentials(normalizedEmail, String(password));
       if (!user) {
         if (!attemptEntry || now >= attemptEntry.resetAt) {
           loginRateLimiter.set(loginKey, { count: 1, resetAt: now + 5 * 60_000 });
@@ -720,6 +751,28 @@ export function createDarnaApiApp(
         return res.status(401).json({
           success: false,
           message: 'Adresse e-mail ou mot de passe incorrect.',
+        });
+      }
+
+      if (
+        isConfiguredAdminEmail(user.email) &&
+        (user.role !== 'admin' || !user.emailVerified || !user.verified)
+      ) {
+        user = await db.updateUser({
+          ...user,
+          role: 'admin',
+          verified: true,
+          emailVerified: true,
+          subscription: {
+            planId: user.subscription?.planId || 'agence',
+            planName: user.subscription?.planName || 'Administrateur Propriétaire',
+            status: 'active',
+            maxListings: 999,
+            startedAt: user.subscription?.startedAt || new Date().toISOString(),
+            expiresAt:
+              user.subscription?.expiresAt ||
+              new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+          },
         });
       }
 
@@ -754,8 +807,9 @@ export function createDarnaApiApp(
    * Works both BEFORE login (when `email` is provided in body) and AFTER login (via Bearer token).
    * - Enforces rate limiting per IP AND per email (default: 5 sends / hour).
    * - Never reveals whether an email address is registered: returns the exact same 200 response
-   *   whether the account exists or not, and silently sends the verification email only if the account exists.
-   * - Never claims an email was sent if SMTP is unconfigured (503), and never returns the token in HTTP responses.
+   *   whether the account exists or not, and silently sends the 6-digit verification code + magic link
+   *   only if the account exists.
+   * - Never claims an email was sent if SMTP is unconfigured (503), and never returns the code in HTTP responses.
    */
   app.post('/api/auth/request-email-verification', async (req, res) => {
     try {
@@ -806,11 +860,11 @@ export function createDarnaApiApp(
 
       // Silent send only if the account actually exists; return the exact same response either way
       if (targetUser) {
-        const rawToken = await db.createEmailVerificationToken(targetUser.id, targetUser.email);
+        const rawCode = await db.createEmailVerificationToken(targetUser.id, targetUser.email);
         const mailResult = await sendEmailVerificationMessage({
           toEmail: targetUser.email,
           userName: targetUser.name,
-          verificationToken: rawToken,
+          verificationToken: rawCode,
         });
 
         if (!mailResult.sent) {
@@ -839,17 +893,17 @@ export function createDarnaApiApp(
         success: false,
         emailSent: false,
         code: 'DATABASE_SYNC_FAILED',
-        message: 'Impossible de générer ou enregistrer le jeton de vérification e-mail.',
+        message: 'Impossible de générer ou enregistrer le code de vérification e-mail.',
       });
     }
   });
 
   /**
-   * Step 2 of Email Verification:
-   * Works both BEFORE login (with `{ email, verificationToken }`) and AFTER login (via Bearer token).
+   * Step 2 of Email Verification (6-digit code or magic link):
+   * Works both with `{ email, verificationToken | code }` and via Bearer token.
    * - Enforces rate limiting per IP AND per email (default: 10 verifications / 15 min).
    * - Returns the exact same 403 INVALID_OR_EXPIRED_VERIFICATION_TOKEN response whether the account
-   *   does not exist or the token is invalid/expired, preventing account enumeration.
+   *   does not exist or the code is invalid/expired, preventing account enumeration.
    */
   app.post('/api/auth/verify-email', async (req, res) => {
     try {
@@ -865,13 +919,18 @@ export function createDarnaApiApp(
         });
       }
 
-      const { verificationToken } = req.body || {};
-      if (!verificationToken || typeof verificationToken !== 'string' || !verificationToken.trim()) {
+      const rawToken =
+        typeof req.body?.verificationToken === 'string'
+          ? req.body.verificationToken
+          : typeof req.body?.code === 'string'
+          ? req.body.code
+          : '';
+      if (!rawToken || !rawToken.trim()) {
         return res.status(400).json({
           success: false,
           code: 'EMAIL_VERIFICATION_TOKEN_REQUIRED',
           message:
-            'Un jeton de vérification cryptographique valide est requis pour marquer une adresse e-mail comme vérifiée.',
+            'Un code de vérification à 6 chiffres valide est requis pour marquer une adresse e-mail comme vérifiée.',
         });
       }
 
@@ -898,7 +957,7 @@ export function createDarnaApiApp(
         ? await db.consumeEmailVerificationToken(
             targetUser.id,
             targetUser.email,
-            verificationToken.trim()
+            rawToken.trim()
           )
         : null;
 
@@ -922,6 +981,79 @@ export function createDarnaApiApp(
         code: 'DATABASE_SYNC_FAILED',
         message: 'Erreur de persistance lors de la vérification e-mail.',
       });
+    }
+  });
+
+  /**
+   * Magic Link Verification Endpoint (GET /api/auth/verify-email-link?email=...&code=...)
+   * Enforces the same dual rate limiting and anti-enumeration checks.
+   */
+  app.get('/api/auth/verify-email-link', async (req, res) => {
+    try {
+      const effectiveEmail =
+        typeof req.query.email === 'string' ? req.query.email.trim().toLowerCase() : '';
+      const rawCode =
+        typeof req.query.code === 'string' ? req.query.code.trim() : '';
+      const wantsJson = String(req.headers.accept || '').includes('application/json');
+
+      if (!effectiveEmail || !rawCode) {
+        if (wantsJson) {
+          return res.status(400).json({
+            success: false,
+            code: 'EMAIL_VERIFICATION_TOKEN_REQUIRED',
+            message: 'Lien de vérification incomplet.',
+          });
+        }
+        return res.redirect('/?email_verified=0');
+      }
+
+      const maxCheckPer15Min = Number(process.env.AUTH_EMAIL_VERIFY_CHECK_LIMIT || 10);
+      const checkRateLimit = consumeDualRateLimit(
+        emailVerifyCheckEmailLimiter,
+        emailVerifyCheckIpLimiter,
+        effectiveEmail,
+        getClientIp(req),
+        maxCheckPer15Min,
+        15 * 60 * 1000
+      );
+      if (!checkRateLimit.allowed) {
+        if (wantsJson) {
+          return res.status(429).json({
+            success: false,
+            code: 'RATE_LIMIT_EXCEEDED',
+            message: 'Trop de tentatives de vérification. Veuillez patienter avant de réessayer.',
+          });
+        }
+        return res.redirect('/?email_verified=rate_limited');
+      }
+
+      const targetUser = db.getUserByEmail(effectiveEmail)?.user || null;
+      const verifiedUser = targetUser
+        ? await db.consumeEmailVerificationToken(targetUser.id, targetUser.email, rawCode)
+        : null;
+
+      if (!verifiedUser) {
+        if (wantsJson) {
+          return res.status(403).json({
+            success: false,
+            code: 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN',
+            message: 'Lien ou code de vérification invalide ou expiré.',
+          });
+        }
+        return res.redirect('/?email_verified=0');
+      }
+
+      if (wantsJson) {
+        return res.json({
+          success: true,
+          user: verifiedUser,
+          message: 'Votre adresse e-mail est maintenant vérifiée !',
+        });
+      }
+      return res.redirect('/?email_verified=1');
+    } catch (err) {
+      console.error('Error in GET /api/auth/verify-email-link:', err);
+      return res.redirect('/?email_verified=0');
     }
   });
 
@@ -1338,10 +1470,35 @@ export function createDarnaApiApp(
     }
   });
 
-  app.get('/api/auth/me', (req, res) => {
-    const viewer = getAuthUser(req);
+  app.get('/api/auth/me', async (req, res) => {
+    let viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({ success: false, user: null });
+    }
+    if (
+      isConfiguredAdminEmail(viewer.email) &&
+      (viewer.role !== 'admin' || !viewer.emailVerified || !viewer.verified)
+    ) {
+      try {
+        viewer = await db.updateUser({
+          ...viewer,
+          role: 'admin',
+          verified: true,
+          emailVerified: true,
+          subscription: {
+            planId: viewer.subscription?.planId || 'agence',
+            planName: viewer.subscription?.planName || 'Administrateur Propriétaire',
+            status: 'active',
+            maxListings: 999,
+            startedAt: viewer.subscription?.startedAt || new Date().toISOString(),
+            expiresAt:
+              viewer.subscription?.expiresAt ||
+              new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+          },
+        });
+      } catch (err) {
+        console.error('Error auto-promoting owner admin in /api/auth/me:', err);
+      }
     }
     res.json({ success: true, user: viewer });
   });
@@ -2855,6 +3012,122 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: "Une erreur est survenue lors de la communication avec l'assistant IA. Veuillez réessayer plus tard.",
       });
     }
+  });
+
+  // ==========================================================================
+  // CONVERSATIONS & INTERNAL MESSAGING ROUTES
+  // ==========================================================================
+
+  app.get('/api/conversations', (req, res) => {
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Veuillez vous connecter pour accéder à vos conversations.',
+      });
+    }
+    const conversations = db.getConversationsForUser(viewer);
+    return res.json({
+      success: true,
+      conversations,
+    });
+  });
+
+  app.post('/api/conversations', (req, res) => {
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Veuillez vous connecter pour envoyer un message.',
+      });
+    }
+    const rawText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    const conversationId =
+      typeof req.body?.conversationId === 'string' ? req.body.conversationId.trim() : undefined;
+    const listingId =
+      typeof req.body?.listingId === 'string' ? req.body.listingId.trim() : undefined;
+
+    if (!rawText) {
+      return res.status(400).json({
+        success: false,
+        message: 'Veuillez saisir un message avant de l’envoyer.',
+      });
+    }
+    if (rawText.length > 1500) {
+      return res.status(400).json({
+        success: false,
+        message: 'Le message ne peut pas dépasser 1500 caractères.',
+      });
+    }
+
+    let listing = listingId ? db.getListingById(listingId) : null;
+    if (!conversationId && !listing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Annonce ou conversation introuvable.',
+      });
+    }
+
+    if (conversationId) {
+      const existingConv = db.getConversationById(conversationId);
+      if (!existingConv) {
+        return res.status(404).json({
+          success: false,
+          message: 'Conversation introuvable.',
+        });
+      }
+      const isParticipant =
+        viewer.role === 'admin' ||
+        existingConv.participantIds.includes(viewer.id) ||
+        existingConv.advertiserId === viewer.id ||
+        existingConv.initiatorId === viewer.id;
+      if (!isParticipant) {
+        return res.status(403).json({
+          success: false,
+          message: 'Accès non autorisé à cette conversation.',
+        });
+      }
+      if (!listing) {
+        listing = db.getListingById(existingConv.listingId);
+      }
+    }
+
+    const conversation = db.sendConversationMessage({
+      listing,
+      sender: viewer,
+      text: rawText,
+      conversationId,
+    });
+
+    return res.status(201).json({
+      success: true,
+      conversation,
+      message: 'Message envoyé avec succès.',
+    });
+  });
+
+  app.post('/api/conversations/:id/read', (req, res) => {
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Authentification requise.',
+      });
+    }
+    const updated = db.markConversationRead(req.params.id, viewer.id);
+    if (!updated) {
+      return res.status(404).json({
+        success: false,
+        message: 'Conversation introuvable.',
+      });
+    }
+    return res.json({
+      success: true,
+      conversation: updated,
+    });
   });
 
   // Strict JSON 404 handler for all /api/* routes so unmatched API endpoints never fall through

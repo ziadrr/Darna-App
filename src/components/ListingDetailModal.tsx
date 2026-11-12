@@ -45,6 +45,7 @@ interface ListingDetailModalProps {
   allListings?: Listing[];
   onSelectListing?: (listing: Listing) => void;
   onOpenBoostModal?: (listing: Listing) => void;
+  onSendMessageToAdvertiser?: (listing: Listing, text: string) => Promise<void>;
 }
 
 export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
@@ -59,6 +60,7 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   allListings = [],
   onSelectListing,
   onOpenBoostModal,
+  onSendMessageToAdvertiser,
 }) => {
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -84,16 +86,20 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
     setTimeout(() => setCopiedLink(false), 2500);
   };
 
-  const handleSendInternalMessage = (e: React.FormEvent) => {
+  const handleSendInternalMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) {
       onRequireAuth({ type: 'contact', listingId: listing.id });
       return;
     }
     if (!messageText.trim()) return;
+    const textToSend = messageText.trim();
+    if (onSendMessageToAdvertiser) {
+      await onSendMessageToAdvertiser(listing, textToSend);
+    }
     setContactMessageSent(true);
+    setMessageText('');
     setTimeout(() => {
-      setMessageText('');
       setContactMessageSent(false);
     }, 3500);
   };

@@ -520,13 +520,20 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       'Must never return devVerificationToken in HTTP response'
     );
 
-    const lastMailRaw = smtpServer.messages[smtpServer.messages.length - 1].raw.replace(
-      /=\r?\n/g,
-      ''
+    const lastMailRaw = smtpServer.messages[smtpServer.messages.length - 1].raw
+      .replace(/=\r?\n/g, '')
+      .replace(/=3D/gi, '=');
+    const match = lastMailRaw.match(/CODE_VERIFICATION:\s*(\d{6})/i);
+    assert.ok(match && match[1], 'Email must contain the 6-digit numeric verification code');
+    const emailedVerifyCode = match[1];
+    assert.match(emailedVerifyCode, /^\d{6}$/, 'Verification code must be exactly 6 digits');
+
+    const magicLinkMatch = lastMailRaw.match(/LIEN_MAGIQUE:\s*(https?:\/\/[^\s]+)/i);
+    assert.ok(magicLinkMatch && magicLinkMatch[1], 'Email must also contain a magic link');
+    assert.ok(
+      magicLinkMatch[1].includes(`code=${emailedVerifyCode}`),
+      'Magic link must embed the 6-digit verification code'
     );
-    const match = lastMailRaw.match(/JETON_VERIFICATION:\s*([a-f0-9]{48})/i);
-    assert.ok(match && match[1], 'Email must contain the 48-char verification token');
-    const emailedVerifyToken = match[1];
 
     const validVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
       method: 'POST',
@@ -534,20 +541,20 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
       },
-      body: JSON.stringify({ verificationToken: emailedVerifyToken }),
+      body: JSON.stringify({ verificationToken: emailedVerifyCode }),
     });
     const validVerifyData = await validVerifyRes.json();
     assert.equal(validVerifyRes.status, 200);
     assert.equal(validVerifyData.user.emailVerified, true);
 
-    // D) Replaying the same verification token a second time fails with 403
+    // D) Replaying the same 6-digit verification code a second time fails with 403
     const replayVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${userToken}`,
       },
-      body: JSON.stringify({ verificationToken: emailedVerifyToken }),
+      body: JSON.stringify({ verificationToken: emailedVerifyCode }),
     });
     assert.equal(replayVerifyRes.status, 403);
   });
@@ -1432,11 +1439,145 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       assert.ok(!connectSrc.includes('ws:'), 'Production connect-src must NOT contain ws:');
       assert.ok(!connectSrc.includes('wss:'), 'Production connect-src must NOT contain wss:');
       assert.ok(connectSrc.includes('https://*.googleapis.com'), 'connect-src must allow Firebase/Google APIs');
+
+      // 4. frame-ancestors & X-Frame-Options: allow AI Studio preview iframe while preventing arbitrary clickjacking
+      assert.equal(
+        res.headers.get('x-frame-options'),
+        null,
+        'X-Frame-Options: SAMEORIGIN must be disabled so AI Studio preview iframe is not blocked'
+      );
+      const frameAncestors = directives['frame-ancestors'] || [];
+      assert.ok(frameAncestors.includes("'self'"), "frame-ancestors must include 'self'");
+      assert.ok(
+        frameAncestors.includes('https://aistudio.google.com'),
+        'frame-ancestors must allow https://aistudio.google.com preview iframe'
+      );
     } finally {
       if (savedNodeEnv !== undefined) process.env.NODE_ENV = savedNodeEnv;
       else delete process.env.NODE_ENV;
     }
   });
+
+  it('17. removes the Verify tab from AuthModal, automatically sends a 6-digit code + magic link upon registration, and supports magic link verification', async () => {
+    // 1. Verify AuthModal.tsx has NO 'verify' tab or manual email input for verification
+    const authModalSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src', 'components', 'AuthModal.tsx'),
+      'utf8'
+    );
+    assert.ok(
+      !authModalSource.includes("switchMode('verify')") &&
+        !authModalSource.includes("mode === 'verify'") &&
+        !authModalSource.includes('prelogin-verify-email'),
+      'AuthModal must NOT have a Verify tab or manual email input for verification'
+    );
+
+    // 2. Verify automatic email send upon registration when SMTP is configured
+    process.env.SMTP_HOST = '127.0.0.1';
+    process.env.SMTP_PORT = String(smtpPort);
+    const msgCountBefore = smtpServer.messages.length;
+
+    const autoEmail = 'amine.tazi@example.ma';
+    const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.240',
+      },
+      body: JSON.stringify({
+        firstName: 'Amine',
+        lastName: 'Tazi',
+        email: autoEmail,
+        password: 'AmineStrong2026!',
+        termsAccepted: true,
+      }),
+    });
+    const regData = await regRes.json();
+    assert.equal(regRes.status, 201);
+    assert.equal(
+      regData.verificationEmailSent,
+      true,
+      'POST /api/auth/register must automatically send the 6-digit verification email when SMTP is configured'
+    );
+    assert.equal(
+      smtpServer.messages.length,
+      msgCountBefore + 1,
+      'SMTP server must receive the automatic verification email right upon registration'
+    );
+
+    const rawEmail = smtpServer.messages[smtpServer.messages.length - 1].raw.replace(/=\r?\n/g, '');
+    const codeMatch = rawEmail.match(/CODE_VERIFICATION:\s*(\d{6})/i);
+    assert.ok(codeMatch && codeMatch[1], 'Automatic registration email must contain a 6-digit code');
+    const sixDigitCode = codeMatch[1];
+
+    // 3. Verify Magic Link endpoint (GET /api/auth/verify-email-link?email=...&code=...) marks email as verified
+    const magicRes = await fetch(
+      `${baseUrl}/api/auth/verify-email-link?email=${encodeURIComponent(autoEmail)}&code=${encodeURIComponent(
+        sixDigitCode
+      )}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'X-Forwarded-For': '198.51.100.240',
+        },
+      }
+    );
+    const magicData = await magicRes.json();
+    assert.equal(magicRes.status, 200);
+    assert.equal(magicData.success, true);
+    assert.equal(magicData.user.emailVerified, true);
+  });
+
+  it('18. supports owner admin accounts and authenticated conversations endpoints (/api/conversations)', async () => {
+    // 1. Unauthenticated visitors receive 401 on GET /api/conversations
+    const unauthConvRes = await fetch(`${baseUrl}/api/conversations`);
+    assert.equal(unauthConvRes.status, 401);
+
+    // 2. Owner admin login (ayarziad@gmail.com registered in Test 3) can list all conversations and send replies
+    const adminLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '198.51.100.245',
+      },
+      body: JSON.stringify({
+        email: 'ayarziad@gmail.com',
+        password: 'AdminStrong2026!',
+      }),
+    });
+    const adminLoginData = await adminLoginRes.json();
+    assert.equal(adminLoginRes.status, 200);
+    assert.equal(adminLoginData.user.role, 'admin');
+    const adminToken = adminLoginData.token;
+
+    const listConvRes = await fetch(`${baseUrl}/api/conversations`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    const listConvData = await listConvRes.json();
+    assert.equal(listConvRes.status, 200);
+    assert.equal(listConvData.success, true);
+    assert.ok(Array.isArray(listConvData.conversations) && listConvData.conversations.length >= 2);
+
+    const firstConvId = listConvData.conversations[0].id;
+    const replyRes = await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({
+        conversationId: firstConvId,
+        text: 'Bonjour, message de test depuis le compte Propriétaire Admin.',
+      }),
+    });
+    const replyData = await replyRes.json();
+    assert.equal(replyRes.status, 201);
+    assert.equal(replyData.success, true);
+    assert.equal(
+      replyData.conversation.lastMessageText,
+      'Bonjour, message de test depuis le compte Propriétaire Admin.'
+    );
+  });
 });
+
 
 

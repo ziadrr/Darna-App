@@ -1,4 +1,4 @@
-import { scryptSync, randomBytes, timingSafeEqual, createHash } from 'node:crypto';
+import { scryptSync, randomBytes, randomInt, timingSafeEqual, createHash } from 'node:crypto';
 import type { Listing, User } from '../types/index.ts';
 import { sanitizeListingForVisitor, sanitizeListingForPublic } from './rentalLogic.ts';
 
@@ -70,6 +70,13 @@ export function generateSecureToken(bytes = 32): string {
 }
 
 /**
+ * Generates a cryptographically secure 6-digit numeric verification code (e.g. "482910").
+ */
+export function generateSixDigitCode(): string {
+  return String(randomInt(100000, 1000000));
+}
+
+/**
  * Hashes a session or password-reset token with SHA-256 before storing in the database.
  */
 export function hashToken(token: string): string {
@@ -85,7 +92,7 @@ export function isConfiguredAdminEmail(email: string, envAdminEmails?: string): 
   const rawList =
     envAdminEmails !== undefined
       ? envAdminEmails
-      : process.env.ADMIN_EMAILS || 'ayarziad@gmail.com';
+      : process.env.ADMIN_EMAILS || 'ayarziad@gmail.com,ghenamreda62@gmail.com,admin@darna.ma';
   const allowedList = rawList
     .split(',')
     .map((e) => e.trim().toLowerCase())

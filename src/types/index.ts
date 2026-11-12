@@ -234,5 +234,37 @@ export type PendingAction =
   | { type: 'post_ad' }
   | { type: 'subscribe'; planId: string }
   | { type: 'boost'; listingId: string; optionId?: BoostOptionId }
+  | { type: 'conversations' }
   | null;
+
+export interface ConversationMessage {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  senderName: string;
+  senderRole: UserRole;
+  text: string;
+  createdAt: string;
+  read: boolean;
+}
+
+export interface ConversationThread {
+  id: string;
+  listingId: string;
+  listingTitle: string;
+  listingCity: string;
+  listingPrice: number;
+  listingImage?: string;
+  participantIds: string[];
+  participantNames: Record<string, string>;
+  advertiserId: string;
+  advertiserName: string;
+  initiatorId: string;
+  initiatorName: string;
+  lastMessageText: string;
+  lastMessageAt: string;
+  unreadCountByUser: Record<string, number>;
+  messages: ConversationMessage[];
+}
+
 

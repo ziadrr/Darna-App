@@ -138,29 +138,49 @@ export async function sendEmailVerificationMessage(params: {
   toEmail: string;
   userName: string;
   verificationToken: string;
+  magicLinkUrl?: string;
 }): Promise<EmailSendResult> {
-  const subject = 'Darna.ma — Vérification de votre adresse e-mail';
+  const baseUrl = (
+    process.env.APP_URL ||
+    'https://ais-dev-y46ket62kvdjqfadnsiutg-79125794117.europe-west3.run.app'
+  ).replace(/\/$/, '');
+  const magicLink =
+    params.magicLinkUrl ||
+    `${baseUrl}/?verify_email=${encodeURIComponent(params.toEmail)}&code=${encodeURIComponent(
+      params.verificationToken
+    )}`;
+
+  const subject = `Darna.ma — Votre code de vérification : ${params.verificationToken}`;
   const text = [
     `Bonjour ${params.userName},`,
     '',
-    'Vous avez demandé la vérification de votre adresse e-mail sur Darna.ma.',
-    'Voici votre jeton de vérification à usage unique (valable 15 minutes) :',
+    'Bienvenue sur Darna.ma ! Voici votre code de vérification à 6 chiffres (valable 15 minutes) :',
     '',
+    `CODE_VERIFICATION: ${params.verificationToken}`,
     `JETON_VERIFICATION: ${params.verificationToken}`,
     '',
-    "Si vous n'êtes pas à l'origine de cette demande, ignorez cet e-mail.",
+    'Vous pouvez également vérifier votre adresse e-mail en un clic grâce à ce lien magique :',
+    `LIEN_MAGIQUE: ${magicLink}`,
+    '',
+    "Si vous n'êtes pas à l'origine de cette demande, ignorez simplement cet e-mail.",
   ].join('\n');
 
   const html = `
     <div style="font-family: sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; border: 1px solid #e7e5e4; border-radius: 16px;">
       <h2 style="color: #1E3D34; margin-top: 0;">Vérification de votre adresse e-mail Darna</h2>
       <p>Bonjour <strong>${params.userName}</strong>,</p>
-      <p>Voici votre code / jeton de vérification à usage unique (valable 15 minutes) :</p>
-      <div style="background: #FAF7F2; border: 1px solid #C15C3D; padding: 14px; border-radius: 10px; font-family: monospace; font-size: 15px; font-weight: bold; color: #1c1917; word-break: break-all;">
+      <p>Saisissez ce code à 6 chiffres dans les 6 cases de l'application (valable 15 minutes) :</p>
+      <div style="background: #FAF7F2; border: 2px solid #C15C3D; padding: 18px; border-radius: 12px; font-family: monospace; font-size: 28px; font-weight: bold; letter-spacing: 8px; text-align: center; color: #1c1917;">
         ${params.verificationToken}
       </div>
+      <p style="margin-top: 20px; margin-bottom: 12px;">Ou cliquez directement sur ce lien magique pour vérifier votre adresse instantanément :</p>
+      <div style="text-align: center; margin: 16px 0;">
+        <a href="${magicLink}" style="display: inline-block; background: #1E3D34; color: #ffffff; text-decoration: none; font-weight: bold; font-size: 14px; padding: 12px 24px; border-radius: 10px;">
+          Vérifier mon adresse e-mail en 1 clic
+        </a>
+      </div>
       <p style="font-size: 12px; color: #57534e; margin-top: 16px;">
-        Ce jeton est strictement personnel et à usage unique.
+        Ce code à 6 chiffres et ce lien magique sont strictement personnels et à usage unique.
       </p>
     </div>
   `;

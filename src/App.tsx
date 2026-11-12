@@ -25,7 +25,8 @@ import {
   DetectedLocation,
   SubscriptionPlan,
   BoostOption,
-  PaymentTransaction
+  PaymentTransaction,
+  ConversationThread
 } from './types';
 import {
   INITIAL_LISTINGS,
@@ -51,13 +52,17 @@ import { LegalAndCndpModal } from './components/LegalAndCndpModal';
 import { ReportListingModal } from './components/ReportListingModal';
 import { FilterBar } from './components/FilterBar';
 import { MoroccoMap } from './components/MoroccoMap';
-import { AuthModal } from './components/AuthModal';
+import { AuthModal, AuthSuccessMeta } from './components/AuthModal';
+import { EmailVerificationModal } from './components/EmailVerificationModal';
 import {
   SubscriptionPlansView,
   BoostListingModal,
   PaymentCheckoutModal,
   CheckoutTarget
 } from './components/MonetizationComponents';
+import {
+  ConversationsModal
+} from './components/ConversationsBannerAndModal';
 
 export default function App() {
   // Global Data State: Visitor default listings have all phone numbers/WhatsApp/emails stripped
@@ -84,9 +89,20 @@ export default function App() {
   );
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
-  const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register' | 'verify'>('login');
+  const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
   const [authReasonMessage, setAuthReasonMessage] = useState<string | undefined>(undefined);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+
+  // Email Verification Modal State (6-digit OTP + Magic Link + Just-in-time verification)
+  const [isEmailVerifyModalOpen, setIsEmailVerifyModalOpen] = useState(false);
+  const [verifyAlreadySentOnRegister, setVerifyAlreadySentOnRegister] = useState(false);
+  const [verifyReasonMessage, setVerifyReasonMessage] = useState<string | undefined>(undefined);
+  const [pendingPostVerifyAction, setPendingPostVerifyAction] = useState<'post_ad' | null>(null);
+
+  // Conversations & Internal Messaging State
+  const [conversations, setConversations] = useState<ConversationThread[]>([]);
+  const [isConversationsModalOpen, setIsConversationsModalOpen] = useState(false);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
 
   // Automatic Wi-Fi / IP + GPS Geolocation State
   const [userLocation, setUserLocation] = useState<DetectedLocation>({
@@ -263,21 +279,30 @@ export default function App() {
     }
   }, []);
 
-  // Fetch user's payment history and (only if admin) admin monetization/users/reports data
+  // Fetch user's payment history, conversations, and (only if admin) admin monetization/users/reports data
   const fetchPaymentData = useCallback(async (token?: string | null, role?: string) => {
     if (!token) {
       setMyTransactions([]);
+      setConversations([]);
       setUsers([]);
       setReports([]);
       return;
     }
     try {
-      const myRes = await fetch('/api/payments/my', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const myData = await myRes.json();
+      const [myRes, convRes] = await Promise.all([
+        fetch('/api/payments/my', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch('/api/conversations', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ]);
+      const [myData, convData] = await Promise.all([myRes.json(), convRes.json()]);
       if (myData.success && Array.isArray(myData.transactions)) {
         setMyTransactions(myData.transactions);
+      }
+      if (convData.success && Array.isArray(convData.conversations)) {
+        setConversations(convData.conversations);
       }
 
       if (role === 'admin') {
@@ -385,6 +410,57 @@ export default function App() {
     }
   }, [listings, selectedListing]);
 
+  // Handle magic link email verification query parameters (?verify_email=...&code=... or ?email_verified=1)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const verifyEmailParam = params.get('verify_email');
+    const codeParam = params.get('code');
+    const emailVerifiedStatus = params.get('email_verified');
+
+    if (verifyEmailParam && codeParam) {
+      const cleanUrl = window.location.pathname;
+      window.history.replaceState({}, document.title, cleanUrl);
+
+      const token = localStorage.getItem('darna_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      fetch('/api/auth/verify-email', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          email: verifyEmailParam.trim().toLowerCase(),
+          verificationToken: codeParam.trim(),
+        }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.success) {
+            if (data.user) {
+              setCurrentUser((prev) => (prev ? { ...prev, ...data.user, emailVerified: true } : prev));
+            }
+            setIsEmailVerifyModalOpen(false);
+            showToast('Votre adresse e-mail est maintenant vérifiée grâce au lien magique !');
+          } else {
+            showToast(data.message || 'Lien magique de vérification invalide ou expiré.');
+          }
+        })
+        .catch(() => {
+          showToast('Erreur réseau lors de la vérification du lien magique.');
+        });
+    } else if (emailVerifiedStatus === '1') {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setCurrentUser((prev) => (prev ? { ...prev, emailVerified: true, verified: true } : prev));
+      setIsEmailVerifyModalOpen(false);
+      showToast('Votre adresse e-mail est maintenant vérifiée !');
+    } else if (emailVerifiedStatus === '0') {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      showToast('Lien de vérification invalide ou expiré.');
+    }
+  }, [showToast]);
+
   // Require authentication helper
   const requireAuth = (action: PendingAction, customReason?: string) => {
     setPendingAction(action);
@@ -394,7 +470,7 @@ export default function App() {
   };
 
   // Handle successful login or registration and return user to pendingAction
-  const handleAuthSuccess = async (user: User, token: string) => {
+  const handleAuthSuccess = async (user: User, token: string, meta?: AuthSuccessMeta) => {
     localStorage.setItem('darna_token', token);
     setAuthToken(token);
     setCurrentUser(user);
@@ -406,8 +482,17 @@ export default function App() {
 
     if (pendingAction) {
       if (pendingAction.type === 'post_ad') {
-        setEditingListing(null);
-        setIsPostWizardOpen(true);
+        if (!user.emailVerified) {
+          setPendingPostVerifyAction('post_ad');
+          setVerifyAlreadySentOnRegister(Boolean(meta?.verificationEmailSent));
+          setVerifyReasonMessage(
+            'Vérifiez votre adresse e-mail avec le code à 6 chiffres pour publier votre annonce.'
+          );
+          setIsEmailVerifyModalOpen(true);
+        } else {
+          setEditingListing(null);
+          setIsPostWizardOpen(true);
+        }
       } else if (pendingAction.type === 'contact') {
         const target =
           (updatedListings || listings).find((l) => l.id === pendingAction.listingId) || null;
@@ -444,10 +529,107 @@ export default function App() {
         if (target) {
           setBoostingListing(target);
         }
+      } else if (pendingAction.type === 'conversations') {
+        setIsConversationsModalOpen(true);
       }
       setPendingAction(null);
+    } else if (meta?.isNewRegistration && !user.emailVerified) {
+      setPendingPostVerifyAction(null);
+      setVerifyAlreadySentOnRegister(Boolean(meta.verificationEmailSent));
+      setVerifyReasonMessage(undefined);
+      setIsEmailVerifyModalOpen(true);
     } else {
       showToast(`Bienvenue sur Darna, ${user.firstName || user.name} !`);
+    }
+  };
+
+  const handleOpenConversation = async (conversationId?: string) => {
+    if (!currentUser || !authToken) {
+      requireAuth(
+        { type: 'conversations' },
+        'Connectez-vous pour accéder à vos conversations avec les propriétaires et agences.'
+      );
+      return;
+    }
+    const targetId = conversationId || conversations[0]?.id || null;
+    setActiveConversationId(targetId);
+    setIsConversationsModalOpen(true);
+    if (targetId) {
+      try {
+        const res = await fetch(`/api/conversations/${encodeURIComponent(targetId)}/read`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        const data = await res.json();
+        if (data.success && data.conversation) {
+          setConversations((prev) =>
+            prev.map((c) => (c.id === data.conversation.id ? data.conversation : c))
+          );
+        }
+      } catch {
+        // Ignore read mark failure
+      }
+    }
+  };
+
+  const handleSendConversationReply = async (conversationId: string, text: string) => {
+    if (!authToken) return;
+    try {
+      const res = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ conversationId, text }),
+      });
+      const data = await res.json();
+      if (data.success && data.conversation) {
+        setConversations((prev) => {
+          const exists = prev.some((c) => c.id === data.conversation.id);
+          if (exists) {
+            return [
+              data.conversation,
+              ...prev.filter((c) => c.id !== data.conversation.id),
+            ];
+          }
+          return [data.conversation, ...prev];
+        });
+        setActiveConversationId(data.conversation.id);
+      }
+    } catch {
+      showToast("Erreur lors de l'envoi du message.");
+    }
+  };
+
+  const handleSendMessageToAdvertiser = async (listing: Listing, text: string) => {
+    if (!authToken) return;
+    try {
+      const res = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ listingId: listing.id, text }),
+      });
+      const data = await res.json();
+      if (data.success && data.conversation) {
+        setConversations((prev) => {
+          const exists = prev.some((c) => c.id === data.conversation.id);
+          if (exists) {
+            return [
+              data.conversation,
+              ...prev.filter((c) => c.id !== data.conversation.id),
+            ];
+          }
+          return [data.conversation, ...prev];
+        });
+        setActiveConversationId(data.conversation.id);
+        showToast('Message envoyé ! Retrouvez la discussion dans la bannière de conversations.');
+      }
+    } catch {
+      showToast("Erreur lors de l'envoi du message.");
     }
   };
 
@@ -463,6 +645,8 @@ export default function App() {
     setCurrentUser(null);
     setFavorites([]);
     setMyTransactions([]);
+    setConversations([]);
+    setIsConversationsModalOpen(false);
     setIsProfileModalOpen(false);
     if (currentView === 'admin') setCurrentView('home');
     await fetchListings(null);
@@ -554,6 +738,16 @@ export default function App() {
         { type: 'post_ad' },
         'Un compte est requis pour publier et gérer vos annonces immobilières.'
       );
+      return;
+    }
+    // Just-in-time email verification when attempting to publish a listing
+    if (!currentUser.emailVerified) {
+      setPendingPostVerifyAction('post_ad');
+      setVerifyAlreadySentOnRegister(false);
+      setVerifyReasonMessage(
+        'Vérifiez votre adresse e-mail avec le code à 6 chiffres pour déposer une annonce.'
+      );
+      setIsEmailVerifyModalOpen(true);
       return;
     }
     setEditingListing(null);
@@ -659,29 +853,12 @@ export default function App() {
     }
   };
 
-  const handleVerifyEmail = async () => {
-    if (!authToken) return;
-    try {
-      const reqRes = await fetch('/api/auth/request-email-verification', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-      const reqData = await reqRes.json();
-      if (!reqRes.ok || !reqData.success || reqData.emailSent !== true) {
-        showToast(
-          reqData.message ||
-            "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP) n'est pas configuré."
-        );
-        return;
-      }
-
-      showToast(
-        reqData.message ||
-          'Un e-mail contenant votre jeton de vérification à usage unique a été envoyé.'
-      );
-    } catch (err) {
-      console.warn(err);
-    }
+  const handleVerifyEmail = () => {
+    if (!currentUser) return;
+    setPendingPostVerifyAction(null);
+    setVerifyAlreadySentOnRegister(false);
+    setVerifyReasonMessage(undefined);
+    setIsEmailVerifyModalOpen(true);
   };
 
   const handleModerateListing = async (
@@ -990,6 +1167,20 @@ export default function App() {
               {t.favorites}
             </button>
 
+            <button
+              type="button"
+              onClick={() => handleOpenConversation()}
+              className="px-3.5 py-1.5 rounded-full text-xs font-bold flex items-center gap-1.5 text-stone-700 hover:text-[#1E3D34] hover:bg-white/60 transition-all whitespace-nowrap shrink-0"
+            >
+              <MessageSquare className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
+              <span>Conversations</span>
+              {currentUser && conversations.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-[#1E3D34] text-white text-[10px] font-bold">
+                  {conversations.length}
+                </span>
+              )}
+            </button>
+
             {currentUser?.role === 'admin' && (
               <button
                 type="button"
@@ -1071,33 +1262,19 @@ export default function App() {
                 </span>
               </button>
             ) : (
-              <div className="flex items-center gap-1.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPendingAction(null);
-                    setAuthReasonMessage(undefined);
-                    setAuthInitialMode('verify');
-                    setIsAuthModalOpen(true);
-                  }}
-                  className="hidden md:flex items-center gap-1.5 px-3 py-2 rounded-full bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 text-xs font-bold transition-all whitespace-nowrap shrink-0"
-                >
-                  <span>Vérifier mon mail</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPendingAction(null);
-                    setAuthReasonMessage(undefined);
-                    setAuthInitialMode('login');
-                    setIsAuthModalOpen(true);
-                  }}
-                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all whitespace-nowrap shrink-0"
-                >
-                  <LogIn className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
-                  <span>Se connecter</span>
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingAction(null);
+                  setAuthReasonMessage(undefined);
+                  setAuthInitialMode('login');
+                  setIsAuthModalOpen(true);
+                }}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-full bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 text-xs font-bold shadow-2xs transition-all whitespace-nowrap shrink-0"
+              >
+                <LogIn className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
+                <span>Se connecter</span>
+              </button>
             )}
           </div>
         </div>
@@ -1117,10 +1294,10 @@ export default function App() {
             </p>
             <button
               type="button"
-              onClick={() => setIsProfileModalOpen(true)}
+              onClick={handleVerifyEmail}
               className="px-3.5 py-1.5 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-xl text-xs font-bold shrink-0 transition-colors"
             >
-              Vérifier mon mail
+              Saisir mon code à 6 chiffres
             </button>
           </div>
         )}
@@ -1617,6 +1794,24 @@ export default function App() {
           setSelectedListing(null);
           handleOpenBoostForListing(listing);
         }}
+        onSendMessageToAdvertiser={handleSendMessageToAdvertiser}
+      />
+
+      <ConversationsModal
+        isOpen={isConversationsModalOpen}
+        onClose={() => setIsConversationsModalOpen(false)}
+        currentUser={currentUser}
+        conversations={conversations}
+        activeConversationId={activeConversationId}
+        onSelectConversation={(id) => handleOpenConversation(id)}
+        onSendMessage={handleSendConversationReply}
+        onOpenListingById={(listingId) => {
+          const found = listings.find((l) => l.id === listingId);
+          if (found) {
+            setIsConversationsModalOpen(false);
+            setSelectedListing(found);
+          }
+        }}
       />
 
       <PostListingWizard
@@ -1707,6 +1902,33 @@ export default function App() {
         reasonMessage={authReasonMessage}
         onAuthSuccess={handleAuthSuccess}
       />
+
+      {currentUser && (
+        <EmailVerificationModal
+          isOpen={isEmailVerifyModalOpen}
+          onClose={() => {
+            setIsEmailVerifyModalOpen(false);
+            setPendingPostVerifyAction(null);
+          }}
+          userEmail={currentUser.email}
+          authToken={authToken}
+          alreadySentOnRegister={verifyAlreadySentOnRegister}
+          reasonMessage={verifyReasonMessage}
+          onVerified={(updatedUser) => {
+            setCurrentUser((prev) =>
+              updatedUser ? updatedUser : prev ? { ...prev, emailVerified: true, verified: true } : prev
+            );
+            setIsEmailVerifyModalOpen(false);
+            if (pendingPostVerifyAction === 'post_ad') {
+              setPendingPostVerifyAction(null);
+              setEditingListing(null);
+              setIsPostWizardOpen(true);
+            } else {
+              showToast('Votre adresse e-mail est maintenant vérifiée !');
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

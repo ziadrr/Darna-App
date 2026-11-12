@@ -8,6 +8,8 @@ import type {
   SubscriptionPlan,
   BoostOption,
   PaymentTransaction,
+  ConversationThread,
+  ConversationMessage,
 } from '../types/index.ts';
 import {
   INITIAL_LISTINGS,
@@ -20,6 +22,7 @@ import {
   hashPassword,
   verifyPassword,
   generateSecureToken,
+  generateSixDigitCode,
   hashToken,
 } from '../utils/security.ts';
 import {
@@ -44,6 +47,7 @@ const requireModule = createRequire(import.meta.url);
 export class DarnaPersistentDb {
   private db: any;
   public readonly dbFilePath: string;
+  private readonly isCustomTestDb: boolean;
   private readonly enableCloudSqlSync: boolean;
   private simulateCloudSqlFailure = false;
   private cloudSqlHydrated = false;
@@ -61,6 +65,7 @@ export class DarnaPersistentDb {
       );
     }
 
+    this.isCustomTestDb = Boolean(customDbPath);
     this.enableCloudSqlSync =
       options?.enableCloudSqlSync !== undefined
         ? Boolean(options.enableCloudSqlSync && isCloudSqlConfigured())
@@ -287,6 +292,10 @@ export class DarnaPersistentDb {
             );
         }
 
+        if (!this.isCustomTestDb) {
+          await this.ensureOwnerAdminAccounts(true);
+        }
+
         this.cloudSqlHydrated = true;
         this.lastCloudSqlSyncAt = Date.now();
       } finally {
@@ -366,6 +375,15 @@ export class DarnaPersistentDb {
         idempotency_key TEXT UNIQUE NOT NULL,
         user_id TEXT NOT NULL,
         status TEXT NOT NULL,
+        sort_time INTEGER NOT NULL,
+        data_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        listing_id TEXT NOT NULL,
         sort_time INTEGER NOT NULL,
         data_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -463,6 +481,224 @@ export class DarnaPersistentDb {
           u.createdAt || nowIso,
           nowIso
         );
+      }
+    }
+
+    if (!this.isCustomTestDb) {
+      void this.ensureOwnerAdminAccounts(false);
+    }
+
+    const convCountRow = this.db
+      .prepare('SELECT COUNT(*) as cnt FROM conversations')
+      .get() as { cnt: number };
+    if (!convCountRow || convCountRow.cnt === 0) {
+      const initialConversations: ConversationThread[] = [
+        {
+          id: 'conv-darna-casa-01',
+          listingId: 'darna-casa-01',
+          listingTitle: 'Bel appartement • Casablanca',
+          listingCity: 'Maârif, Casablanca',
+          listingPrice: 7500,
+          listingImage:
+            'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=400&q=80',
+          participantIds: ['user-part-1', 'user-admin-owner'],
+          participantNames: {
+            'user-part-1': 'Karim Bennani',
+            'user-admin-owner': 'Direction Darna (Admin)',
+          },
+          advertiserId: 'user-part-1',
+          advertiserName: 'Karim Bennani',
+          initiatorId: 'user-admin-owner',
+          initiatorName: 'Salma El Fassi (Locataire)',
+          lastMessageText:
+            'Bonjour, oui l’appartement au Maârif est toujours disponible. Souhaitez-vous visiter demain à 17h ?',
+          lastMessageAt: nowIso,
+          unreadCountByUser: { 'user-admin-owner': 1 },
+          messages: [
+            {
+              id: 'msg-init-1',
+              conversationId: 'conv-darna-casa-01',
+              senderId: 'user-admin-owner',
+              senderName: 'Salma El Fassi',
+              senderRole: 'particulier',
+              text: 'Bonjour Karim, votre appartement 2 chambres au Maârif est-il toujours disponible pour une location longue durée ?',
+              createdAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+              read: true,
+            },
+            {
+              id: 'msg-init-2',
+              conversationId: 'conv-darna-casa-01',
+              senderId: 'user-part-1',
+              senderName: 'Karim Bennani',
+              senderRole: 'particulier',
+              text: 'Bonjour, oui l’appartement au Maârif est toujours disponible. Souhaitez-vous visiter demain à 17h ?',
+              createdAt: nowIso,
+              read: false,
+            },
+          ],
+        },
+        {
+          id: 'conv-darna-rabat-02',
+          listingId: 'darna-rabat-02',
+          listingTitle: 'Appartement standing • Rabat Hay Riad',
+          listingCity: 'Hay Riad, Rabat',
+          listingPrice: 11000,
+          listingImage:
+            'https://images.unsplash.com/photo-1512917774080-9991f1c4c750?auto=format&fit=crop&w=400&q=80',
+          participantIds: ['user-pro-1', 'user-admin-owner'],
+          participantNames: {
+            'user-pro-1': 'Atlas Prestige Immobilier',
+            'user-admin-owner': 'Direction Darna (Admin)',
+          },
+          advertiserId: 'user-pro-1',
+          advertiserName: 'Atlas Prestige Immobilier',
+          initiatorId: 'user-admin-owner',
+          initiatorName: 'Omar Tazi (Locataire)',
+          lastMessageText:
+            'Le bail est conforme à la loi 67-12 avec 2 mois de caution. Nous restons à votre disposition.',
+          lastMessageAt: new Date(Date.now() - 1800 * 1000).toISOString(),
+          unreadCountByUser: {},
+          messages: [
+            {
+              id: 'msg-init-3',
+              conversationId: 'conv-darna-rabat-02',
+              senderId: 'user-admin-owner',
+              senderName: 'Omar Tazi',
+              senderRole: 'particulier',
+              text: 'Bonjour, quelles sont les conditions du bail pour cet appartement à Hay Riad ?',
+              createdAt: new Date(Date.now() - 5400 * 1000).toISOString(),
+              read: true,
+            },
+            {
+              id: 'msg-init-4',
+              conversationId: 'conv-darna-rabat-02',
+              senderId: 'user-pro-1',
+              senderName: 'Atlas Prestige Immobilier',
+              senderRole: 'professionnel',
+              text: 'Le bail est conforme à la loi 67-12 avec 2 mois de caution. Nous restons à votre disposition.',
+              createdAt: new Date(Date.now() - 1800 * 1000).toISOString(),
+              read: true,
+            },
+          ],
+        },
+      ];
+
+      const insertConv = this.db.prepare(
+        'INSERT INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      for (const conv of initialConversations) {
+        insertConv.run(
+          conv.id,
+          conv.listingId,
+          new Date(conv.lastMessageAt).getTime() || Date.now(),
+          JSON.stringify(conv),
+          conv.lastMessageAt,
+          nowIso
+        );
+      }
+    }
+  }
+
+  public async ensureOwnerAdminAccounts(syncRemote = false): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+    const defaultAdminPass = process.env.OWNER_ADMIN_INITIAL_PASSWORD || 'DarnaAdmin2026!';
+
+    const ownerProfiles = [
+      {
+        id: 'user-admin-owner',
+        email: 'ayarziad@gmail.com',
+        firstName: 'Ziad',
+        lastName: 'Ayar',
+        name: 'Ziad Ayar (Propriétaire Admin)',
+      },
+      {
+        id: 'user-admin-reda',
+        email: 'ghenamreda62@gmail.com',
+        firstName: 'Karim',
+        lastName: 'Benani',
+        name: 'Karim Benani (Propriétaire Admin)',
+      },
+      {
+        id: 'user-admin-1',
+        email: 'admin@darna.ma',
+        firstName: 'Direction',
+        lastName: 'Darna',
+        name: 'Direction Darna (Admin)',
+      },
+    ];
+
+    for (const owner of ownerProfiles) {
+      const existing = this.getUserByEmail(owner.email);
+      if (existing) {
+        if (
+          existing.user.role !== 'admin' ||
+          existing.user.emailVerified !== true ||
+          existing.user.verified !== true
+        ) {
+          const upgraded: User = {
+            ...existing.user,
+            role: 'admin',
+            verified: true,
+            emailVerified: true,
+            subscription: {
+              planId: existing.user.subscription?.planId || 'agence',
+              planName: existing.user.subscription?.planName || 'Administrateur Propriétaire',
+              status: 'active',
+              maxListings: 999,
+              startedAt: existing.user.subscription?.startedAt || nowIso,
+              expiresAt: existing.user.subscription?.expiresAt || nextYearIso,
+            },
+          };
+          this.db
+            .prepare(
+              'UPDATE users SET role = ?, data_json = ?, updated_at = ? WHERE email = ?'
+            )
+            .run('admin', JSON.stringify(upgraded), nowIso, owner.email);
+          if (syncRemote && this.enableCloudSqlSync) {
+            await syncUserToCloudSql(upgraded, existing.passwordHash);
+          }
+        }
+      } else {
+        const adminUser: User = {
+          id: owner.id,
+          firstName: owner.firstName,
+          lastName: owner.lastName,
+          name: owner.name,
+          email: owner.email,
+          phone: '0661000000',
+          role: 'admin',
+          advertiserType: 'professionnel',
+          verified: true,
+          emailVerified: true,
+          favorites: ['darna-casa-01'],
+          subscription: {
+            planId: 'agence',
+            planName: 'Administrateur Propriétaire',
+            status: 'active',
+            maxListings: 999,
+            startedAt: nowIso,
+            expiresAt: nextYearIso,
+          },
+          createdAt: nowIso.split('T')[0],
+        };
+        const pwdHash = hashPassword(defaultAdminPass);
+        this.db
+          .prepare(
+            'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          )
+          .run(
+            adminUser.id,
+            adminUser.email,
+            pwdHash,
+            'admin',
+            JSON.stringify(adminUser),
+            nowIso,
+            nowIso
+          );
+        if (syncRemote && this.enableCloudSqlSync) {
+          await syncUserToCloudSql(adminUser, pwdHash);
+        }
       }
     }
   }
@@ -727,7 +963,7 @@ export class DarnaPersistentDb {
   }
 
   /**
-   * Generates a single-use cryptographic token to verify ownership of an email address.
+   * Generates a single-use 6-digit numeric code to verify ownership of an email address.
    */
   public async createEmailVerificationToken(
     userId: string,
@@ -735,11 +971,11 @@ export class DarnaPersistentDb {
     ttlMs = 15 * 60 * 1000
   ): Promise<string> {
     this.assertCloudSqlWritable();
-    const rawVerifyToken = generateSecureToken(24);
-    const tokenHash = hashToken(rawVerifyToken);
+    const rawVerifyCode = generateSixDigitCode();
+    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
+    const tokenHash = hashToken(`${taggedEmail}:${rawVerifyCode}`);
     const expiresAt = Date.now() + ttlMs;
     const nowIso = new Date().toISOString();
-    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
 
     if (this.enableCloudSqlSync) {
       await syncPasswordResetTokenToCloudSql(
@@ -751,17 +987,22 @@ export class DarnaPersistentDb {
       );
     }
 
+    // Invalidate any previous unused verification code for this user/email
+    this.db
+      .prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ? AND email = ?')
+      .run(userId, taggedEmail);
+
     this.db
       .prepare(
-        'INSERT INTO password_reset_tokens (token_hash, user_id, email, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)'
+        'INSERT OR REPLACE INTO password_reset_tokens (token_hash, user_id, email, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)'
       )
       .run(tokenHash, userId, taggedEmail, expiresAt, nowIso);
 
-    return rawVerifyToken;
+    return rawVerifyCode;
   }
 
   /**
-   * Validates and consumes a single-use cryptographic email verification token.
+   * Validates and consumes a single-use 6-digit email verification code (or magic link code).
    */
   public async consumeEmailVerificationToken(
     userId: string,
@@ -770,16 +1011,20 @@ export class DarnaPersistentDb {
   ): Promise<User | null> {
     this.assertCloudSqlWritable();
     if (!userId || !email || !rawVerifyToken) return null;
-    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
-    const tokenHash = hashToken(rawVerifyToken.trim());
+    const cleanCode = rawVerifyToken.trim().replace(/\s+/g, '');
+    if (!cleanCode) return null;
 
-    const row = this.db
+    const taggedEmail = `verify:${email.trim().toLowerCase()}`;
+    const scopedTokenHash = hashToken(`${taggedEmail}:${cleanCode}`);
+    const legacyTokenHash = hashToken(cleanCode);
+
+    const row = (this.db
       .prepare(
-        'SELECT user_id, email, expires_at, used FROM password_reset_tokens WHERE token_hash = ?'
+        'SELECT token_hash, user_id, email, expires_at, used FROM password_reset_tokens WHERE token_hash = ? OR token_hash = ?'
       )
-      .get(tokenHash) as
-      | { user_id: string; email: string; expires_at: number; used: number }
-      | undefined;
+      .get(scopedTokenHash, legacyTokenHash) as
+      | { token_hash: string; user_id: string; email: string; expires_at: number; used: number }
+      | undefined);
 
     if (!row) return null;
     if (row.used !== 0) return null;
@@ -792,7 +1037,7 @@ export class DarnaPersistentDb {
 
     if (this.enableCloudSqlSync) {
       await syncPasswordResetTokenToCloudSql(
-        tokenHash,
+        row.token_hash,
         row.user_id,
         row.email,
         row.expires_at,
@@ -802,7 +1047,7 @@ export class DarnaPersistentDb {
 
     this.db
       .prepare('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?')
-      .run(tokenHash);
+      .run(row.token_hash);
 
     user.emailVerified = true;
     user.verified = true;
@@ -1112,6 +1357,175 @@ export class DarnaPersistentDb {
       .run(tx.status, JSON.stringify(tx), nowIso, tx.id);
 
     return tx;
+  }
+
+  // ==========================================================================
+  // CONVERSATIONS & INTERNAL MESSAGING
+  // ==========================================================================
+
+  public getAllConversations(): ConversationThread[] {
+    const rows = this.db
+      .prepare('SELECT data_json FROM conversations ORDER BY sort_time DESC')
+      .all() as { data_json: string }[];
+    return rows.map((r) => JSON.parse(r.data_json) as ConversationThread);
+  }
+
+  public getConversationsForUser(user: User): ConversationThread[] {
+    const all = this.getAllConversations();
+    if (user.role === 'admin') {
+      return all;
+    }
+    return all.filter(
+      (c) =>
+        c.participantIds.includes(user.id) ||
+        c.advertiserId === user.id ||
+        c.initiatorId === user.id
+    );
+  }
+
+  public getConversationById(id: string): ConversationThread | null {
+    const row = this.db
+      .prepare('SELECT data_json FROM conversations WHERE id = ?')
+      .get(id) as { data_json: string } | undefined;
+    return row ? (JSON.parse(row.data_json) as ConversationThread) : null;
+  }
+
+  public sendConversationMessage(params: {
+    listing?: Listing | null;
+    sender: User;
+    text: string;
+    conversationId?: string;
+  }): ConversationThread {
+    const nowIso = new Date().toISOString();
+    const cleanText = String(params.text || '').trim().slice(0, 1500);
+
+    let thread: ConversationThread | null = null;
+    if (params.conversationId) {
+      thread = this.getConversationById(params.conversationId);
+    } else if (params.listing) {
+      const all = this.getAllConversations();
+      thread =
+        all.find(
+          (c) =>
+            c.listingId === params.listing!.id &&
+            (c.initiatorId === params.sender.id || c.participantIds.includes(params.sender.id))
+        ) || null;
+    }
+
+    const msgId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    if (thread) {
+      const newMessage: ConversationMessage = {
+        id: msgId,
+        conversationId: thread.id,
+        senderId: params.sender.id,
+        senderName: params.sender.name,
+        senderRole: params.sender.role,
+        text: cleanText,
+        createdAt: nowIso,
+        read: false,
+      };
+      const participantIds = Array.from(new Set([...thread.participantIds, params.sender.id]));
+      const participantNames = {
+        ...thread.participantNames,
+        [params.sender.id]: params.sender.name,
+      };
+      const unreadCountByUser = { ...thread.unreadCountByUser };
+      for (const pid of participantIds) {
+        if (pid !== params.sender.id) {
+          unreadCountByUser[pid] = (unreadCountByUser[pid] || 0) + 1;
+        }
+      }
+      const updatedThread: ConversationThread = {
+        ...thread,
+        participantIds,
+        participantNames,
+        lastMessageText: cleanText,
+        lastMessageAt: nowIso,
+        unreadCountByUser,
+        messages: [...thread.messages, newMessage],
+      };
+
+      this.db
+        .prepare(
+          'UPDATE conversations SET sort_time = ?, data_json = ?, updated_at = ? WHERE id = ?'
+        )
+        .run(Date.now(), JSON.stringify(updatedThread), nowIso, updatedThread.id);
+      return updatedThread;
+    }
+
+    const listing = params.listing!;
+    const convId = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const advertiserId = listing.userId || 'user-part-1';
+    const advertiserName = listing.contact?.name || 'Annonceur Darna';
+    const participantIds = Array.from(new Set([params.sender.id, advertiserId]));
+    const unreadCountByUser: Record<string, number> = {};
+    if (advertiserId !== params.sender.id) {
+      unreadCountByUser[advertiserId] = 1;
+    }
+
+    const firstMessage: ConversationMessage = {
+      id: msgId,
+      conversationId: convId,
+      senderId: params.sender.id,
+      senderName: params.sender.name,
+      senderRole: params.sender.role,
+      text: cleanText,
+      createdAt: nowIso,
+      read: false,
+    };
+
+    const newThread: ConversationThread = {
+      id: convId,
+      listingId: listing.id,
+      listingTitle: listing.title,
+      listingCity: `${listing.district}, ${listing.city}`,
+      listingPrice: listing.price,
+      listingImage: listing.images?.[0],
+      participantIds,
+      participantNames: {
+        [params.sender.id]: params.sender.name,
+        [advertiserId]: advertiserName,
+      },
+      advertiserId,
+      advertiserName,
+      initiatorId: params.sender.id,
+      initiatorName: params.sender.name,
+      lastMessageText: cleanText,
+      lastMessageAt: nowIso,
+      unreadCountByUser,
+      messages: [firstMessage],
+    };
+
+    this.db
+      .prepare(
+        'INSERT INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+      .run(convId, listing.id, Date.now(), JSON.stringify(newThread), nowIso, nowIso);
+
+    return newThread;
+  }
+
+  public markConversationRead(
+    conversationId: string,
+    userId: string
+  ): ConversationThread | null {
+    const thread = this.getConversationById(conversationId);
+    if (!thread) return null;
+    const nowIso = new Date().toISOString();
+    const unreadCountByUser = { ...thread.unreadCountByUser, [userId]: 0 };
+    const messages = thread.messages.map((m) =>
+      m.senderId !== userId ? { ...m, read: true } : m
+    );
+    const updated: ConversationThread = {
+      ...thread,
+      unreadCountByUser,
+      messages,
+    };
+    this.db
+      .prepare('UPDATE conversations SET data_json = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(updated), nowIso, conversationId);
+    return updated;
   }
 
   public close(): void {
