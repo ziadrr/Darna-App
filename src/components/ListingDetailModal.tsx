@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   MapPin,
@@ -63,21 +63,34 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   onSendMessageToAdvertiser,
 }) => {
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
+  const [isGalleryPaused, setIsGalleryPaused] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [contactMessageSent, setContactMessageSent] = useState(false);
   const [messageText, setMessageText] = useState('');
+
+  const images =
+    listing && listing.images?.length > 0
+      ? listing.images
+      : [
+          'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80',
+        ];
+
+  useEffect(() => {
+    setActivePhotoIdx(0);
+  }, [listing?.id]);
+
+  useEffect(() => {
+    if (!isOpen || !listing || images.length <= 1 || isGalleryPaused) return;
+    const timer = window.setInterval(() => {
+      setActivePhotoIdx((prev) => (prev + 1) % images.length);
+    }, 3500);
+    return () => window.clearInterval(timer);
+  }, [isOpen, listing, images.length, isGalleryPaused]);
 
   if (!isOpen || !listing) return null;
 
   const isSponsored = isListingBoostActive(listing);
   const isOwner = Boolean(currentUser && currentUser.id === listing.userId);
-
-  const images =
-    listing.images?.length > 0
-      ? listing.images
-      : [
-          'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80',
-        ];
 
   const handleShare = () => {
     const shareUrl = `${window.location.origin}/?annonce=${encodeURIComponent(listing.id)}`;
@@ -197,11 +210,15 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
           )}
 
           {/* Photo Gallery Carousel */}
-          <div className="relative rounded-2xl overflow-hidden bg-stone-900 aspect-[16/10] sm:aspect-[16/9] shadow-md">
+          <div
+            onMouseEnter={() => setIsGalleryPaused(true)}
+            onMouseLeave={() => setIsGalleryPaused(false)}
+            className="relative rounded-2xl overflow-hidden bg-stone-900 aspect-[16/10] sm:aspect-[16/9] shadow-md"
+          >
             <img
               src={images[activePhotoIdx] || images[0]}
               alt={`${listing.title} - photo ${activePhotoIdx + 1}`}
-              className="w-full h-full object-cover transition-all duration-300"
+              className="w-full h-full object-cover transition-all duration-500"
             />
 
             {images.length > 1 && (
