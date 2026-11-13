@@ -280,6 +280,31 @@ export function createDarnaApiApp(
   const aiTtsIpLimiter = new Map<string, { count: number; resetAt: number }>();
   const aiImageUserLimiter = new Map<string, { count: number; resetAt: number }>();
   const aiImageIpLimiter = new Map<string, { count: number; resetAt: number }>();
+  const conversationMessageUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const conversationNewThreadUserLimiter = new Map<string, { count: number; resetAt: number }>();
+
+  function consumeUserRateLimit(
+    userMap: Map<string, { count: number; resetAt: number }>,
+    userId: string,
+    maxRequests: number,
+    windowMs: number,
+    commit = true
+  ): boolean {
+    const now = Date.now();
+    const entry = userMap.get(userId);
+    const currentCount = entry && now < entry.resetAt ? entry.count : 0;
+    if (currentCount >= maxRequests) {
+      return false;
+    }
+    if (commit) {
+      if (!entry || now >= entry.resetAt) {
+        userMap.set(userId, { count: 1, resetAt: now + windowMs });
+      } else {
+        entry.count += 1;
+      }
+    }
+    return true;
+  }
 
   function consumeDualRateLimit(
     userMap: Map<string, { count: number; resetAt: number }>,
@@ -546,11 +571,25 @@ export function createDarnaApiApp(
 
     const existing = db.getUserByEmail(normalizedEmail);
     if (existing) {
-      // Only link to an existing account if its email was already verified or verified by the provider token
+      // Promote to admin only after verified provider token confirms email ownership
+      const isAdmin = isConfiguredAdminEmail(normalizedEmail);
+      const nowIso = new Date().toISOString();
+      const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
       const updatedUser: User = {
         ...existing.user,
+        role: isAdmin ? 'admin' : existing.user.role,
         emailVerified: true,
         verified: true,
+        subscription: isAdmin
+          ? {
+              planId: existing.user.subscription?.planId || 'agence',
+              planName: existing.user.subscription?.planName || 'Administrateur',
+              status: 'active',
+              maxListings: 999,
+              startedAt: existing.user.subscription?.startedAt || nowIso,
+              expiresAt: existing.user.subscription?.expiresAt || nextYearIso,
+            }
+          : existing.user.subscription,
       };
       const saved = await db.updateUser(updatedUser);
       const token = await db.createSession(saved.id);
@@ -644,13 +683,9 @@ export function createDarnaApiApp(
         });
       }
 
-      // Never trust client-supplied role: only configured ADMIN_EMAILS can receive 'admin'
-      const isAuthorizedAdminEmail = isConfiguredAdminEmail(normalizedEmail);
-      const role: User['role'] = isAuthorizedAdminEmail
-        ? 'admin'
-        : advertiserType === 'professionnel'
-        ? 'professionnel'
-        : 'particulier';
+      // Never auto-promote at registration: everyone starts as particulier/professionnel with emailVerified=false
+      const role: User['role'] =
+        advertiserType === 'professionnel' ? 'professionnel' : 'particulier';
 
       const plans = db.getAllPlans();
       const defaultPlan = plans.find((p) => p.id === 'particulier') || plans[0];
@@ -666,14 +701,14 @@ export function createDarnaApiApp(
         phone: phone ? String(phone).trim() : '',
         role,
         advertiserType: advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
-        verified: isAuthorizedAdminEmail,
-        emailVerified: isAuthorizedAdminEmail,
+        verified: false,
+        emailVerified: false,
         favorites: [],
         subscription: {
           planId: defaultPlan.id,
           planName: defaultPlan.name,
           status: 'active',
-          maxListings: isAuthorizedAdminEmail ? 999 : defaultPlan.maxListings,
+          maxListings: defaultPlan.maxListings,
           startedAt: nowIso,
           expiresAt: nextYearIso,
         },
@@ -741,7 +776,7 @@ export function createDarnaApiApp(
         });
       }
 
-      let user = db.verifyUserCredentials(normalizedEmail, String(password));
+      const user = db.verifyUserCredentials(normalizedEmail, String(password));
       if (!user) {
         if (!attemptEntry || now >= attemptEntry.resetAt) {
           loginRateLimiter.set(loginKey, { count: 1, resetAt: now + 5 * 60_000 });
@@ -751,32 +786,6 @@ export function createDarnaApiApp(
         return res.status(401).json({
           success: false,
           message: 'Adresse e-mail ou mot de passe incorrect.',
-        });
-      }
-
-      if (isConfiguredAdminEmail(user.email)) {
-        if (user.role !== 'admin' || !user.emailVerified || !user.verified) {
-          user = await db.updateUser({
-            ...user,
-            role: 'admin',
-            verified: true,
-            emailVerified: true,
-            subscription: {
-              planId: user.subscription?.planId || 'agence',
-              planName: user.subscription?.planName || 'Administrateur Propriétaire',
-              status: 'active',
-              maxListings: 999,
-              startedAt: user.subscription?.startedAt || new Date().toISOString(),
-              expiresAt:
-                user.subscription?.expiresAt ||
-                new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-            },
-          });
-        }
-      } else if (user.role === 'admin') {
-        user = await db.updateUser({
-          ...user,
-          role: user.advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
         });
       }
 
@@ -1474,43 +1483,10 @@ export function createDarnaApiApp(
     }
   });
 
-  app.get('/api/auth/me', async (req, res) => {
-    let viewer = getAuthUser(req);
+  app.get('/api/auth/me', (req, res) => {
+    const viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({ success: false, user: null });
-    }
-    if (isConfiguredAdminEmail(viewer.email)) {
-      if (viewer.role !== 'admin' || !viewer.emailVerified || !viewer.verified) {
-        try {
-          viewer = await db.updateUser({
-            ...viewer,
-            role: 'admin',
-            verified: true,
-            emailVerified: true,
-            subscription: {
-              planId: viewer.subscription?.planId || 'agence',
-              planName: viewer.subscription?.planName || 'Administrateur Propriétaire',
-              status: 'active',
-              maxListings: 999,
-              startedAt: viewer.subscription?.startedAt || new Date().toISOString(),
-              expiresAt:
-                viewer.subscription?.expiresAt ||
-                new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-            },
-          });
-        } catch (err) {
-          console.error('Error auto-promoting owner admin in /api/auth/me:', err);
-        }
-      }
-    } else if (viewer.role === 'admin') {
-      try {
-        viewer = await db.updateUser({
-          ...viewer,
-          role: viewer.advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
-        });
-      } catch (err) {
-        console.error('Error demoting non-admin in /api/auth/me:', err);
-      }
     }
     res.json({ success: true, user: viewer });
   });
@@ -3055,6 +3031,15 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: 'Veuillez vous connecter pour envoyer un message.',
       });
     }
+    if (viewer.emailVerified !== true) {
+      return res.status(403).json({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        message:
+          'Veuillez vérifier votre adresse e-mail avant de pouvoir envoyer des messages aux annonceurs.',
+      });
+    }
+
     const rawText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
     const conversationId =
       typeof req.body?.conversationId === 'string' ? req.body.conversationId.trim() : undefined;
@@ -3082,8 +3067,8 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       });
     }
 
+    let existingConv = conversationId ? db.getConversationById(conversationId) : null;
     if (conversationId) {
-      const existingConv = db.getConversationById(conversationId);
       if (!existingConv) {
         return res.status(404).json({
           success: false,
@@ -3091,20 +3076,92 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         });
       }
       const isParticipant =
-        viewer.role === 'admin' ||
         existingConv.participantIds.includes(viewer.id) ||
         existingConv.advertiserId === viewer.id ||
         existingConv.initiatorId === viewer.id;
       if (!isParticipant) {
         return res.status(403).json({
           success: false,
+          code: 'FORBIDDEN_CONVERSATION_ACCESS',
           message: 'Accès non autorisé à cette conversation.',
         });
       }
       if (!listing) {
         listing = db.getListingById(existingConv.listingId);
       }
+    } else if (listing) {
+      existingConv =
+        db
+          .getAllConversations()
+          .find(
+            (c) =>
+              c.listingId === listing!.id &&
+              (c.initiatorId === viewer.id || c.participantIds.includes(viewer.id))
+          ) || null;
     }
+
+    if (!existingConv && listing && listing.userId === viewer.id) {
+      return res.status(403).json({
+        success: false,
+        code: 'SELF_MESSAGE_FORBIDDEN',
+        message: 'Vous ne pouvez pas envoyer un message à votre propre annonce.',
+      });
+    }
+
+    const maxMessagesPerHour = Number(process.env.CONVERSATION_MESSAGE_RATE_LIMIT || 30);
+    const maxNewConversationsPerHour = Number(process.env.CONVERSATION_NEW_THREAD_RATE_LIMIT || 5);
+    const oneHourMs = 60 * 60 * 1000;
+
+    if (
+      !consumeUserRateLimit(
+        conversationMessageUserLimiter,
+        viewer.id,
+        maxMessagesPerHour,
+        oneHourMs,
+        false
+      )
+    ) {
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message:
+          'Limite atteinte : vous ne pouvez pas envoyer plus de 30 messages par heure. Veuillez patienter avant de réessayer.',
+      });
+    }
+
+    if (!existingConv) {
+      if (
+        !consumeUserRateLimit(
+          conversationNewThreadUserLimiter,
+          viewer.id,
+          maxNewConversationsPerHour,
+          oneHourMs,
+          false
+        )
+      ) {
+        return res.status(429).json({
+          success: false,
+          code: 'RATE_LIMIT_EXCEEDED',
+          message:
+            'Limite atteinte : vous ne pouvez pas démarrer plus de 5 nouvelles conversations par heure. Veuillez patienter avant de réessayer.',
+        });
+      }
+      consumeUserRateLimit(
+        conversationNewThreadUserLimiter,
+        viewer.id,
+        maxNewConversationsPerHour,
+        oneHourMs,
+        true
+      );
+    }
+
+    consumeUserRateLimit(
+      conversationMessageUserLimiter,
+      viewer.id,
+      maxMessagesPerHour,
+      oneHourMs,
+      true
+    );
 
     const conversation = db.sendConversationMessage({
       listing,
@@ -3129,11 +3186,26 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: 'Authentification requise.',
       });
     }
-    const updated = db.markConversationRead(req.params.id, viewer.id);
-    if (!updated) {
+    if (viewer.emailVerified !== true) {
+      return res.status(403).json({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Veuillez vérifier votre adresse e-mail pour accéder à la messagerie.',
+      });
+    }
+    const existingConv = db.getConversationById(req.params.id);
+    if (!existingConv) {
       return res.status(404).json({
         success: false,
         message: 'Conversation introuvable.',
+      });
+    }
+    const updated = db.markConversationRead(req.params.id, viewer.id);
+    if (!updated) {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN_CONVERSATION_ACCESS',
+        message: 'Accès non autorisé à cette conversation.',
       });
     }
     return res.json({

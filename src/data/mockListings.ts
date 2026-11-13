@@ -155,7 +155,7 @@ export const INITIAL_USERS: User[] = [
     firstName: 'Équipe Modération',
     lastName: 'Darna',
     name: 'Équipe Modération Darna',
-    email: 'admin@darna.ma',
+    email: 'moderation@example.com',
     phone: '0537707070',
     role: 'admin',
     city: 'Rabat',

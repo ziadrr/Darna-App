@@ -24,6 +24,7 @@ import {
   generateSecureToken,
   generateSixDigitCode,
   hashToken,
+  isConfiguredAdminEmail,
 } from '../utils/security.ts';
 import {
   isCloudSqlConfigured,
@@ -600,124 +601,72 @@ export class DarnaPersistentDb {
   }
 
   public async ensureOwnerAdminAccounts(syncRemote = false): Promise<void> {
-    const nowIso = new Date().toISOString();
-    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
-    const defaultAdminPass = process.env.OWNER_ADMIN_INITIAL_PASSWORD || 'DarnaAdmin2026!';
-
-    // Remove the previously seeded 'user-admin-reda' entry if it was auto-seeded as admin,
-    // or demote any non-admin account back to particulier
-    const redaRecord = this.getUserByEmail('ghenamreda62@gmail.com');
-    if (redaRecord && redaRecord.user.role === 'admin') {
-      const demotedReda: User = {
-        ...redaRecord.user,
-        name: 'Karim Benani',
-        role: 'particulier',
-        advertiserType: 'particulier',
-        subscription: {
-          planId: 'particulier',
-          planName: 'Particulier',
-          status: 'active',
-          maxListings: 3,
-          startedAt: redaRecord.user.subscription?.startedAt || nowIso,
-          expiresAt: redaRecord.user.subscription?.expiresAt || nextYearIso,
-        },
-      };
-      this.db
-        .prepare('UPDATE users SET role = ?, data_json = ?, updated_at = ? WHERE email = ?')
-        .run('particulier', JSON.stringify(demotedReda), nowIso, 'ghenamreda62@gmail.com');
-      if (syncRemote && this.enableCloudSqlSync) {
-        await syncUserToCloudSql(demotedReda, redaRecord.passwordHash);
-      }
+    const initialPassword = (process.env.OWNER_ADMIN_INITIAL_PASSWORD || '').trim();
+    if (!initialPassword || initialPassword.length < 12) {
+      console.warn(
+        '[Security] OWNER_ADMIN_INITIAL_PASSWORD is not defined or is shorter than 12 characters. No initial admin account was created.'
+      );
+      return;
     }
 
-    const ownerProfiles = [
-      {
-        id: 'user-admin-owner',
-        email: 'ayarziad@gmail.com',
-        firstName: 'Ziad',
-        lastName: 'Ayar',
-        name: 'Ziad Ayar (Propriétaire Admin)',
-      },
-      {
-        id: 'user-admin-1',
-        email: 'admin@darna.ma',
-        firstName: 'Direction',
-        lastName: 'Darna',
-        name: 'Direction Darna (Admin)',
-      },
-    ];
+    const adminEmails = (process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean);
 
-    for (const owner of ownerProfiles) {
-      const existing = this.getUserByEmail(owner.email);
+    if (adminEmails.length === 0) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
+    for (const email of adminEmails) {
+      const existing = this.getUserByEmail(email);
       if (existing) {
-        if (
-          existing.user.role !== 'admin' ||
-          existing.user.emailVerified !== true ||
-          existing.user.verified !== true
-        ) {
-          const upgraded: User = {
-            ...existing.user,
-            role: 'admin',
-            verified: true,
-            emailVerified: true,
-            subscription: {
-              planId: existing.user.subscription?.planId || 'agence',
-              planName: existing.user.subscription?.planName || 'Administrateur Propriétaire',
-              status: 'active',
-              maxListings: 999,
-              startedAt: existing.user.subscription?.startedAt || nowIso,
-              expiresAt: existing.user.subscription?.expiresAt || nextYearIso,
-            },
-          };
-          this.db
-            .prepare(
-              'UPDATE users SET role = ?, data_json = ?, updated_at = ? WHERE email = ?'
-            )
-            .run('admin', JSON.stringify(upgraded), nowIso, owner.email);
-          if (syncRemote && this.enableCloudSqlSync) {
-            await syncUserToCloudSql(upgraded, existing.passwordHash);
-          }
-        }
-      } else {
-        const adminUser: User = {
-          id: owner.id,
-          firstName: owner.firstName,
-          lastName: owner.lastName,
-          name: owner.name,
-          email: owner.email,
-          phone: '0661000000',
-          role: 'admin',
-          advertiserType: 'professionnel',
-          verified: true,
-          emailVerified: true,
-          favorites: ['darna-casa-01'],
-          subscription: {
-            planId: 'agence',
-            planName: 'Administrateur Propriétaire',
-            status: 'active',
-            maxListings: 999,
-            startedAt: nowIso,
-            expiresAt: nextYearIso,
-          },
-          createdAt: nowIso.split('T')[0],
-        };
-        const pwdHash = hashPassword(defaultAdminPass);
-        this.db
-          .prepare(
-            'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-          )
-          .run(
-            adminUser.id,
-            adminUser.email,
-            pwdHash,
-            'admin',
-            JSON.stringify(adminUser),
-            nowIso,
-            nowIso
-          );
-        if (syncRemote && this.enableCloudSqlSync) {
-          await syncUserToCloudSql(adminUser, pwdHash);
-        }
+        continue;
+      }
+
+      const localPart = email.split('@')[0] || 'Admin';
+      const firstName = localPart.charAt(0).toUpperCase() + localPart.slice(1);
+      const adminUser: User = {
+        id: `user-admin-${hashToken(email).slice(0, 10)}`,
+        firstName,
+        lastName: 'Admin',
+        name: `${firstName} Admin`,
+        email,
+        phone: '',
+        role: 'admin',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Administrateur',
+          status: 'active',
+          maxListings: 999,
+          startedAt: nowIso,
+          expiresAt: nextYearIso,
+        },
+        createdAt: nowIso.split('T')[0],
+      };
+      const pwdHash = hashPassword(initialPassword);
+      this.db
+        .prepare(
+          'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )
+        .run(
+          adminUser.id,
+          adminUser.email,
+          pwdHash,
+          'admin',
+          JSON.stringify(adminUser),
+          nowIso,
+          nowIso
+        );
+      if (syncRemote && this.enableCloudSqlSync) {
+        await syncUserToCloudSql(adminUser, pwdHash);
       }
     }
   }
@@ -1070,6 +1019,19 @@ export class DarnaPersistentDb {
 
     user.emailVerified = true;
     user.verified = true;
+    if (isConfiguredAdminEmail(user.email)) {
+      const nowIso = new Date().toISOString();
+      const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+      user.role = 'admin';
+      user.subscription = {
+        planId: user.subscription?.planId || 'agence',
+        planName: user.subscription?.planName || 'Administrateur',
+        status: 'active',
+        maxListings: 999,
+        startedAt: user.subscription?.startedAt || nowIso,
+        expiresAt: user.subscription?.expiresAt || nextYearIso,
+      };
+    }
     const updatedUser = await this.updateUser(user);
     return updatedUser;
   }
@@ -1531,6 +1493,12 @@ export class DarnaPersistentDb {
   ): ConversationThread | null {
     const thread = this.getConversationById(conversationId);
     if (!thread) return null;
+    const isParticipant =
+      thread.participantIds.includes(userId) ||
+      thread.advertiserId === userId ||
+      thread.initiatorId === userId;
+    if (!isParticipant) return null;
+
     const nowIso = new Date().toISOString();
     const unreadCountByUser = { ...thread.unreadCountByUser, [userId]: 0 };
     const messages = thread.messages.map((m) =>

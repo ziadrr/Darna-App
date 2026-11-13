@@ -97,7 +97,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       os.tmpdir(),
       `darna-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
     );
-    process.env.ADMIN_EMAILS = 'ayarziad@gmail.com,superadmin@darna.ma';
+    process.env.ADMIN_EMAILS = 'superadmin@example.com,owner@example.com';
 
     smtpServer = createLocalTestSmtpServer();
     smtpPort = await smtpServer.start();
@@ -262,21 +262,76 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       assert.equal(data.code, 'FORBIDDEN_ADMIN_ONLY');
     }
 
+    // Registering with an ADMIN_EMAILS address MUST NOT grant admin at registration (must start as non-admin with emailVerified=false)
     const regAdminRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        firstName: 'Ziad',
-        lastName: 'Ayar',
-        email: 'ayarziad@gmail.com',
+        firstName: 'Admin',
+        lastName: 'Principal',
+        email: 'superadmin@example.com',
         password: 'AdminStrong2026!',
         termsAccepted: true,
       }),
     });
     const regAdminData = await regAdminRes.json();
     assert.equal(regAdminRes.status, 201);
-    assert.equal(regAdminData.user.role, 'admin');
+    assert.equal(
+      regAdminData.user.role,
+      'particulier',
+      'Admin email must NOT be promoted to admin before email verification'
+    );
+    assert.equal(regAdminData.user.emailVerified, false);
     const adminToken = regAdminData.token as string;
+
+    // Before email verification, login and /api/auth/me must NOT auto-promote to admin
+    const loginBeforeVerifyRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'superadmin@example.com',
+        password: 'AdminStrong2026!',
+      }),
+    });
+    const loginBeforeVerifyData = await loginBeforeVerifyRes.json();
+    assert.equal(loginBeforeVerifyRes.status, 200);
+    assert.equal(loginBeforeVerifyData.user.role, 'particulier');
+    assert.equal(loginBeforeVerifyData.user.emailVerified, false);
+
+    const meBeforeVerifyRes = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    const meBeforeVerifyData = await meBeforeVerifyRes.json();
+    assert.equal(meBeforeVerifyRes.status, 200);
+    assert.equal(meBeforeVerifyData.user.role, 'particulier');
+
+    // Unverified admin email must be rejected from admin endpoints (403)
+    const unverifiedAdminMonRes = await fetch(`${baseUrl}/api/admin/monetization`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.equal(unverifiedAdminMonRes.status, 403);
+
+    // Verify the email with a 6-digit verification code -> account is NOW promoted to 'admin'
+    const verifyCode = await dbInstance.createEmailVerificationToken(
+      regAdminData.user.id,
+      'superadmin@example.com'
+    );
+    const verifyAdminRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ code: verifyCode }),
+    });
+    const verifyAdminData = await verifyAdminRes.json();
+    assert.equal(verifyAdminRes.status, 200);
+    assert.equal(verifyAdminData.user.emailVerified, true);
+    assert.equal(
+      verifyAdminData.user.role,
+      'admin',
+      'Configured admin email must be promoted to admin after successful email verification'
+    );
 
     const adminMonRes = await fetch(`${baseUrl}/api/admin/monetization`, {
       headers: { Authorization: `Bearer ${adminToken}` },
@@ -1527,55 +1582,281 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(magicData.user.emailVerified, true);
   });
 
-  it('18. supports owner admin accounts and authenticated conversations endpoints (/api/conversations)', async () => {
-    // 1. Unauthenticated visitors receive 401 on GET /api/conversations
+  it('18. enforces OWNER_ADMIN_INITIAL_PASSWORD requirement, strict ADMIN_EMAILS with no default, and messaging security (emailVerified, self-listing block, rate limits, participant access control)', async () => {
+    // 1. With empty ADMIN_EMAILS env, isConfiguredAdminEmail returns false for everything
+    const savedAdminEmails = process.env.ADMIN_EMAILS;
+    delete process.env.ADMIN_EMAILS;
+    const { isConfiguredAdminEmail } = await import('../src/utils/security.ts');
+    assert.equal(isConfiguredAdminEmail('superadmin@example.com'), false);
+    assert.equal(isConfiguredAdminEmail('admin@example.com'), false);
+    process.env.ADMIN_EMAILS = savedAdminEmails;
+
+    // 2. Without OWNER_ADMIN_INITIAL_PASSWORD (or < 12 chars), ensureOwnerAdminAccounts creates NO admin account and logs a warning
+    const isolatedDbPath = path.join(
+      os.tmpdir(),
+      `darna-no-admin-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
+    );
+    const isolatedDb = new DarnaPersistentDb(isolatedDbPath);
+    try {
+      delete process.env.OWNER_ADMIN_INITIAL_PASSWORD;
+      await isolatedDb.ensureOwnerAdminAccounts(false);
+      const adminsWhenMissing = isolatedDb.getAllUsers().filter((u) => u.role === 'admin');
+      assert.equal(
+        adminsWhenMissing.length,
+        0,
+        'No admin account may be created when OWNER_ADMIN_INITIAL_PASSWORD is not set'
+      );
+
+      process.env.OWNER_ADMIN_INITIAL_PASSWORD = 'short';
+      await isolatedDb.ensureOwnerAdminAccounts(false);
+      const adminsWhenShort = isolatedDb.getAllUsers().filter((u) => u.role === 'admin');
+      assert.equal(
+        adminsWhenShort.length,
+        0,
+        'No admin account may be created when OWNER_ADMIN_INITIAL_PASSWORD is shorter than 12 chars'
+      );
+
+      process.env.OWNER_ADMIN_INITIAL_PASSWORD = 'ValidInitialAdminPass2026!';
+      await isolatedDb.ensureOwnerAdminAccounts(false);
+      const adminsWhenValid = isolatedDb.getAllUsers().filter((u) => u.role === 'admin');
+      assert.equal(
+        adminsWhenValid.length,
+        2,
+        'Configured ADMIN_EMAILS should be created when OWNER_ADMIN_INITIAL_PASSWORD >= 12 chars'
+      );
+    } finally {
+      delete process.env.OWNER_ADMIN_INITIAL_PASSWORD;
+      isolatedDb.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        const f = `${isolatedDbPath}${suffix}`;
+        if (fs.existsSync(f)) {
+          try {
+            fs.unlinkSync(f);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    // 3. Unauthenticated visitors receive 401 on GET /api/conversations
     const unauthConvRes = await fetch(`${baseUrl}/api/conversations`);
     assert.equal(unauthConvRes.status, 401);
 
-    // 2. Owner admin login (ayarziad@gmail.com registered in Test 3) can list all conversations and send replies
-    const adminLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+    // 4. Unverified user cannot send messages or mark conversations read (403 EMAIL_NOT_VERIFIED)
+    const unverifiedRegRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Forwarded-For': '198.51.100.245',
+        'X-Forwarded-For': '198.51.100.241',
       },
       body: JSON.stringify({
-        email: 'ayarziad@gmail.com',
-        password: 'AdminStrong2026!',
+        firstName: 'Mehdi',
+        lastName: 'NonVerifie',
+        email: 'mehdi.unverified@example.ma',
+        password: 'MehdiPass2026!',
+        termsAccepted: true,
       }),
     });
-    const adminLoginData = await adminLoginRes.json();
-    assert.equal(adminLoginRes.status, 200);
-    assert.equal(adminLoginData.user.role, 'admin');
-    const adminToken = adminLoginData.token;
+    const unverifiedRegData = await unverifiedRegRes.json();
+    assert.equal(unverifiedRegRes.status, 201);
+    const unverifiedToken = unverifiedRegData.token as string;
 
-    const listConvRes = await fetch(`${baseUrl}/api/conversations`, {
-      headers: { Authorization: `Bearer ${adminToken}` },
-    });
-    const listConvData = await listConvRes.json();
-    assert.equal(listConvRes.status, 200);
-    assert.equal(listConvData.success, true);
-    assert.ok(Array.isArray(listConvData.conversations) && listConvData.conversations.length >= 2);
-
-    const firstConvId = listConvData.conversations[0].id;
-    const replyRes = await fetch(`${baseUrl}/api/conversations`, {
+    const unverifiedMsgRes = await fetch(`${baseUrl}/api/conversations`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
+        Authorization: `Bearer ${unverifiedToken}`,
       },
       body: JSON.stringify({
-        conversationId: firstConvId,
-        text: 'Bonjour, message de test depuis le compte Propriétaire Admin.',
+        listingId: 'darna-casa-01',
+        text: 'Puis-je visiter ?',
       }),
     });
-    const replyData = await replyRes.json();
-    assert.equal(replyRes.status, 201);
-    assert.equal(replyData.success, true);
-    assert.equal(
-      replyData.conversation.lastMessageText,
-      'Bonjour, message de test depuis le compte Propriétaire Admin.'
+    const unverifiedMsgData = await unverifiedMsgRes.json();
+    assert.equal(unverifiedMsgRes.status, 403);
+    assert.equal(unverifiedMsgData.code, 'EMAIL_NOT_VERIFIED');
+
+    // Verify Mehdi's email so he can use messaging
+    const mehdiCode = await dbInstance.createEmailVerificationToken(
+      unverifiedRegData.user.id,
+      'mehdi.unverified@example.ma'
     );
+    const verifyMehdiRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${unverifiedToken}`,
+      },
+      body: JSON.stringify({ code: mehdiCode }),
+    });
+    assert.equal(verifyMehdiRes.status, 200);
+
+    // 5. Create a listing owned by Mehdi and verify he CANNOT message his own listing (403 SELF_MESSAGE_FORBIDDEN)
+    const ownListingRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${unverifiedToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Studio Maarif Test Messagerie',
+        description: 'Bel appartement studio meublé au coeur du Maarif à Casablanca.',
+        category: 'studio',
+        price: 4500,
+        period: 'mois',
+        surface: 45,
+        rooms: 1,
+        bedrooms: 1,
+        bathrooms: 1,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: ['https://images.unsplash.com/photo-1522708323590-d24dbb6b0267'],
+      }),
+    });
+    const ownListingData = await ownListingRes.json();
+    assert.equal(ownListingRes.status, 201);
+
+    const selfMsgRes = await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${unverifiedToken}`,
+      },
+      body: JSON.stringify({
+        listingId: ownListingData.listing.id,
+        text: 'Je m’écris à moi-même.',
+      }),
+    });
+    const selfMsgData = await selfMsgRes.json();
+    assert.equal(selfMsgRes.status, 403);
+    assert.equal(selfMsgData.code, 'SELF_MESSAGE_FORBIDDEN');
+
+    // 6. Access denied (403) when trying to reply to or mark read another user's conversation
+    const otherConvReplyRes = await fetch(`${baseUrl}/api/conversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${unverifiedToken}`,
+      },
+      body: JSON.stringify({
+        conversationId: 'conv-darna-casa-01',
+        text: 'Tentative d’intrusion dans la conversation d’un tiers.',
+      }),
+    });
+    assert.equal(otherConvReplyRes.status, 403);
+
+    const otherConvReadRes = await fetch(`${baseUrl}/api/conversations/conv-darna-casa-01/read`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${unverifiedToken}`,
+      },
+    });
+    assert.equal(otherConvReadRes.status, 403);
+    assert.equal(
+      dbInstance.markConversationRead('conv-darna-casa-01', unverifiedRegData.user.id),
+      null,
+      'markConversationRead must return null when userId is not a participant'
+    );
+
+    // 7. Rate limit: max 5 new conversations/hour per user (6th new conversation returns 429)
+    process.env.CONVERSATION_NEW_THREAD_RATE_LIMIT = '5';
+    process.env.CONVERSATION_MESSAGE_RATE_LIMIT = '30';
+    try {
+      const targetListings = ['darna-casa-01', 'darna-rabat-02', 'darna-marrakech-03', 'darna-tanger-04', 'darna-casa-05'];
+      for (let i = 0; i < 5; i++) {
+        const lid = targetListings[i];
+        if (!dbInstance.getListingById(lid)) {
+          await dbInstance.createListing({
+            ...ownListingData.listing,
+            id: lid,
+            userId: 'user-pro-1',
+            title: `Annonce Test ${i + 1}`,
+          });
+        }
+        const convRes = await fetch(`${baseUrl}/api/conversations`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${unverifiedToken}`,
+          },
+          body: JSON.stringify({
+            listingId: lid,
+            text: `Bonjour pour annonce ${i + 1}`,
+          }),
+        });
+        assert.equal(convRes.status, 201, `New conversation ${i + 1}/5 should succeed`);
+      }
+
+      // 6th new conversation must be blocked with 429
+      await dbInstance.createListing({
+        ...ownListingData.listing,
+        id: 'darna-sixth-conv-listing',
+        userId: 'user-pro-1',
+        title: 'Sixième annonce test',
+      });
+      const sixthNewConvRes = await fetch(`${baseUrl}/api/conversations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${unverifiedToken}`,
+        },
+        body: JSON.stringify({
+          listingId: 'darna-sixth-conv-listing',
+          text: 'Sixième nouvelle conversation en 1h',
+        }),
+      });
+      const sixthNewConvData = await sixthNewConvRes.json();
+      assert.equal(sixthNewConvRes.status, 429);
+      assert.equal(sixthNewConvData.code, 'RATE_LIMIT_EXCEEDED');
+
+      // 8. Rate limit: max 30 messages/hour per user (after 5 messages sent above, sending 25 more in existing thread succeeds, 31st returns 429)
+      const mehdiConvsRes = await fetch(`${baseUrl}/api/conversations`, {
+        headers: { Authorization: `Bearer ${unverifiedToken}` },
+      });
+      const mehdiConvsData = await mehdiConvsRes.json();
+      const firstMehdiConvId = mehdiConvsData.conversations[0].id as string;
+
+      // Participant can mark their own conversation read
+      const validReadRes = await fetch(`${baseUrl}/api/conversations/${firstMehdiConvId}/read`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${unverifiedToken}` },
+      });
+      assert.equal(validReadRes.status, 200);
+
+      for (let m = 6; m <= 30; m++) {
+        const msgRes = await fetch(`${baseUrl}/api/conversations`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${unverifiedToken}`,
+          },
+          body: JSON.stringify({
+            conversationId: firstMehdiConvId,
+            text: `Message suivi numéro ${m}`,
+          }),
+        });
+        assert.equal(msgRes.status, 201, `Message ${m}/30 should succeed`);
+      }
+
+      const msg31Res = await fetch(`${baseUrl}/api/conversations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${unverifiedToken}`,
+        },
+        body: JSON.stringify({
+          conversationId: firstMehdiConvId,
+          text: 'Message 31 au-delà du quota horaire',
+        }),
+      });
+      const msg31Data = await msg31Res.json();
+      assert.equal(msg31Res.status, 429);
+      assert.equal(msg31Data.code, 'RATE_LIMIT_EXCEEDED');
+    } finally {
+      delete process.env.CONVERSATION_NEW_THREAD_RATE_LIMIT;
+      delete process.env.CONVERSATION_MESSAGE_RATE_LIMIT;
+    }
   });
 });
 
