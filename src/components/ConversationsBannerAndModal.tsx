@@ -255,7 +255,7 @@ export const ConversationsModal: React.FC<ConversationsModalProps> = ({
         {/* Main 2-column content */}
         <div className="flex-1 flex flex-col md:flex-row min-h-0">
           {/* Left column: Threads list */}
-          <div className="w-full md:w-80 border-b md:border-b-0 md:border-r border-stone-200 overflow-y-auto bg-stone-50/60">
+          <div className="w-full md:w-80 max-h-44 md:max-h-none shrink-0 border-b md:border-b-0 md:border-r border-stone-200 overflow-y-auto overscroll-contain touch-pan-y bg-stone-50/60">
             {conversations.length === 0 ? (
               <div className="p-6 text-center text-xs text-stone-500">
                 Aucune conversation pour le moment. Ouvrez une annonce pour envoyer un message à un propriétaire.
@@ -339,7 +339,7 @@ export const ConversationsModal: React.FC<ConversationsModalProps> = ({
                 </div>
 
                 {/* Messages stream */}
-                <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#FAF7F2]/50">
+                <div className="flex-1 overflow-y-auto overscroll-contain touch-pan-y p-4 space-y-3 bg-[#FAF7F2]/50">
                   {activeThread.messages.map((msg) => {
                     const isMine = msg.senderId === currentUser.id;
                     return (

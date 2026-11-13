@@ -1112,7 +1112,7 @@ export default function App() {
           {/* Zone 2: Clean Centered Primary Navigation Links */}
           <nav
             aria-label="Navigation principale"
-            className="hidden md:flex items-center gap-1 bg-stone-100/90 p-1.5 rounded-full border border-stone-200/80 shrink-0"
+            className="hidden md:flex items-center gap-1 bg-stone-100/90 p-1.5 rounded-full border border-stone-200/80 overflow-x-auto scrollbar-none touch-pan-x max-w-full"
           >
             <button
               type="button"
@@ -1236,6 +1236,38 @@ export default function App() {
               </button>
             </div>
 
+            {/* Mobile/Tablet Quick Conversations & Admin buttons (visible when main nav is hidden < md) */}
+            <button
+              type="button"
+              onClick={() => handleOpenConversation()}
+              className="md:hidden relative flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-800 border border-stone-300 text-xs font-bold transition-all whitespace-nowrap shrink-0"
+              title="Conversations"
+            >
+              <MessageSquare className="w-3.5 h-3.5 text-[#C15C3D] shrink-0" />
+              <span>Conversations</span>
+              {currentUser && conversations.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-[#1E3D34] text-white text-[10px] font-bold">
+                  {conversations.length}
+                </span>
+              )}
+            </button>
+
+            {currentUser?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={() => setCurrentView('admin')}
+                className={`md:hidden flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-bold border transition-all whitespace-nowrap shrink-0 ${
+                  currentView === 'admin'
+                    ? 'bg-stone-900 text-amber-300 border-stone-900'
+                    : 'bg-stone-100 text-stone-800 border-stone-300'
+                }`}
+                title="Administration"
+              >
+                <Shield className="w-3.5 h-3.5 shrink-0" />
+                <span>Admin</span>
+              </button>
+            )}
+
             {/* CTA "+ Déposer une annonce" */}
             <button
               type="button"
@@ -1281,7 +1313,7 @@ export default function App() {
       </header>
 
       {/* MAIN CONTAINER */}
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-7">
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 pt-6 pb-24 sm:pb-10 space-y-7">
         {/* Simple Email Verification Reminder Banner for Unverified Users */}
         {currentUser && !currentUser.emailVerified && (
           <div
@@ -1705,7 +1737,7 @@ export default function App() {
       {/* BOTTOM MOBILE NAVIGATION BAR */}
       <nav
         aria-label="Navigation mobile"
-        className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-stone-200 px-2 py-2 flex items-center justify-around"
+        className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-stone-200 px-2 py-2 flex items-center justify-around overflow-x-auto scrollbar-none touch-pan-x"
       >
         <button
           type="button"
@@ -1750,6 +1782,37 @@ export default function App() {
           <Heart className="w-5 h-5" />
           <span className="text-[10px] whitespace-nowrap">{t.favorites}</span>
         </button>
+
+        <button
+          type="button"
+          onClick={() => handleOpenConversation()}
+          className={`relative flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+            isConversationsModalOpen ? 'text-[#C15C3D] font-bold' : 'text-stone-500'
+          }`}
+        >
+          <div className="relative">
+            <MessageSquare className="w-5 h-5" />
+            {currentUser && conversations.length > 0 && (
+              <span className="absolute -top-1.5 -right-2 min-w-[15px] h-[15px] px-1 rounded-full bg-[#C15C3D] text-white text-[9px] font-extrabold flex items-center justify-center">
+                {conversations.length}
+              </span>
+            )}
+          </div>
+          <span className="text-[10px] whitespace-nowrap">Conversations</span>
+        </button>
+
+        {currentUser?.role === 'admin' && (
+          <button
+            type="button"
+            onClick={() => setCurrentView('admin')}
+            className={`flex-1 flex flex-col items-center gap-1 py-1 transition-colors ${
+              currentView === 'admin' ? 'text-stone-900 font-bold' : 'text-stone-500'
+            }`}
+          >
+            <Shield className="w-5 h-5 text-[#C15C3D]" />
+            <span className="text-[10px] whitespace-nowrap">Admin</span>
+          </button>
+        )}
 
         <button
           type="button"

@@ -92,7 +92,7 @@ export function isConfiguredAdminEmail(email: string, envAdminEmails?: string): 
   const rawList =
     envAdminEmails !== undefined
       ? envAdminEmails
-      : process.env.ADMIN_EMAILS || 'ayarziad@gmail.com,ghenamreda62@gmail.com,admin@darna.ma';
+      : process.env.ADMIN_EMAILS || 'ayarziad@gmail.com,admin@darna.ma';
   const allowedList = rawList
     .split(',')
     .map((e) => e.trim().toLowerCase())

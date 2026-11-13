@@ -754,25 +754,29 @@ export function createDarnaApiApp(
         });
       }
 
-      if (
-        isConfiguredAdminEmail(user.email) &&
-        (user.role !== 'admin' || !user.emailVerified || !user.verified)
-      ) {
+      if (isConfiguredAdminEmail(user.email)) {
+        if (user.role !== 'admin' || !user.emailVerified || !user.verified) {
+          user = await db.updateUser({
+            ...user,
+            role: 'admin',
+            verified: true,
+            emailVerified: true,
+            subscription: {
+              planId: user.subscription?.planId || 'agence',
+              planName: user.subscription?.planName || 'Administrateur Propriétaire',
+              status: 'active',
+              maxListings: 999,
+              startedAt: user.subscription?.startedAt || new Date().toISOString(),
+              expiresAt:
+                user.subscription?.expiresAt ||
+                new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+            },
+          });
+        }
+      } else if (user.role === 'admin') {
         user = await db.updateUser({
           ...user,
-          role: 'admin',
-          verified: true,
-          emailVerified: true,
-          subscription: {
-            planId: user.subscription?.planId || 'agence',
-            planName: user.subscription?.planName || 'Administrateur Propriétaire',
-            status: 'active',
-            maxListings: 999,
-            startedAt: user.subscription?.startedAt || new Date().toISOString(),
-            expiresAt:
-              user.subscription?.expiresAt ||
-              new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-          },
+          role: user.advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
         });
       }
 
@@ -1475,29 +1479,37 @@ export function createDarnaApiApp(
     if (!viewer) {
       return res.status(401).json({ success: false, user: null });
     }
-    if (
-      isConfiguredAdminEmail(viewer.email) &&
-      (viewer.role !== 'admin' || !viewer.emailVerified || !viewer.verified)
-    ) {
+    if (isConfiguredAdminEmail(viewer.email)) {
+      if (viewer.role !== 'admin' || !viewer.emailVerified || !viewer.verified) {
+        try {
+          viewer = await db.updateUser({
+            ...viewer,
+            role: 'admin',
+            verified: true,
+            emailVerified: true,
+            subscription: {
+              planId: viewer.subscription?.planId || 'agence',
+              planName: viewer.subscription?.planName || 'Administrateur Propriétaire',
+              status: 'active',
+              maxListings: 999,
+              startedAt: viewer.subscription?.startedAt || new Date().toISOString(),
+              expiresAt:
+                viewer.subscription?.expiresAt ||
+                new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
+            },
+          });
+        } catch (err) {
+          console.error('Error auto-promoting owner admin in /api/auth/me:', err);
+        }
+      }
+    } else if (viewer.role === 'admin') {
       try {
         viewer = await db.updateUser({
           ...viewer,
-          role: 'admin',
-          verified: true,
-          emailVerified: true,
-          subscription: {
-            planId: viewer.subscription?.planId || 'agence',
-            planName: viewer.subscription?.planName || 'Administrateur Propriétaire',
-            status: 'active',
-            maxListings: 999,
-            startedAt: viewer.subscription?.startedAt || new Date().toISOString(),
-            expiresAt:
-              viewer.subscription?.expiresAt ||
-              new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
-          },
+          role: viewer.advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
         });
       } catch (err) {
-        console.error('Error auto-promoting owner admin in /api/auth/me:', err);
+        console.error('Error demoting non-admin in /api/auth/me:', err);
       }
     }
     res.json({ success: true, user: viewer });

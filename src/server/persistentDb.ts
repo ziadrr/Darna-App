@@ -604,6 +604,32 @@ export class DarnaPersistentDb {
     const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
     const defaultAdminPass = process.env.OWNER_ADMIN_INITIAL_PASSWORD || 'DarnaAdmin2026!';
 
+    // Remove the previously seeded 'user-admin-reda' entry if it was auto-seeded as admin,
+    // or demote any non-admin account back to particulier
+    const redaRecord = this.getUserByEmail('ghenamreda62@gmail.com');
+    if (redaRecord && redaRecord.user.role === 'admin') {
+      const demotedReda: User = {
+        ...redaRecord.user,
+        name: 'Karim Benani',
+        role: 'particulier',
+        advertiserType: 'particulier',
+        subscription: {
+          planId: 'particulier',
+          planName: 'Particulier',
+          status: 'active',
+          maxListings: 3,
+          startedAt: redaRecord.user.subscription?.startedAt || nowIso,
+          expiresAt: redaRecord.user.subscription?.expiresAt || nextYearIso,
+        },
+      };
+      this.db
+        .prepare('UPDATE users SET role = ?, data_json = ?, updated_at = ? WHERE email = ?')
+        .run('particulier', JSON.stringify(demotedReda), nowIso, 'ghenamreda62@gmail.com');
+      if (syncRemote && this.enableCloudSqlSync) {
+        await syncUserToCloudSql(demotedReda, redaRecord.passwordHash);
+      }
+    }
+
     const ownerProfiles = [
       {
         id: 'user-admin-owner',
@@ -611,13 +637,6 @@ export class DarnaPersistentDb {
         firstName: 'Ziad',
         lastName: 'Ayar',
         name: 'Ziad Ayar (Propriétaire Admin)',
-      },
-      {
-        id: 'user-admin-reda',
-        email: 'ghenamreda62@gmail.com',
-        firstName: 'Karim',
-        lastName: 'Benani',
-        name: 'Karim Benani (Propriétaire Admin)',
       },
       {
         id: 'user-admin-1',

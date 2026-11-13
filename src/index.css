@@ -7,11 +7,17 @@
     --font-arabic: 'Tajawal', sans-serif;
   }
 
+  html,
   body {
     font-family: var(--font-sans);
     background-color: #FAF7F2;
     color: #292524;
     -webkit-tap-highlight-color: transparent;
+    -webkit-overflow-scrolling: touch;
+    scroll-behavior: smooth;
+    overflow-x: hidden;
+    overflow-y: auto;
+    touch-action: manipulation;
   }
 
   [dir="rtl"] {
@@ -27,7 +33,16 @@
   font-family: 'Tajawal', sans-serif;
 }
 
-/* Custom scrollbar for mobile feel */
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Custom scrollbar for desktop & touch feel */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

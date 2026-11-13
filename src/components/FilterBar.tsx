@@ -179,8 +179,25 @@ export const FilterBar: React.FC<FilterBarProps> = ({
         </div>
       </div>
 
-      {/* Horizontal Category Cards (All 11 Categories) */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1.5 scrollbar-none">
+      {/* Horizontal Category Cards (All 11 Categories — touch swipe & pointer drag enabled) */}
+      <div
+        className="flex items-center gap-2 overflow-x-auto pb-1.5 scrollbar-none touch-pan-x overscroll-x-contain cursor-grab active:cursor-grabbing select-none"
+        onMouseDown={(e) => {
+          const el = e.currentTarget;
+          const startX = e.pageX - el.offsetLeft;
+          const scrollLeft = el.scrollLeft;
+          const onMove = (moveEvent: MouseEvent) => {
+            const x = moveEvent.pageX - el.offsetLeft;
+            el.scrollLeft = scrollLeft - (x - startX);
+          };
+          const onUp = () => {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+          };
+          window.addEventListener('mousemove', onMove);
+          window.addEventListener('mouseup', onUp);
+        }}
+      >
         <button
           onClick={() => onChangeFilters({ ...filters, category: 'all' })}
           className={`px-3.5 py-2.5 rounded-2xl border text-xs font-bold shrink-0 transition-all flex items-center gap-2 ${
