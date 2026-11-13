@@ -730,8 +730,17 @@ export function createDarnaApiApp(
             verificationToken: rawCode,
           });
           verificationEmailSent = mailResult.sent;
+          if (!mailResult.sent) {
+            console.error(
+              '[POST /api/auth/register]',
+              mailResult.errorMessage || 'Automatic verification email send failed'
+            );
+          }
         } catch (mailErr) {
-          console.error('Automatic verification email on register failed:', mailErr);
+          console.error(
+            '[POST /api/auth/register]',
+            mailErr instanceof Error ? mailErr.message : 'Automatic verification email failed'
+          );
         }
       }
 
@@ -743,7 +752,10 @@ export function createDarnaApiApp(
         smtpConfigured,
       });
     } catch (err: any) {
-      console.error('Error in POST /api/auth/register:', err);
+      console.error(
+        '[POST /api/auth/register]',
+        err instanceof Error ? err.message : 'Registration error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',
@@ -793,7 +805,10 @@ export function createDarnaApiApp(
       const token = await db.createSession(user.id);
       return res.json({ success: true, user, token });
     } catch (err: any) {
-      console.error('Error in POST /api/auth/login:', err);
+      console.error(
+        '[POST /api/auth/login]',
+        err instanceof Error ? err.message : 'Login error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',
@@ -881,6 +896,10 @@ export function createDarnaApiApp(
         });
 
         if (!mailResult.sent) {
+          console.error(
+            '[POST /api/auth/request-email-verification]',
+            mailResult.errorMessage || 'Verification email delivery failed'
+          );
           return res.status(502).json({
             success: false,
             emailSent: false,
@@ -901,7 +920,10 @@ export function createDarnaApiApp(
           'Si un compte correspond à cette adresse e-mail, un code de vérification (valable 15 minutes) a été envoyé.',
       });
     } catch (err) {
-      console.error('Error in POST /api/auth/request-email-verification:', err);
+      console.error(
+        '[POST /api/auth/request-email-verification]',
+        err instanceof Error ? err.message : 'Request email verification error'
+      );
       return res.status(503).json({
         success: false,
         emailSent: false,
@@ -988,7 +1010,10 @@ export function createDarnaApiApp(
         message: 'Votre adresse e-mail est maintenant vérifiée !',
       });
     } catch (err) {
-      console.error('Error in POST /api/auth/verify-email:', err);
+      console.error(
+        '[POST /api/auth/verify-email]',
+        err instanceof Error ? err.message : 'Verify email error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',
@@ -1065,7 +1090,10 @@ export function createDarnaApiApp(
       }
       return res.redirect('/?email_verified=1');
     } catch (err) {
-      console.error('Error in GET /api/auth/verify-email-link:', err);
+      console.error(
+        '[GET /api/auth/verify-email-link]',
+        err instanceof Error ? err.message : 'Magic link verification error'
+      );
       return res.redirect('/?email_verified=0');
     }
   });
@@ -1303,7 +1331,10 @@ export function createDarnaApiApp(
         token: result.token,
       });
     } catch (error) {
-      console.error('Social login error:', error);
+      console.error(
+        '[POST /api/auth/social-login]',
+        error instanceof Error ? error.message : 'Social login error'
+      );
       return res.status(500).json({
         success: false,
         message: 'Erreur serveur lors de la vérification de la connexion sociale.',
@@ -1363,6 +1394,10 @@ export function createDarnaApiApp(
         });
 
         if (!mailResult.sent) {
+          console.error(
+            '[POST /api/auth/request-password-reset]',
+            mailResult.errorMessage || 'Password reset email delivery failed'
+          );
           return res.status(502).json({
             success: false,
             emailSent: false,
@@ -1383,7 +1418,10 @@ export function createDarnaApiApp(
             'Un e-mail contenant votre code de réinitialisation sécurisé (valable 15 minutes) a été envoyé.',
         });
       } catch (err) {
-        console.error('Error in POST /api/auth/request-password-reset:', err);
+        console.error(
+          '[POST /api/auth/request-password-reset]',
+          err instanceof Error ? err.message : 'Request password reset error'
+        );
         return res.status(503).json({
           success: false,
           emailSent: false,
@@ -1437,7 +1475,10 @@ export function createDarnaApiApp(
         message: 'Votre mot de passe a été mis à jour de façon sécurisée. Vous pouvez maintenant vous connecter.',
       });
     } catch (err) {
-      console.error('Error in POST /api/auth/reset-password:', err);
+      console.error(
+        '[POST /api/auth/reset-password]',
+        err instanceof Error ? err.message : 'Reset password error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',
@@ -1454,7 +1495,10 @@ export function createDarnaApiApp(
       }
       return res.json({ success: true });
     } catch (err) {
-      console.error('Error in POST /api/auth/logout:', err);
+      console.error(
+        '[POST /api/auth/logout]',
+        err instanceof Error ? err.message : 'Logout error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',
@@ -1484,11 +1528,19 @@ export function createDarnaApiApp(
   });
 
   app.get('/api/auth/me', (req, res) => {
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({ success: false, user: null });
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({ success: false, user: null });
+      }
+      return res.json({ success: true, user: viewer });
+    } catch (err) {
+      console.error(
+        '[GET /api/auth/me]',
+        err instanceof Error ? err.message : 'Get current user error'
+      );
+      return res.status(500).json({ success: false, user: null });
     }
-    res.json({ success: true, user: viewer });
   });
 
   app.post('/api/auth/favorites', async (req, res) => {
@@ -1510,7 +1562,10 @@ export function createDarnaApiApp(
       await db.updateUser(viewer);
       return res.json({ success: true, favorites: viewer.favorites });
     } catch (err) {
-      console.error('Error in POST /api/auth/favorites:', err);
+      console.error(
+        '[POST /api/auth/favorites]',
+        err instanceof Error ? err.message : 'Favorites update error'
+      );
       return res.status(503).json({
         success: false,
         code: 'DATABASE_SYNC_FAILED',

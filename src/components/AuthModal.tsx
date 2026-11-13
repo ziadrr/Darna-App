@@ -90,20 +90,47 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     e.preventDefault();
     setError(null);
     setLoading(true);
+    const url = '/api/auth/login';
+    let res: Response;
     try {
-      const res = await fetch('/api/auth/login', {
+      res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const data = await res.json();
+    } catch (err) {
+      console.error(0, url, err);
+      setError('Impossible de joindre le serveur');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const rawText = await res.text();
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        console.error(res.status, url, parseErr);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
+        return;
+      }
       if (!res.ok || !data.success) {
-        setError(data.message || 'Identifiants incorrects.');
+        console.error(res.status, url, data.message || data.code || 'Login failed');
+        setError(
+          data.message ||
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
       } else {
         onAuthSuccess(data.user, data.token, { isNewRegistration: false });
       }
-    } catch {
-      setError('Erreur réseau lors de la connexion. Veuillez réessayer.');
+    } catch (err) {
+      console.error(res.status, url, err);
+      setError(
+        `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+      );
     } finally {
       setLoading(false);
     }
@@ -117,8 +144,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return;
     }
     setLoading(true);
+    const url = '/api/auth/register';
+    let res: Response;
     try {
-      const res = await fetch('/api/auth/register', {
+      res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -131,17 +160,42 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           termsAccepted,
         }),
       });
-      const data = await res.json();
+    } catch (err) {
+      console.error(0, url, err);
+      setError('Impossible de joindre le serveur');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const rawText = await res.text();
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        console.error(res.status, url, parseErr);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
+        return;
+      }
       if (!res.ok || !data.success) {
-        setError(data.message || 'Impossible de créer le compte.');
+        console.error(res.status, url, data.message || data.code || 'Registration failed');
+        setError(
+          data.message ||
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
       } else {
         onAuthSuccess(data.user, data.token, {
           isNewRegistration: true,
           verificationEmailSent: Boolean(data.verificationEmailSent),
         });
       }
-    } catch {
-      setError("Erreur réseau lors de l'inscription. Veuillez réessayer.");
+    } catch (err) {
+      console.error(res.status, url, err);
+      setError(
+        `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+      );
     } finally {
       setLoading(false);
     }
@@ -152,17 +206,38 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setError(null);
     setSuccessMsg(null);
     setLoading(true);
+    const url = '/api/auth/request-password-reset';
+    let res: Response;
     try {
-      const res = await fetch('/api/auth/request-password-reset', {
+      res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
       });
-      const data = await res.json();
+    } catch (err) {
+      console.error(0, url, err);
+      setError('Impossible de joindre le serveur');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const rawText = await res.text();
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        console.error(res.status, url, parseErr);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
+        return;
+      }
       if (!res.ok || !data.success || data.emailSent !== true) {
+        console.error(res.status, url, data.message || data.code || 'Password reset request failed');
         setError(
           data.message ||
-            "Aucun e-mail n'a été envoyé. Vérifiez l'adresse saisie ou la configuration du serveur SMTP."
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
         );
       } else {
         setResetStep('confirm');
@@ -171,8 +246,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             'Un e-mail contenant votre code de réinitialisation sécurisé a été envoyé.'
         );
       }
-    } catch {
-      setError('Erreur lors de la demande de réinitialisation.');
+    } catch (err) {
+      console.error(res.status, url, err);
+      setError(
+        `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+      );
     } finally {
       setLoading(false);
     }
@@ -183,8 +261,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setError(null);
     setSuccessMsg(null);
     setLoading(true);
+    const url = '/api/auth/reset-password';
+    let res: Response;
     try {
-      const res = await fetch('/api/auth/reset-password', {
+      res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -193,9 +273,31 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           newPassword: newResetPassword,
         }),
       });
-      const data = await res.json();
+    } catch (err) {
+      console.error(0, url, err);
+      setError('Impossible de joindre le serveur');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const rawText = await res.text();
+      let data: any;
+      try {
+        data = JSON.parse(rawText);
+      } catch (parseErr) {
+        console.error(res.status, url, parseErr);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
+        return;
+      }
       if (!res.ok || !data.success) {
-        setError(data.message || 'Code de réinitialisation invalide ou expiré.');
+        console.error(res.status, url, data.message || data.code || 'Password reset confirm failed');
+        setError(
+          data.message ||
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
       } else {
         setSuccessMsg(data.message);
         setPassword('');
@@ -203,8 +305,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           switchMode('login');
         }, 1800);
       }
-    } catch {
-      setError('Erreur lors de la validation du nouveau mot de passe.');
+    } catch (err) {
+      console.error(res.status, url, err);
+      setError(
+        `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+      );
     } finally {
       setLoading(false);
     }

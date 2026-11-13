@@ -47,6 +47,8 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
         setInfoMessage(null);
       }
 
+      const url = '/api/auth/request-email-verification';
+      let res: Response;
       try {
         const token = authToken || localStorage.getItem('darna_token');
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -54,17 +56,36 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
           headers['Authorization'] = `Bearer ${token}`;
         }
 
-        const res = await fetch('/api/auth/request-email-verification', {
+        res = await fetch(url, {
           method: 'POST',
           headers,
           body: JSON.stringify({ email: userEmail.trim().toLowerCase() }),
         });
-        const data = await res.json();
+      } catch (err) {
+        console.error(0, url, err);
+        setError('Impossible de joindre le serveur');
+        setSending(false);
+        return;
+      }
+
+      try {
+        const rawText = await res.text();
+        let data: any;
+        try {
+          data = JSON.parse(rawText);
+        } catch (parseErr) {
+          console.error(res.status, url, parseErr);
+          setError(
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+          );
+          return;
+        }
 
         if (!res.ok || !data.success || data.emailSent !== true) {
+          console.error(res.status, url, data.message || data.code || 'Email send failed');
           setError(
             data.message ||
-              "Aucun e-mail n'a été envoyé : le serveur d'envoi d'e-mails (SMTP_HOST) n'est pas encore configuré."
+              `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
           );
         } else {
           setInfoMessage(
@@ -73,8 +94,11 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
               : `Code à 6 chiffres et lien magique envoyés automatiquement à ${userEmail}.`
           );
         }
-      } catch {
-        setError("Erreur réseau lors de l'envoi automatique du code de vérification.");
+      } catch (err) {
+        console.error(res.status, url, err);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
       } finally {
         setSending(false);
       }
@@ -94,6 +118,8 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
       setError(null);
       setInfoMessage(null);
 
+      const url = '/api/auth/verify-email';
+      let res: Response;
       try {
         const token = authToken || localStorage.getItem('darna_token');
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -101,7 +127,7 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
           headers['Authorization'] = `Bearer ${token}`;
         }
 
-        const res = await fetch('/api/auth/verify-email', {
+        res = await fetch(url, {
           method: 'POST',
           headers,
           body: JSON.stringify({
@@ -109,13 +135,33 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
             verificationToken: cleanCode,
           }),
         });
-        const data = await res.json();
+      } catch (err) {
+        console.error(0, url, err);
+        setError('Impossible de joindre le serveur');
+        setVerifying(false);
+        return;
+      }
+
+      try {
+        const rawText = await res.text();
+        let data: any;
+        try {
+          data = JSON.parse(rawText);
+        } catch (parseErr) {
+          console.error(res.status, url, parseErr);
+          setError(
+            `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+          );
+          return;
+        }
 
         if (!res.ok || !data.success) {
+          console.error(res.status, url, data.message || data.code || 'Verification failed');
           setError(
             data.code === 'INVALID_OR_EXPIRED_VERIFICATION_TOKEN'
               ? 'Code à 6 chiffres invalide ou expiré. Vérifiez votre e-mail ou demandez un nouveau code.'
-              : data.message || 'Code à 6 chiffres invalide ou expiré.'
+              : data.message ||
+                  `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
           );
         } else {
           setSuccessMessage('Votre adresse e-mail est maintenant vérifiée !');
@@ -123,8 +169,11 @@ export const EmailVerificationModal: React.FC<EmailVerificationModalProps> = ({
             onVerified(data.user);
           }, 500);
         }
-      } catch {
-        setError('Erreur réseau lors de la vérification du code.');
+      } catch (err) {
+        console.error(res.status, url, err);
+        setError(
+          `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
+        );
       } finally {
         setVerifying(false);
       }
