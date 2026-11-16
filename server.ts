@@ -32,7 +32,11 @@ const initPromise = (async () => {
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, 'dist'), { index: false }));
-    app.get('*', (_req, res) => {
+    app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+    app.get('*', (req, res) => {
+      if (/\.(png|jpe?g|webp|gif|svg|ico|webmanifest|json|js|css|map|txt|xml)$/i.test(req.path)) {
+        return res.status(404).send('Fichier statique introuvable');
+      }
       res.sendFile(path.join(__dirname, 'dist', 'index.html'));
     });
   }

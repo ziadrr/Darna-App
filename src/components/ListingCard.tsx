@@ -11,7 +11,13 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { Listing } from '../types';
-import { formatMAD, isListingBoostActive } from '../utils/rentalLogic';
+import {
+  formatMAD,
+  isListingBoostActive,
+  getListingTransactionType,
+  getTransactionBadgeLabel,
+  hasDemoImages,
+} from '../utils/rentalLogic';
 
 interface ListingCardProps {
   listing: Listing;
@@ -30,9 +36,7 @@ export const ListingCard: React.FC<ListingCardProps> = ({
   const images =
     listing.images && listing.images.length > 0
       ? listing.images
-      : [
-          'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=800&q=80',
-        ];
+      : ['/og-default.png'];
 
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
@@ -54,6 +58,9 @@ export const ListingCard: React.FC<ListingCardProps> = ({
   }, [images.length, isPaused, listing.id]);
 
   const isSponsored = isListingBoostActive(listing);
+  const txType = getListingTransactionType(listing);
+  const txBadgeLabel = getTransactionBadgeLabel(listing);
+  const isDemoOrStock = Boolean(listing.isDemo || hasDemoImages(listing));
 
   const handlePrevPhoto = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -122,6 +129,15 @@ export const ListingCard: React.FC<ListingCardProps> = ({
               <Sparkles className="w-3 h-3 fill-current" /> Sponsorisé
             </span>
           )}
+          <span
+            className={`text-[11px] font-extrabold px-2.5 py-1 rounded-full shadow-xs ${
+              txType === 'vente'
+                ? 'bg-[#C15C3D] text-white'
+                : 'bg-[#1E3D34] text-white'
+            }`}
+          >
+            {txBadgeLabel}
+          </span>
           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-white/95 backdrop-blur-md text-[#1E3D34] shadow-xs border border-stone-200/60 uppercase tracking-wider">
             {listing.category}
           </span>
@@ -134,7 +150,7 @@ export const ListingCard: React.FC<ListingCardProps> = ({
               Particulier
             </span>
           )}
-          {listing.isDemo && (
+          {isDemoOrStock && (
             <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100/95 text-amber-900 border border-amber-300 backdrop-blur-md shadow-xs">
               Annonce de démonstration
             </span>
@@ -198,7 +214,7 @@ export const ListingCard: React.FC<ListingCardProps> = ({
 
           {/* Price */}
           <div className="mt-2.5 font-bold text-[#C15C3D] text-base sm:text-lg">
-            {formatMAD(listing.price, listing.period)}
+            {formatMAD(listing.price, listing.period, listing.transactionType)}
           </div>
         </div>
 

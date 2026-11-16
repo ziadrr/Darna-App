@@ -128,10 +128,11 @@ export default function App() {
 
   // Search & Filter State
   const [filters, setFilters] = useState<ListingFilter>({
+    transactionType: 'all',
     category: 'all',
     city: undefined,
     district: undefined,
-    priceMax: 50000,
+    priceMax: undefined,
     sortBy: 'recent',
     userLat: 33.5731,
     userLng: -7.5898,
@@ -664,7 +665,14 @@ export default function App() {
 
   // Smart Geolocation + Homepage Sponsored Listings for Home View
   const homeDisplayedListings = useMemo(() => {
-    const published = listings.filter((l) => l.status === 'publiee');
+    const published = listings.filter((l) => {
+      if (l.status !== 'publiee') return false;
+      if (filters.transactionType && filters.transactionType !== 'all') {
+        const tx = l.transactionType === 'vente' ? 'vente' : 'location';
+        if (tx !== filters.transactionType) return false;
+      }
+      return true;
+    });
     const sortWithSponsoredAndProximity = (arr: Listing[]) =>
       [...arr].sort((a, b) => {
         const boostDiff = getBoostPriorityWeight(b) - getBoostPriorityWeight(a);
@@ -700,7 +708,14 @@ export default function App() {
       return sortWithSponsoredAndProximity(published).slice(0, 6);
     }
     return published.slice(0, 6);
-  }, [listings, homeProximityMode, userLocation.city, userLocation.lat, userLocation.lng]);
+  }, [
+    listings,
+    filters.transactionType,
+    homeProximityMode,
+    userLocation.city,
+    userLocation.lat,
+    userLocation.lng,
+  ]);
 
   // Favorites Listings List
   const favoriteListingsList = useMemo(() => {
@@ -1356,8 +1371,9 @@ export default function App() {
               }}
               onResetFilters={() =>
                 setFilters({
+                  transactionType: 'all',
                   category: 'all',
-                  priceMax: 50000,
+                  priceMax: undefined,
                   sortBy: 'recent',
                   userLat: userLocation.lat,
                   userLng: userLocation.lng,
@@ -1502,7 +1518,11 @@ export default function App() {
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h1 className="text-2xl font-bold text-stone-900">
-                  Location immobilière au Maroc
+                  {filters.transactionType === 'vente'
+                    ? 'Acheter un bien immobilier au Maroc (À vendre)'
+                    : filters.transactionType === 'location'
+                    ? 'Louer un bien immobilier au Maroc (À louer)'
+                    : 'Louer ou Acheter un bien immobilier au Maroc'}
                 </h1>
                 <p className="text-xs text-stone-500 mt-0.5">
                   {filteredListings.length} annonce(s) disponible(s) selon vos critères
@@ -1528,8 +1548,9 @@ export default function App() {
               onChangeFilters={setFilters}
               onResetFilters={() =>
                 setFilters({
+                  transactionType: 'all',
                   category: 'all',
-                  priceMax: 50000,
+                  priceMax: undefined,
                   sortBy: 'recent',
                   userLat: userLocation.lat,
                   userLng: userLocation.lng,
@@ -1576,8 +1597,9 @@ export default function App() {
                     <button
                       onClick={() =>
                         setFilters({
+                          transactionType: 'all',
                           category: 'all',
-                          priceMax: 50000,
+                          priceMax: undefined,
                           sortBy: 'recent',
                           userLat: userLocation.lat,
                           userLng: userLocation.lng,

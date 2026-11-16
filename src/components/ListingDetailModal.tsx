@@ -28,7 +28,11 @@ import {
   formatMoroccanPhone,
   buildWhatsAppLink,
   getSimilarListings,
-  isListingBoostActive
+  isListingBoostActive,
+  getListingTransactionType,
+  getTransactionBadgeLabel,
+  hasDemoImages,
+  getConfiguredAppOrigin,
 } from '../utils/rentalLogic';
 import { AudioTourPlayer } from './AudioTourPlayer';
 import { SingleLocationMap } from './MoroccoMap';
@@ -66,16 +70,16 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   const [isGalleryPaused, setIsGalleryPaused] = useState(false);
   const [contactMessageSent, setContactMessageSent] = useState(false);
   const [messageText, setMessageText] = useState('');
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const images =
     listing && listing.images?.length > 0
       ? listing.images
-      : [
-          'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80',
-        ];
+      : ['/og-default.png'];
 
   useEffect(() => {
     setActivePhotoIdx(0);
+    setCopiedLink(false);
   }, [listing?.id]);
 
   useEffect(() => {
@@ -90,11 +94,16 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
 
   const isSponsored = isListingBoostActive(listing);
   const isOwner = Boolean(currentUser && currentUser.id === listing.userId);
+  const txType = getListingTransactionType(listing);
+  const txBadgeLabel = getTransactionBadgeLabel(listing);
+  const isDemoOrStock = Boolean(listing.isDemo || hasDemoImages(listing));
 
-  const shareUrl = `${window.location.origin}/?annonce=${encodeURIComponent(listing.id)}`;
-  const shareSummaryText = `${listing.category.toUpperCase()} à ${listing.city} (${listing.district}) — ${formatMAD(
+  const configuredOrigin = getConfiguredAppOrigin();
+  const shareUrl = `${configuredOrigin}/?annonce=${encodeURIComponent(listing.id)}`;
+  const shareSummaryText = `${txBadgeLabel.toUpperCase()} — ${listing.category.toUpperCase()} à ${listing.city} (${listing.district}) — ${formatMAD(
     listing.price,
-    listing.period
+    listing.period,
+    listing.transactionType
   )} (${listing.surface} m²)`;
   const whatsappShareUrl = `https://wa.me/?text=${encodeURIComponent(
     `${shareSummaryText} : ${shareUrl}`
@@ -106,12 +115,22 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
     if (canNativeShare) {
       try {
         await navigator.share({
-          title: `${listing.category} à ${listing.city} - Darna`,
+          title: `${txBadgeLabel} : ${listing.category} à ${listing.city} - Darna`,
           text: shareSummaryText,
           url: shareUrl,
         });
+        return;
       } catch {
         // User cancelled or share failed; WhatsApp fallback button remains available
+      }
+    }
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        setCopiedLink(true);
+        setTimeout(() => setCopiedLink(false), 2500);
+      } catch {
+        // ignore
       }
     }
   };
@@ -151,7 +170,12 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
     !!currentUser && listing.contact.showEmail && Boolean(listing.contact.email);
 
   const whatsappLink = canShowWhatsApp
-    ? buildWhatsAppLink(listing.contact.whatsapp || listing.contact.phone, listing.title)
+    ? buildWhatsAppLink(
+        listing.contact.whatsapp || listing.contact.phone,
+        listing.title,
+        shareUrl,
+        listing.transactionType
+      )
     : '';
 
   const similarListings = getSimilarListings(listing, allListings, 3);
@@ -167,10 +191,19 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
                 <Sparkles className="w-3.5 h-3.5 fill-current" /> Sponsorisé
               </span>
             )}
+            <span
+              className={`text-xs font-extrabold px-2.5 py-1 rounded-full ${
+                txType === 'vente'
+                  ? 'bg-[#C15C3D] text-white'
+                  : 'bg-[#1E3D34] text-white'
+              }`}
+            >
+              {txBadgeLabel}
+            </span>
             <span className="text-xs font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-[#1E3D34]/10 text-[#1E3D34]">
               {listing.category}
             </span>
-            {listing.isDemo && (
+            {isDemoOrStock && (
               <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
                 Annonce de démonstration
               </span>
@@ -195,10 +228,12 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
                 type="button"
                 onClick={handleNativeShare}
                 className="px-3 py-1.5 rounded-xl text-xs font-semibold text-stone-700 hover:text-stone-900 hover:bg-stone-100 transition-colors flex items-center gap-1.5 border border-stone-200"
-                title="Partager l'annonce"
+                title={`Partager (${shareUrl})`}
               >
                 <Share2 className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Partager</span>
+                <span className="hidden sm:inline">
+                  {copiedLink ? 'Lien copié !' : 'Partager'}
+                </span>
               </button>
             ) : null}
             <a
@@ -245,6 +280,11 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
               alt={`${listing.title} - photo ${activePhotoIdx + 1}`}
               className="w-full h-full object-cover transition-all duration-500"
             />
+            {isDemoOrStock && (
+              <div className="absolute top-3 left-3 px-3 py-1 rounded-full bg-amber-100/95 text-amber-950 border border-amber-300 text-[11px] font-bold shadow-xs">
+                Photo d’illustration (Démo — Non contractuelle)
+              </div>
+            )}
 
             {images.length > 1 && (
               <>
@@ -303,12 +343,12 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
 
             <div className="bg-[#FAF7F2] p-4 rounded-2xl border border-stone-200/90 shrink-0 text-left md:text-right">
               <span className="block text-xs uppercase font-bold tracking-wider text-stone-500">
-                Loyer demandé
+                {txType === 'vente' ? 'Prix de vente demandé' : 'Loyer demandé'}
               </span>
               <span className="text-2xl font-extrabold text-[#C15C3D]">
-                {formatMAD(listing.price, listing.period)}
+                {formatMAD(listing.price, listing.period, listing.transactionType)}
               </span>
-              {listing.deposit && (
+              {txType === 'location' && listing.deposit && (
                 <span className="block text-xs text-stone-500 mt-1">
                   Caution : {listing.deposit.toLocaleString('fr-FR')} MAD
                 </span>

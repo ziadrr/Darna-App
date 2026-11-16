@@ -55,8 +55,8 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
 
   return (
     <div className="space-y-10 animate-fade-in pb-8">
-      {/* Test Mode Notice Banner */}
-      <div className="bg-amber-50 border border-amber-300/90 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-2xs">
+      {/* Real Payments Disabled & Simulation Scope Notice Banner */}
+      <div className="bg-amber-50 border border-amber-300/90 rounded-2xl p-4 sm:p-5 space-y-3 shadow-2xs">
         <div className="flex items-start gap-3">
           <div className="w-10 h-10 rounded-xl bg-amber-400/20 border border-amber-400/40 text-amber-900 flex items-center justify-center shrink-0 mt-0.5">
             <ShieldCheck className="w-5 h-5 text-amber-800" />
@@ -64,15 +64,35 @@ export const SubscriptionPlansView: React.FC<SubscriptionPlansViewProps> = ({
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-[11px] font-extrabold uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-amber-400 text-stone-950">
-                Mode Test (Bac à sable)
+                Paiements réels désactivés • Mode Simulation uniquement
               </span>
               <h3 className="font-bold text-sm text-stone-900">
-                Système de paiement en Dirhams (MAD) — Passerelle CMI / Payzone Maroc
+                Système de paiement en Dirhams (MAD) — Passerelle CMI / Payzone Maroc (Bac à sable)
               </h3>
             </div>
             <p className="text-xs text-stone-700 mt-1 leading-relaxed">
-              Les paiements fonctionnent actuellement en <strong>mode test clairement indiqué</strong>. Aucun débit bancaire réel n’est effectué tant que le contrat marchand de production n’est pas activé. Aucune donnée complète de carte bancaire n’est stockée, et toute option payante n’est activée qu’après confirmation effective du paiement.
+              Les paiements bancaires réels sont <strong>strictement désactivés</strong>. Aucun débit bancaire réel n’est effectué et aucune donnée de carte bancaire n’est collectée.
             </p>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-amber-200/80 text-xs">
+          <div className="bg-white/80 p-3 rounded-xl border border-amber-200">
+            <span className="font-bold text-red-800 block mb-1">
+              Désactivé (Aucun débit réel) :
+            </span>
+            <ul className="list-disc list-inside text-stone-700 space-y-0.5 text-[11px]">
+              <li>Débit bancaire réel par carte CMI, Visa ou Mastercard</li>
+              <li>Prélèvement réel Payzone Maroc et facturation automatique</li>
+            </ul>
+          </div>
+          <div className="bg-white/80 p-3 rounded-xl border border-amber-200">
+            <span className="font-bold text-emerald-900 block mb-1">
+              Fonctionne uniquement en simulation (Bac à sable) :
+            </span>
+            <ul className="list-disc list-inside text-stone-700 space-y-0.5 text-[11px]">
+              <li>Activation simulée des offres Particulier et Agence (0 DH débité)</li>
+              <li>Test des badges « Sponsorisé », d’échec bancaire et d’anti-double paiement</li>
+            </ul>
           </div>
         </div>
       </div>

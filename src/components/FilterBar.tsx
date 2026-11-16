@@ -57,12 +57,15 @@ export const FilterBar: React.FC<FilterBarProps> = ({
     (c) => c.name.toLowerCase() === (filters.city || '').toLowerCase()
   );
 
+  const activeTransactionType = filters.transactionType || 'all';
+
   const activeFiltersCount = [
+    filters.transactionType && filters.transactionType !== 'all',
     filters.city && filters.city !== 'all',
     filters.district && filters.district !== 'all',
     filters.category && filters.category !== 'all',
     filters.priceMin !== undefined && filters.priceMin > 0,
-    filters.priceMax !== undefined && filters.priceMax < 50000,
+    filters.priceMax !== undefined && filters.priceMax > 0,
     filters.surfaceMin !== undefined && filters.surfaceMin > 0,
     filters.bedrooms && filters.bedrooms !== 'all',
     filters.furnished !== undefined && filters.furnished !== 'all',
@@ -80,6 +83,71 @@ export const FilterBar: React.FC<FilterBarProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Parcourir : Tout / Louer (À louer) / Acheter (À vendre) */}
+      <div
+        role="tablist"
+        aria-label="Parcours Louer ou Acheter"
+        className="inline-flex flex-wrap items-center gap-1.5 bg-white p-1.5 rounded-2xl border border-stone-200/90 shadow-2xs"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTransactionType === 'all'}
+          onClick={() => onChangeFilters({ ...filters, transactionType: 'all' })}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${
+            activeTransactionType === 'all'
+              ? 'bg-stone-900 text-white shadow-xs'
+              : 'text-stone-600 hover:text-stone-900 hover:bg-stone-100'
+          }`}
+        >
+          Tout (Louer & Acheter)
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTransactionType === 'location'}
+          onClick={() => onChangeFilters({ ...filters, transactionType: 'location' })}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+            activeTransactionType === 'location'
+              ? 'bg-[#1E3D34] text-white shadow-xs'
+              : 'text-stone-700 hover:text-[#1E3D34] hover:bg-stone-100'
+          }`}
+        >
+          <span>Louer</span>
+          <span
+            className={`text-[10px] px-2 py-0.5 rounded-full ${
+              activeTransactionType === 'location'
+                ? 'bg-white/20 text-amber-200'
+                : 'bg-emerald-50 text-[#1E3D34]'
+            }`}
+          >
+            À louer
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTransactionType === 'vente'}
+          onClick={() => onChangeFilters({ ...filters, transactionType: 'vente' })}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+            activeTransactionType === 'vente'
+              ? 'bg-[#C15C3D] text-white shadow-xs'
+              : 'text-stone-700 hover:text-[#C15C3D] hover:bg-stone-100'
+          }`}
+        >
+          <span>Acheter</span>
+          <span
+            className={`text-[10px] px-2 py-0.5 rounded-full ${
+              activeTransactionType === 'vente'
+                ? 'bg-white/20 text-white'
+                : 'bg-amber-50 text-[#C15C3D]'
+            }`}
+          >
+            À vendre
+          </span>
+        </button>
+      </div>
+
       {/* Main Search Input Bar */}
       <div className="bg-white p-2.5 sm:p-3 rounded-3xl shadow-sm border border-stone-200/90 flex flex-wrap sm:flex-nowrap items-center gap-2">
         <div className="flex-1 min-w-[180px] flex items-center gap-2.5 px-3">
@@ -306,7 +374,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
             {/* Min & Max Price in MAD */}
             <div>
               <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                Budget Loyer (MAD) :
+                {filters.transactionType === 'vente' ? 'Budget Achat (MAD) :' : 'Budget (MAD) :'}
               </label>
               <div className="grid grid-cols-2 gap-2">
                 <input
@@ -327,11 +395,11 @@ export const FilterBar: React.FC<FilterBarProps> = ({
                   type="number"
                   min={0}
                   step={500}
-                  value={filters.priceMax && filters.priceMax < 50000 ? filters.priceMax : ''}
+                  value={filters.priceMax || ''}
                   onChange={(e) =>
                     onChangeFilters({
                       ...filters,
-                      priceMax: e.target.value ? Number(e.target.value) : 50000,
+                      priceMax: e.target.value ? Number(e.target.value) : undefined,
                     })
                   }
                   placeholder="Max DH"

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   Check,
@@ -9,15 +9,26 @@ import {
   AlertCircle,
   Trash2,
   ShieldCheck,
-  AlertTriangle
+  AlertTriangle,
+  Camera,
+  Loader2,
+  Tag
 } from 'lucide-react';
-import { Listing, PropertyCategory, AdvertiserType, RentPeriod, User } from '../types';
+import {
+  Listing,
+  PropertyCategory,
+  AdvertiserType,
+  RentPeriod,
+  TransactionType,
+  User
+} from '../types';
 import { MOROCCAN_CITIES, CATEGORIES_CONFIG, AVAILABLE_AMENITIES } from '../data/moroccoLocations';
 import {
   validateListingForm,
   formatMAD,
   ValidationError,
-  detectContactInPublicText
+  detectContactInPublicText,
+  isDemoImageUrl
 } from '../utils/rentalLogic';
 import { AiImageStudioModal } from './AiImageStudioModal';
 import { SingleLocationMap } from './MoroccoMap';
@@ -41,8 +52,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [validationErrors, setValidationErrors] = useState<ValidationError[]>([]);
   const [isAiStudioOpen, setIsAiStudioOpen] = useState(false);
+  const [isUploadingPhotos, setIsUploadingPhotos] = useState(false);
+  const [uploadStatusMsg, setUploadStatusMsg] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Form State
+  const [transactionType, setTransactionType] = useState<TransactionType>('location');
   const [category, setCategory] = useState<PropertyCategory>('appartement');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -65,9 +80,8 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
     'Climatisation',
     'Cuisine équipée',
   ]);
-  const [images, setImages] = useState<string[]>([
-    'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80',
-  ]);
+  // Never pre-fill a demo/Unsplash photo on new listings so demo photos are never presented as real
+  const [images, setImages] = useState<string[]>([]);
   const [availableFrom, setAvailableFrom] = useState('Immédiate');
 
   // Contact & Privacy State
@@ -86,6 +100,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   useEffect(() => {
     if (editingListing) {
       setStep(1);
+      setTransactionType(editingListing.transactionType === 'vente' ? 'vente' : 'location');
       setCategory(editingListing.category);
       setTitle(editingListing.title);
       setDescription(editingListing.description);
@@ -96,7 +111,9 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
       setCustomLng(editingListing.longitude || -7.5898);
       setShowMapLocation(editingListing.contact?.showMapLocation !== false);
       setPrice(editingListing.price);
-      setPeriod(editingListing.period);
+      setPeriod(
+        editingListing.transactionType === 'vente' ? 'unique' : editingListing.period || 'mois'
+      );
       setDeposit(editingListing.deposit || 0);
       setSurface(editingListing.surface);
       setBedrooms(editingListing.bedrooms ?? 2);
@@ -117,8 +134,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
       setShowExactAddress(editingListing.contact?.showExactAddress ?? false);
       setPhoneConsentAccepted(editingListing.contact?.phoneConsentAccepted !== false);
       setLegalConsentAccepted(true);
+      setUploadStatusMsg(null);
     } else if (currentUser) {
       setStep(1);
+      setTransactionType('location');
+      setImages([]);
+      setUploadStatusMsg(null);
       setContactName(currentUser.name || '');
       setContactPhone(currentUser.phone || '');
       setContactWhatsApp(currentUser.phone || '');
@@ -134,6 +155,23 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
   const titleLeak = detectContactInPublicText(title);
   const descLeak = detectContactInPublicText(description);
+
+  const handleTransactionTypeChange = (nextType: TransactionType) => {
+    setTransactionType(nextType);
+    if (nextType === 'vente') {
+      setPeriod('unique');
+      if (price === 6500) {
+        setPrice(1450000);
+      }
+      setDeposit(0);
+    } else {
+      setPeriod('mois');
+      if (price === 1450000) {
+        setPrice(6500);
+        setDeposit(13000);
+      }
+    }
+  };
 
   const handleCityChange = (newCityName: string) => {
     setCity(newCityName);
@@ -151,6 +189,106 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
     setSelectedAmenities((prev) =>
       prev.includes(amenity) ? prev.filter((a) => a !== amenity) : [...prev, amenity]
     );
+  };
+
+  const readFileAsDataUri = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error(`Impossible de lire le fichier ${file.name}`));
+      reader.readAsDataURL(file);
+    });
+
+  const handlePersonalFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+
+    const selectedFiles: File[] = Array.from(fileList);
+    e.target.value = '';
+    setValidationErrors([]);
+    setUploadStatusMsg(null);
+    setIsUploadingPhotos(true);
+
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    const maxBytes = 5 * 1024 * 1024;
+    const uploadedDataUris: string[] = [];
+    const token = localStorage.getItem('darna_token');
+
+    try {
+      for (const file of selectedFiles) {
+        if (!allowedMimes.includes(file.type)) {
+          setValidationErrors([
+            {
+              field: 'images',
+              message: `Format non autorisé (${file.name}). Utilisez uniquement JPEG, PNG, WebP ou GIF.`,
+            },
+          ]);
+          continue;
+        }
+        if (file.size > maxBytes) {
+          setValidationErrors([
+            {
+              field: 'images',
+              message: `La photo « ${file.name} » dépasse la limite de 5 Mo.`,
+            },
+          ]);
+          continue;
+        }
+
+        const rawDataUri = await readFileAsDataUri(file);
+
+        if (token) {
+          const res = await fetch('/api/uploads/image', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              dataUri: rawDataUri,
+              filename: file.name,
+            }),
+          });
+          const text = await res.text();
+          let data: any = null;
+          try {
+            data = JSON.parse(text);
+          } catch {
+            data = null;
+          }
+          if (!res.ok || !data?.success || !data?.dataUri) {
+            setValidationErrors([
+              {
+                field: 'images',
+                message:
+                  data?.message ||
+                  `Échec de validation sécurisée pour « ${file.name} » (HTTP ${res.status}).`,
+              },
+            ]);
+            continue;
+          }
+          uploadedDataUris.push(data.dataUri);
+        } else {
+          uploadedDataUris.push(rawDataUri);
+        }
+      }
+
+      if (uploadedDataUris.length > 0) {
+        setImages((prev) => [...prev, ...uploadedDataUris]);
+        setUploadStatusMsg(
+          `${uploadedDataUris.length} photo(s) personnelle(s) téléversée(s) et sécurisée(s) (métadonnées EXIF supprimées).`
+        );
+      }
+    } catch (err: any) {
+      setValidationErrors([
+        {
+          field: 'images',
+          message: err?.message || 'Erreur lors du téléversement de vos photos personnelles.',
+        },
+      ]);
+    } finally {
+      setIsUploadingPhotos(false);
+    }
   };
 
   const handleAddSampleImage = () => {
@@ -171,14 +309,16 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   const constructPayload = (): Partial<Listing> => {
     const lat = currentCityData?.lat || 33.5731;
     const lng = currentCityData?.lng || -7.5898;
+    const usesDemoImages = images.some((img) => isDemoImageUrl(img));
 
     return {
       title,
       description,
       category,
+      transactionType,
       price: Number(price),
-      period,
-      deposit: Number(deposit) || undefined,
+      period: transactionType === 'vente' ? 'unique' : period,
+      deposit: transactionType === 'vente' ? undefined : Number(deposit) || undefined,
       surface: Number(surface),
       bedrooms: currentCategoryConfig?.requiresBedrooms ? Number(bedrooms) : undefined,
       bathrooms: currentCategoryConfig?.requiresBathrooms ? Number(bathrooms) : undefined,
@@ -186,6 +326,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
       furnished: currentCategoryConfig?.canBeFurnished ? furnished : undefined,
       amenities: selectedAmenities,
       images,
+      isDemo: usesDemoImages,
       city,
       district,
       address,
@@ -382,12 +523,74 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
         {/* Step Content */}
         <div className="flex-1 overflow-y-auto p-6 space-y-5">
-          {/* STEP 1: CATEGORY, TITLE & LOCATION */}
+          {/* STEP 1: TRANSACTION TYPE, CATEGORY, TITLE & LOCATION */}
           {step === 1 && (
             <div className="space-y-5">
+              {/* Transaction Type Selector: À louer / À vendre */}
               <div>
                 <label className="block text-xs font-bold uppercase tracking-wider text-stone-700 mb-2">
-                  1. Quel type de bien proposez-vous ?
+                  1. Type d’offre (Location ou Vente) :
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleTransactionTypeChange('location')}
+                    className={`p-3.5 rounded-2xl border text-left transition-all flex items-center justify-between ${
+                      transactionType === 'location'
+                        ? 'bg-[#1E3D34] border-[#1E3D34] text-white shadow-sm ring-2 ring-[#1E3D34]/20'
+                        : 'bg-white border-stone-200 hover:border-stone-300 text-stone-700'
+                    }`}
+                  >
+                    <div>
+                      <div className="font-bold text-sm flex items-center gap-1.5">
+                        <Tag className="w-4 h-4 text-amber-300" />
+                        <span>À louer</span>
+                      </div>
+                      <div
+                        className={`text-xs mt-0.5 ${
+                          transactionType === 'location' ? 'text-stone-200' : 'text-stone-500'
+                        }`}
+                      >
+                        Location mensuelle, courte durée ou annuelle
+                      </div>
+                    </div>
+                    {transactionType === 'location' && (
+                      <Check className="w-4 h-4 text-amber-300 shrink-0" />
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleTransactionTypeChange('vente')}
+                    className={`p-3.5 rounded-2xl border text-left transition-all flex items-center justify-between ${
+                      transactionType === 'vente'
+                        ? 'bg-[#C15C3D] border-[#C15C3D] text-white shadow-sm ring-2 ring-[#C15C3D]/20'
+                        : 'bg-white border-stone-200 hover:border-stone-300 text-stone-700'
+                    }`}
+                  >
+                    <div>
+                      <div className="font-bold text-sm flex items-center gap-1.5">
+                        <Tag className="w-4 h-4 text-amber-200" />
+                        <span>À vendre</span>
+                      </div>
+                      <div
+                        className={`text-xs mt-0.5 ${
+                          transactionType === 'vente' ? 'text-amber-100' : 'text-stone-500'
+                        }`}
+                      >
+                        Vente immobilière (prix global en MAD)
+                      </div>
+                    </div>
+                    {transactionType === 'vente' && (
+                      <Check className="w-4 h-4 text-white shrink-0" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-wider text-stone-700 mb-2">
+                  2. Quel type de bien proposez-vous ?
                 </label>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {CATEGORIES_CONFIG.map((cat) => {
@@ -415,13 +618,17 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                  Titre de votre annonce :
+                  Titre de votre annonce ({transactionType === 'vente' ? 'À vendre' : 'À louer'}) :
                 </label>
                 <input
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  placeholder="Ex: Bel appartement 2 chambres meublé avec terrasse à Maârif"
+                  placeholder={
+                    transactionType === 'vente'
+                      ? 'Ex: Appartement 3 chambres avec terrasse à vendre à Maârif'
+                      : 'Ex: Bel appartement 2 chambres meublé avec terrasse à Maârif'
+                  }
                   className="w-full text-sm px-4 py-3 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D]"
                 />
                 {titleLeak.hasContactInfo && (
@@ -522,7 +729,9 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                    Loyer en Dirhams (MAD) :
+                    {transactionType === 'vente'
+                      ? 'Prix de vente en Dirhams (MAD) :'
+                      : 'Loyer en Dirhams (MAD) :'}
                   </label>
                   <input
                     type="number"
@@ -532,20 +741,31 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                   />
                 </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-stone-700 mb-1.5">
-                    Périodicité :
-                  </label>
-                  <select
-                    value={period}
-                    onChange={(e) => setPeriod(e.target.value as any)}
-                    className="w-full text-sm px-4 py-3 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D] bg-white"
-                  >
-                    <option value="mois">Par mois (Bail classique)</option>
-                    <option value="jour">Par jour (Courte durée)</option>
-                    <option value="an">Par an</option>
-                  </select>
-                </div>
+                {transactionType === 'location' ? (
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1.5">
+                      Périodicité :
+                    </label>
+                    <select
+                      value={period}
+                      onChange={(e) => setPeriod(e.target.value as any)}
+                      className="w-full text-sm px-4 py-3 rounded-xl border border-stone-300 focus:outline-none focus:ring-2 focus:ring-[#C15C3D] bg-white"
+                    >
+                      <option value="mois">Par mois (Bail classique)</option>
+                      <option value="jour">Par jour (Courte durée)</option>
+                      <option value="an">Par an</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700 mb-1.5">
+                      Type de transaction :
+                    </label>
+                    <div className="w-full text-sm px-4 py-3 rounded-xl border border-stone-200 bg-stone-50 font-semibold text-[#C15C3D]">
+                      À vendre (Prix global MAD)
+                    </div>
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-xs font-bold text-stone-700 mb-1.5">
@@ -679,61 +899,141 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
             </div>
           )}
 
-          {/* STEP 3: PHOTOS & AI STUDIO */}
+          {/* STEP 3: PERSONAL PHOTO UPLOAD & AI STUDIO */}
           {step === 3 && (
             <div className="space-y-5">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-stone-50 p-4 rounded-2xl border border-stone-200">
-                <div>
-                  <h3 className="font-bold text-sm text-stone-900">Photos de l'annonce</h3>
-                  <p className="text-xs text-stone-500">
-                    Ajoutez des photos nettes du bien (sans numéro de téléphone ni filigrane de contact sur l'image).
-                  </p>
+              {/* Hidden native file input for phone camera/gallery and computer files */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/gif"
+                multiple
+                onChange={handlePersonalFileSelect}
+                className="hidden"
+                data-testid="personal-photo-file-input"
+              />
+
+              {/* Primary Personal Photo Upload Box */}
+              <div className="bg-[#FAF7F2] p-5 rounded-3xl border-2 border-dashed border-[#1E3D34]/40 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-900 text-[11px] font-bold">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
+                      <span>Stockage sécurisé • Nettoyage EXIF automatique</span>
+                    </div>
+                    <h3 className="font-bold text-base text-stone-900">
+                      Téléversez vos photos personnelles du bien
+                    </h3>
+                    <p className="text-xs text-stone-600 leading-relaxed">
+                      Sélectionnez vos vraies photos depuis votre téléphone (galerie ou appareil photo) ou votre ordinateur. Formats acceptés : JPEG, PNG, WebP, GIF (max 5 Mo par photo).
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={isUploadingPhotos}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-5 py-3.5 bg-[#1E3D34] hover:bg-[#152c25] text-white rounded-2xl text-xs sm:text-sm font-bold flex items-center justify-center gap-2 shadow-md transition-all shrink-0 active:scale-95 disabled:opacity-60"
+                  >
+                    {isUploadingPhotos ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Téléversement sécurisé...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="w-4 h-4 text-amber-300" />
+                        <span>Sélectionner & téléverser mes photos</span>
+                      </>
+                    )}
+                  </button>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleAddSampleImage}
-                    className="px-3 py-2 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>Ajouter photo démo</span>
-                  </button>
+                {uploadStatusMsg && (
+                  <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-semibold flex items-center gap-2">
+                    <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span>{uploadStatusMsg}</span>
+                  </div>
+                )}
 
-                  <button
-                    type="button"
-                    onClick={() => setIsAiStudioOpen(true)}
-                    className="px-3.5 py-2 bg-gradient-to-r from-[#1E3D34] to-[#C15C3D] text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm hover:opacity-95 transition-all"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Studio IA (1K/2K/4K)</span>
-                  </button>
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-stone-200/80 text-xs">
+                  <span className="text-stone-500">
+                    Les photos de démonstration sont signalées comme non contractuelles et ne remplacent pas les photos réelles.
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleAddSampleImage}
+                      className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-xl text-[11px] font-semibold flex items-center gap-1.5 transition-colors"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Illustration Démo (Test)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setIsAiStudioOpen(true)}
+                      className="px-3 py-1.5 bg-gradient-to-r from-[#1E3D34] to-[#C15C3D] text-white rounded-xl text-[11px] font-bold flex items-center gap-1.5 shadow-2xs hover:opacity-95 transition-all"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Studio IA (1K/2K/4K)</span>
+                    </button>
+                  </div>
                 </div>
               </div>
 
               {/* Photo grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {images.map((img, idx) => (
-                  <div
-                    key={idx}
-                    className="relative rounded-2xl overflow-hidden aspect-[4/3] border border-stone-200 shadow-xs group"
-                  >
-                    <img src={img} alt={`Photo ${idx + 1}`} className="w-full h-full object-cover" />
-                    {idx === 0 && (
-                      <span className="absolute top-2 left-2 bg-[#C15C3D] text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-xs">
-                        Photo principale
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveImage(idx)}
-                      className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
+              {images.length === 0 ? (
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-8 rounded-2xl border border-stone-200 bg-stone-50 hover:bg-stone-100/80 text-center cursor-pointer transition-colors space-y-2"
+                >
+                  <Camera className="w-8 h-8 text-stone-400 mx-auto" />
+                  <p className="text-xs font-bold text-stone-700">
+                    Aucune photo sélectionnée pour le moment
+                  </p>
+                  <p className="text-[11px] text-stone-500">
+                    Cliquez ici ou sur « Sélectionner & téléverser mes photos » pour ajouter les photos réelles de votre bien.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {images.map((img, idx) => {
+                    const isStockDemo = isDemoImageUrl(img);
+                    return (
+                      <div
+                        key={idx}
+                        className="relative rounded-2xl overflow-hidden aspect-[4/3] border border-stone-200 shadow-xs group"
+                      >
+                        <img src={img} alt={`Photo ${idx + 1}`} className="w-full h-full object-cover" />
+                        <div className="absolute top-2 left-2 flex flex-col gap-1 pr-8">
+                          {idx === 0 && (
+                            <span className="bg-[#C15C3D] text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-xs w-fit">
+                              Photo principale
+                            </span>
+                          )}
+                          {isStockDemo ? (
+                            <span className="bg-amber-100/95 text-amber-950 border border-amber-300 text-[10px] font-bold px-2 py-0.5 rounded-full shadow-xs w-fit">
+                              Illustration Démo
+                            </span>
+                          ) : (
+                            <span className="bg-emerald-700/95 text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-xs w-fit">
+                              Photo personnelle
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveImage(idx)}
+                          className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -885,7 +1185,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     className="rounded text-emerald-700 focus:ring-emerald-600 mt-0.5"
                   />
                   <span>
-                    Je certifie sur l'honneur être autorisé à proposer ce bien à la location et j'accepte les Conditions Générales d'Utilisation et la politique de confidentialité de Darna.
+                    Je certifie sur l'honneur être autorisé à proposer ce bien ({transactionType === 'vente' ? 'à la vente' : 'à la location'}) et j'accepte les Conditions Générales d'Utilisation et la politique de confidentialité de Darna.
                   </span>
                 </label>
               </div>
@@ -905,9 +1205,20 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
               <div className="p-4 sm:p-5 bg-white border border-stone-200 rounded-3xl shadow-sm space-y-4">
                 <div className="relative aspect-[16/9] rounded-2xl overflow-hidden bg-stone-100">
                   <img src={images[0]} alt="Aperçu" className="w-full h-full object-cover" />
-                  <span className="absolute top-3 left-3 bg-white/90 backdrop-blur-md text-[#1E3D34] font-bold text-xs px-3 py-1 rounded-full uppercase">
-                    {category}
-                  </span>
+                  <div className="absolute top-3 left-3 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={`font-bold text-xs px-3 py-1 rounded-full shadow-xs ${
+                        transactionType === 'vente'
+                          ? 'bg-[#C15C3D] text-white'
+                          : 'bg-[#1E3D34] text-white'
+                      }`}
+                    >
+                      {transactionType === 'vente' ? 'À vendre' : 'À louer'}
+                    </span>
+                    <span className="bg-white/90 backdrop-blur-md text-[#1E3D34] font-bold text-xs px-3 py-1 rounded-full uppercase">
+                      {category}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
@@ -918,7 +1229,7 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
                     </p>
                   </div>
                   <div className="text-xl font-extrabold text-[#C15C3D]">
-                    {formatMAD(price, period)}
+                    {formatMAD(price, period, transactionType)}
                   </div>
                 </div>
 

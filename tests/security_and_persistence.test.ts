@@ -2639,4 +2639,265 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(ogImgBuf.readUInt32BE(16), 1200, '/og-default.png width must be 1200px');
     assert.equal(ogImgBuf.readUInt32BE(20), 630, '/og-default.png height must be 630px');
   });
+
+  it('26. verifies personal photo upload (/api/uploads/image with EXIF removal), Louer/Acheter & À louer/À vendre flows while preserving existing rentals, production PWA routing (/manifest.webmanifest, /sw.js, icons), configured domain OG/share URLs, and disabled real payments config', async () => {
+    const {
+      filterAndSortListings,
+      formatMAD,
+      getListingTransactionType,
+      getTransactionBadgeLabel,
+      isDemoImageUrl,
+      hasDemoImages,
+    } = await import('../src/utils/rentalLogic');
+
+    // 1. Authenticate a professional user for uploads & listing creation
+    const uploadUserId = 'user-pro-upload-vente';
+    await dbInstance.createUser(
+      {
+        id: uploadUserId,
+        firstName: 'Karim',
+        lastName: 'Immobilier',
+        name: 'Karim Immobilier',
+        email: 'karim.upload@darna.ma',
+        phone: '0661998877',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 100,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'KarimPass2026!'
+    );
+    const uploadToken = await dbInstance.createSession(uploadUserId);
+
+    // 2. Test POST /api/uploads/image: requires auth, rejects SVG, accepts valid PNG/JPEG and strips EXIF
+    const sample1x1PngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    const unauthUploadRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dataUrl: `data:image/png;base64,${sample1x1PngBase64}` }),
+    });
+    assert.equal(unauthUploadRes.status, 401, 'POST /api/uploads/image must require authentication');
+
+    const svgBase64 = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64');
+    const svgUploadRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uploadToken}`,
+      },
+      body: JSON.stringify({
+        dataUrl: `data:image/svg+xml;base64,${svgBase64}`,
+        filename: 'exploit.svg',
+      }),
+    });
+    assert.equal(svgUploadRes.status, 400, 'POST /api/uploads/image must reject SVG uploads');
+
+    const validUploadRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uploadToken}`,
+      },
+      body: JSON.stringify({
+        dataUrl: `data:image/png;base64,${sample1x1PngBase64}`,
+        filename: 'salon-personnel.png',
+      }),
+    });
+    assert.equal(validUploadRes.status, 200, 'POST /api/uploads/image must accept valid personal PNG');
+    const uploadedPhoto = await validUploadRes.json();
+    assert.equal(uploadedPhoto.mimeType, 'image/png');
+    assert.equal(uploadedPhoto.width, 1);
+    assert.equal(uploadedPhoto.height, 1);
+    assert.equal(uploadedPhoto.isPersonalUpload, true);
+    assert.ok(
+      typeof uploadedPhoto.dataUrl === 'string' &&
+        uploadedPhoto.dataUrl.startsWith('data:image/png;base64,'),
+      'Uploaded personal photo must return sanitized data:image/png;base64,...'
+    );
+    assert.equal(
+      isDemoImageUrl(uploadedPhoto.dataUrl),
+      false,
+      'Uploaded personal photo must NOT be marked as a demo photo'
+    );
+    assert.equal(
+      isDemoImageUrl('https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=1000'),
+      true,
+      'Unsplash stock photo must be detected as a demo illustration'
+    );
+
+    // 3. Test « À louer / À vendre » and « Louer / Acheter » flows while preserving existing rental listings
+    const allDbListingsBefore = dbInstance.getAllListings();
+    const existingRentalIds = allDbListingsBefore
+      .filter((l: { id: string }) => /^darna-[a-z-]+-0[1-9]$/.test(l.id))
+      .map((l: { id: string }) => l.id);
+    assert.ok(
+      existingRentalIds.length >= 8,
+      'Original rental listings (darna-*-01 .. 09) must remain preserved in database'
+    );
+
+    // Create a new 'vente' listing with the uploaded personal photo
+    const createSaleRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${uploadToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Appartement Haut Standing À Vendre Gauthier',
+        description: 'Bel appartement lumineux en vente avec titre foncier individuel.',
+        category: 'appartement',
+        transactionType: 'vente',
+        price: 2350000,
+        period: 'unique',
+        surface: 142,
+        rooms: 4,
+        bedrooms: 3,
+        bathrooms: 2,
+        city: 'Casablanca',
+        district: 'Gauthier',
+        images: [uploadedPhoto.dataUrl],
+      }),
+    });
+    assert.equal(createSaleRes.status, 201, 'POST /api/listings must create a "vente" listing');
+    const { listing: createdSaleListing } = await createSaleRes.json();
+    assert.equal(createdSaleListing.transactionType, 'vente');
+    assert.equal(createdSaleListing.period, 'unique');
+    assert.equal(getListingTransactionType(createdSaleListing), 'vente');
+    assert.equal(getTransactionBadgeLabel(createdSaleListing), 'À vendre');
+    assert.equal(hasDemoImages(createdSaleListing), false);
+    assert.ok(
+      formatMAD(createdSaleListing.price, createdSaleListing.period, createdSaleListing.transactionType).endsWith('MAD') &&
+        !formatMAD(createdSaleListing.price, createdSaleListing.period, createdSaleListing.transactionType).includes('/ mois'),
+      'Sale listing price must format as total MAD without "/ mois"'
+    );
+
+    // Verify filtering by transactionType ('location' vs 'vente' vs 'all')
+    const allListingsAfterRes = await fetch(`${baseUrl}/api/listings`);
+    const { listings: allListingsAfter } = await allListingsAfterRes.json();
+    const onlyLocation = filterAndSortListings(allListingsAfter, { transactionType: 'location' });
+    const onlyVente = filterAndSortListings(allListingsAfter, { transactionType: 'vente' });
+    assert.ok(onlyLocation.length >= 9, 'Filtering by "location" must return rental listings');
+    assert.ok(
+      onlyLocation.every((l) => getListingTransactionType(l) === 'location'),
+      'All listings in "Louer" filter must have transactionType === "location"'
+    );
+    assert.ok(onlyVente.length >= 1, 'Filtering by "vente" must return sale listings');
+    assert.ok(
+      onlyVente.every((l) => getListingTransactionType(l) === 'vente'),
+      'All listings in "Acheter" filter must have transactionType === "vente"'
+    );
+    assert.ok(
+      onlyVente.some((l) => l.id === createdSaleListing.id),
+      'Newly created sale listing must appear in "Acheter" (vente) filter'
+    );
+
+    // 4. Verify configured domain (APP_URL) is used in OpenGraph tags on both / and /?annonce=ID
+    const prevAppUrl = process.env.APP_URL;
+    const prevNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.APP_URL = 'https://darna-immobilier.example.ma';
+      process.env.NODE_ENV = 'production';
+
+      const homeOgRes = await fetch(`${baseUrl}/`);
+      assert.equal(homeOgRes.status, 200);
+      const homeOgHtml = await homeOgRes.text();
+      assert.ok(
+        homeOgHtml.includes('property="og:url" content="https://darna-immobilier.example.ma/"'),
+        'Homepage og:url must use the configured APP_URL domain'
+      );
+      assert.ok(
+        homeOgHtml.includes('property="og:image" content="https://darna-immobilier.example.ma/og-default.png"'),
+        'Homepage og:image must use the configured APP_URL domain'
+      );
+
+      const saleOgRes = await fetch(`${baseUrl}/?annonce=${encodeURIComponent(createdSaleListing.id)}`);
+      assert.equal(saleOgRes.status, 200);
+      const saleOgHtml = await saleOgRes.text();
+      assert.ok(
+        saleOgHtml.includes(
+          `property="og:url" content="https://darna-immobilier.example.ma/?annonce=${createdSaleListing.id}"`
+        ),
+        'Listing share og:url must use configured APP_URL domain'
+      );
+      assert.ok(
+        saleOgHtml.includes(
+          `property="og:image" content="https://darna-immobilier.example.ma/api/listings/${createdSaleListing.id}/cover.jpg"`
+        ),
+        'Listing share og:image must use configured APP_URL domain'
+      );
+      assert.ok(
+        saleOgHtml.includes('À vendre') || saleOgHtml.includes('Vente'),
+        'Sale listing OpenGraph metadata must indicate Vente / À vendre'
+      );
+
+      // 5. Verify /manifest.webmanifest, /sw.js, and icons never return index.html even in NODE_ENV=production
+      for (const assetRoute of [
+        { path: '/manifest.webmanifest', expectedType: 'application/manifest+json' },
+        { path: '/manifest.json', expectedType: 'application/manifest+json' },
+        { path: '/sw.js', expectedType: 'application/javascript' },
+        { path: '/pwa-192x192.png', expectedType: 'image/png' },
+        { path: '/pwa-512x512.png', expectedType: 'image/png' },
+        { path: '/pwa-512x512-maskable.png', expectedType: 'image/png' },
+        { path: '/apple-touch-icon.png', expectedType: 'image/png' },
+        { path: '/og-default.png', expectedType: 'image/png' },
+      ]) {
+        const assetRes = await fetch(`${baseUrl}${assetRoute.path}`);
+        assert.equal(assetRes.status, 200, `${assetRoute.path} must return HTTP 200 in production`);
+        const contentType = assetRes.headers.get('content-type') || '';
+        assert.ok(
+          contentType.includes(assetRoute.expectedType),
+          `${assetRoute.path} must return ${assetRoute.expectedType}, got ${contentType}`
+        );
+        assert.ok(
+          !contentType.includes('text/html'),
+          `${assetRoute.path} must NEVER return text/html homepage`
+        );
+      }
+    } finally {
+      if (prevAppUrl === undefined) {
+        delete process.env.APP_URL;
+      } else {
+        process.env.APP_URL = prevAppUrl;
+      }
+      if (prevNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = prevNodeEnv;
+      }
+    }
+
+    // 6. Verify real payments remain disabled and simulation capabilities are explicitly documented
+    const monConfigRes = await fetch(`${baseUrl}/api/monetization/config`);
+    assert.equal(monConfigRes.status, 200);
+    const monConfig = await monConfigRes.json();
+    assert.equal(
+      monConfig.paymentGateway?.realPaymentsEnabled,
+      false,
+      'Real payments must remain disabled'
+    );
+    assert.equal(monConfig.paymentGateway?.liveOperational, false);
+    assert.equal(monConfig.paymentGateway?.mode, 'test');
+    assert.ok(
+      Array.isArray(monConfig.paymentGateway?.disabledRealFeatures) &&
+        monConfig.paymentGateway.disabledRealFeatures.length >= 3,
+      'Monetization config must list disabled real payment features'
+    );
+    assert.ok(
+      Array.isArray(monConfig.paymentGateway?.simulationCapabilities) &&
+        monConfig.paymentGateway.simulationCapabilities.length >= 3,
+      'Monetization config must list simulation-only capabilities'
+    );
+  });
 });
+

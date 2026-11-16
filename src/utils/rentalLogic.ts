@@ -6,18 +6,90 @@ import type {
   PaymentTransaction,
   RevenueSummary,
   SubscriptionPlan,
+  TransactionType,
   User
 } from '../types/index.ts';
 
 /**
- * Format price in Moroccan Dirhams (MAD)
+ * Determine whether a listing is for rent ('location', default) or sale ('vente')
  */
-export function formatMAD(price: number, period: string = 'mois'): string {
+export function getListingTransactionType(
+  listing: Partial<Listing> | null | undefined
+): TransactionType {
+  return listing?.transactionType === 'vente' ? 'vente' : 'location';
+}
+
+/**
+ * Human-readable badge label for a listing's transaction type
+ */
+export function getTransactionBadgeLabel(
+  listing: Partial<Listing> | null | undefined
+): 'À louer' | 'À vendre' {
+  return getListingTransactionType(listing) === 'vente' ? 'À vendre' : 'À louer';
+}
+
+/**
+ * Check if an image URL comes from a stock/demo provider (e.g. Unsplash) rather than a real user upload
+ */
+export function isDemoImageUrl(url: string | null | undefined): boolean {
+  const clean = String(url || '').trim().toLowerCase();
+  if (!clean) return false;
+  return (
+    clean.includes('images.unsplash.com') ||
+    clean.includes('unsplash.com') ||
+    clean.includes('picsum.photos')
+  );
+}
+
+/**
+ * Check if a listing is a demo listing or uses demo stock photos
+ */
+export function hasDemoImages(listing: Partial<Listing> | null | undefined): boolean {
+  if (!listing) return false;
+  if (listing.isDemo) return true;
+  if (!Array.isArray(listing.images) || listing.images.length === 0) return false;
+  return listing.images.some((img) => isDemoImageUrl(img));
+}
+
+/**
+ * Return the configured public origin for share links
+ */
+export function getConfiguredAppOrigin(): string {
+  try {
+    const envMeta = (import.meta as any)?.env;
+    const configured = String(
+      envMeta?.VITE_APP_URL || envMeta?.VITE_PUBLIC_URL || ''
+    )
+      .trim()
+      .replace(/\/$/, '');
+    if (configured && /^https?:\/\//i.test(configured)) {
+      return configured;
+    }
+  } catch {
+    // Ignore when import.meta.env is unavailable
+  }
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin.replace(/\/$/, '');
+  }
+  return 'https://darna.ma';
+}
+
+/**
+ * Format price in Moroccan Dirhams (MAD) for rent or sale
+ */
+export function formatMAD(
+  price: number,
+  period: string = 'mois',
+  transactionType: TransactionType = 'location'
+): string {
   const formatted = new Intl.NumberFormat('fr-MA', {
     style: 'decimal',
     maximumFractionDigits: 0
   }).format(price).replace(/\u202F/g, ' ');
 
+  if (transactionType === 'vente' || period === 'unique' || period === 'vente') {
+    return `${formatted} MAD`;
+  }
   if (period === 'jour') {
     return `${formatted} MAD / jour`;
   } else if (period === 'an') {
@@ -45,14 +117,21 @@ export function formatMoroccanPhone(phone: string): string {
 /**
  * Build WhatsApp click-to-chat URL with a prefilled message
  */
-export function buildWhatsAppLink(phone: string, listingTitle: string, listingUrl?: string): string {
+export function buildWhatsAppLink(
+  phone: string,
+  listingTitle: string,
+  listingUrl?: string,
+  transactionType: TransactionType = 'location'
+): string {
   if (!phone) return '#';
   let cleanNumber = phone.replace(/[^0-9]/g, '');
   if (cleanNumber.startsWith('0')) {
     cleanNumber = '212' + cleanNumber.substring(1);
   }
+  const opLabel = transactionType === 'vente' ? 'à la vente' : 'à la location';
+  const linkSuffix = listingUrl ? ` (${listingUrl})` : '';
   const text = encodeURIComponent(
-    `Bonjour, je vous contacte au sujet de votre annonce sur Darna : "${listingTitle}". Ce bien est-il toujours disponible à la location ? Merci.`
+    `Bonjour, je vous contacte au sujet de votre annonce sur Darna : "${listingTitle}"${linkSuffix}. Ce bien est-il toujours disponible ${opLabel} ? Merci.`
   );
   return `https://wa.me/${cleanNumber}?text=${text}`;
 }
@@ -219,6 +298,14 @@ export function filterAndSortListings(listings: Listing[], filters: ListingFilte
       // Category filter
       if (filters.category && filters.category !== 'all') {
         if (listing.category !== filters.category) {
+          return false;
+        }
+      }
+
+      // Transaction type filter ('location' = Louer / À louer, 'vente' = Acheter / À vendre)
+      if (filters.transactionType && filters.transactionType !== 'all') {
+        const listingTxType = getListingTransactionType(listing);
+        if (listingTxType !== filters.transactionType) {
           return false;
         }
       }
@@ -475,26 +562,36 @@ export function findNearestMoroccanCity(
  * when sending listings to an unauthenticated visitor.
  */
 export function sanitizeListingForVisitor(listing: Listing): Listing {
+  const rawContact = listing.contact || {
+    name: 'Annonceur Darna',
+    type: 'particulier' as const,
+    phone: '',
+    email: '',
+    showPhone: true,
+    showEmail: true,
+    showWhatsApp: false,
+    showExactAddress: false,
+  };
   const sanitizedContact: ListingContact = {
-    name: listing.contact.name,
-    type: listing.contact.type,
+    name: rawContact.name || 'Annonceur Darna',
+    type: rawContact.type || 'particulier',
     phone: '',
     whatsapp: undefined,
     email: '',
-    showPhone: listing.contact.showPhone,
-    showEmail: listing.contact.showEmail,
-    showWhatsApp: listing.contact.showWhatsApp,
-    showExactAddress: listing.contact.showExactAddress,
-    showMapLocation: listing.contact.showMapLocation ?? true,
-    phoneConsentAccepted: listing.contact.phoneConsentAccepted ?? true
+    showPhone: Boolean(rawContact.showPhone),
+    showEmail: Boolean(rawContact.showEmail),
+    showWhatsApp: Boolean(rawContact.showWhatsApp),
+    showExactAddress: Boolean(rawContact.showExactAddress),
+    showMapLocation: rawContact.showMapLocation ?? true,
+    phoneConsentAccepted: rawContact.phoneConsentAccepted ?? true
   };
 
   return {
     ...listing,
     contact: sanitizedContact,
     address: `${listing.district}, ${listing.city}`,
-    latitude: listing.contact.showMapLocation === false ? 0 : listing.latitude,
-    longitude: listing.contact.showMapLocation === false ? 0 : listing.longitude
+    latitude: rawContact.showMapLocation === false ? 0 : listing.latitude,
+    longitude: rawContact.showMapLocation === false ? 0 : listing.longitude
   };
 }
 
@@ -507,20 +604,30 @@ export function sanitizeListingForPublic(listing: Listing, isAuthenticated: bool
     return sanitizeListingForVisitor(listing);
   }
 
-  const allowPhone = Boolean(listing.contact.showPhone && listing.contact.phoneConsentAccepted !== false);
+  const rawContact = listing.contact || {
+    name: 'Annonceur Darna',
+    type: 'particulier' as const,
+    phone: '',
+    email: '',
+    showPhone: true,
+    showEmail: true,
+    showWhatsApp: false,
+    showExactAddress: false,
+  };
+  const allowPhone = Boolean(rawContact.showPhone && rawContact.phoneConsentAccepted !== false);
   const sanitizedContact: ListingContact = {
-    ...listing.contact,
-    phone: allowPhone ? listing.contact.phone : '',
-    email: listing.contact.showEmail ? listing.contact.email : '',
-    whatsapp: listing.contact.showWhatsApp ? listing.contact.whatsapp : undefined,
+    ...rawContact,
+    phone: allowPhone ? rawContact.phone : '',
+    email: rawContact.showEmail ? rawContact.email : '',
+    whatsapp: rawContact.showWhatsApp ? rawContact.whatsapp : undefined,
   };
 
   return {
     ...listing,
     contact: sanitizedContact,
-    address: listing.contact.showExactAddress ? listing.address : `${listing.district}, ${listing.city}`,
-    latitude: listing.contact.showMapLocation === false ? 0 : listing.latitude,
-    longitude: listing.contact.showMapLocation === false ? 0 : listing.longitude
+    address: rawContact.showExactAddress ? listing.address : `${listing.district}, ${listing.city}`,
+    latitude: rawContact.showMapLocation === false ? 0 : listing.latitude,
+    longitude: rawContact.showMapLocation === false ? 0 : listing.longitude
   };
 }
 

@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import sharp from 'sharp';
 import { GoogleGenAI } from '@google/genai';
 import type {
   Listing,
@@ -68,12 +70,50 @@ export function isPublishedListingStatus(listing: Listing | null | undefined): l
   return st === 'publiee' || st === 'published';
 }
 
-function getBaseHttpsUrl(req: express.Request): string {
-  const envUrl = (process.env.APP_URL || '').trim().replace(/\/$/, '');
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const APP_ROOT_DIR = path.resolve(MODULE_DIR, '../..');
+
+export function resolveStaticAssetPath(filename: string): string | null {
+  const safeName = path.basename(filename);
+  const candidates =
+    process.env.NODE_ENV === 'production'
+      ? [
+          path.resolve(APP_ROOT_DIR, 'dist', safeName),
+          path.resolve(process.cwd(), 'dist', safeName),
+          path.resolve(APP_ROOT_DIR, 'public', safeName),
+          path.resolve(process.cwd(), 'public', safeName),
+        ]
+      : [
+          path.resolve(APP_ROOT_DIR, 'public', safeName),
+          path.resolve(process.cwd(), 'public', safeName),
+          path.resolve(APP_ROOT_DIR, 'dist', safeName),
+          path.resolve(process.cwd(), 'dist', safeName),
+        ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+export function getBaseHttpsUrl(req: express.Request): string {
+  const envUrl = (
+    process.env.APP_URL ||
+    process.env.PUBLIC_APP_URL ||
+    process.env.VITE_APP_URL ||
+    ''
+  )
+    .trim()
+    .replace(/\/$/, '');
   if (envUrl && /^https?:\/\//i.test(envUrl)) {
     return envUrl.replace(/^http:\/\//i, 'https://');
   }
-  const host = req.get('host') || 'darna.ma';
+  const forwardedHost = String(req.get('x-forwarded-host') || '')
+    .split(',')[0]
+    .trim();
+  const host = forwardedHost || req.get('host') || 'darna.ma';
   return `https://${host}`;
 }
 
@@ -341,7 +381,8 @@ export function createDarnaApiApp(
 
   app.use((req, res, next) => {
     const isListingUploadRoute =
-      (req.method === 'POST' && req.path === '/api/listings') ||
+      (req.method === 'POST' &&
+        (req.path === '/api/listings' || req.path === '/api/uploads/image')) ||
       (req.method === 'PUT' && /^\/api\/listings\/[^/]+$/.test(req.path));
     const parser = isListingUploadRoute ? listingJsonParser : defaultJsonParser;
     parser(req, res, (err: any) => {
@@ -1913,6 +1954,106 @@ export function createDarnaApiApp(
     });
   });
 
+  /**
+   * Secure Personal Property Photo Upload Endpoint (POST /api/uploads/image)
+   * - Requires authenticated user
+   * - Accepts only image/jpeg, image/png, image/webp, image/gif up to 5 MB decoded
+   * - Verifies real image structure and strips EXIF/GPS metadata via sharp before storage
+   */
+  app.post('/api/uploads/image', async (req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const viewer = getAuthUser(req);
+    if (!viewer) {
+      return res.status(401).json({
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Créez un compte ou connectez-vous pour téléverser vos photos personnelles.',
+      });
+    }
+
+    const rawInput =
+      typeof req.body?.dataUri === 'string'
+        ? req.body.dataUri
+        : typeof req.body?.dataUrl === 'string'
+          ? req.body.dataUrl
+          : '';
+    const rawDataUri = rawInput.trim();
+    const parsed = parseAllowedBase64Image(rawDataUri);
+    if (!parsed.valid || !parsed.buffer || !parsed.mimeType) {
+      if (parsed.reason === 'too_large') {
+        return res.status(400).json({
+          success: false,
+          code: 'IMAGE_TOO_LARGE',
+          message: 'La taille décodée de chaque photo ne doit pas dépasser 5 Mo.',
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_IMAGE_TYPE',
+        message:
+          'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+      });
+    }
+
+    try {
+      const pipeline = sharp(parsed.buffer, {
+        failOn: 'error',
+        animated: parsed.mimeType === 'image/gif',
+      }).rotate(); // Auto-orient and strip EXIF/GPS metadata by default
+
+      const metadata = await pipeline.metadata();
+      if (!metadata.width || !metadata.height) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_IMAGE_DATA',
+          message: 'Le fichier sélectionné n’est pas une image valide.',
+        });
+      }
+
+      const resized = pipeline.resize({
+        width: 1920,
+        height: 1920,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+
+      let outBuffer: Buffer;
+      const outMime = parsed.mimeType;
+      if (parsed.mimeType === 'image/jpeg') {
+        outBuffer = await resized.jpeg({ quality: 86, mozjpeg: true }).toBuffer();
+      } else if (parsed.mimeType === 'image/png') {
+        outBuffer = await resized.png({ compressionLevel: 8 }).toBuffer();
+      } else if (parsed.mimeType === 'image/webp') {
+        outBuffer = await resized.webp({ quality: 86 }).toBuffer();
+      } else {
+        outBuffer = await resized.gif().toBuffer();
+      }
+
+      const outMeta = await sharp(outBuffer).metadata();
+      const sanitizedDataUri = `data:${outMime};base64,${outBuffer.toString('base64')}`;
+
+      return res.status(200).json({
+        success: true,
+        dataUri: sanitizedDataUri,
+        dataUrl: sanitizedDataUri,
+        mimeType: outMime,
+        width: outMeta.width || metadata.width,
+        height: outMeta.height || metadata.height,
+        sizeBytes: outBuffer.length,
+        exifStripped: true,
+        isDemo: false,
+        isPersonalUpload: true,
+      });
+    } catch {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_IMAGE_CONTENT',
+        message:
+          'Impossible de décoder cette image. Veuillez sélectionner une vraie photo JPEG, PNG, WebP ou GIF.',
+      });
+    }
+  });
+
   app.post('/api/listings', async (req, res) => {
     const viewer = getAuthUser(req);
     if (!viewer) {
@@ -1948,15 +2089,34 @@ export function createDarnaApiApp(
       const descCheck = detectContactInPublicText(req.body.description || '');
       const flagged = titleCheck.hasContactInfo || descCheck.hasContactInfo;
       const nowIso = new Date().toISOString();
+      const txType = req.body.transactionType === 'vente' ? 'vente' : 'location';
+
+      const defaultContact = {
+        name: viewer.name || 'Annonceur Darna',
+        type: viewer.advertiserType || (viewer.role === 'professionnel' ? 'professionnel' : 'particulier'),
+        phone: viewer.phone || '',
+        email: viewer.email || '',
+        showPhone: true,
+        showEmail: true,
+        showWhatsApp: false,
+        showExactAddress: false,
+        showMapLocation: true,
+        phoneConsentAccepted: true,
+      };
 
       const newListing: Listing = {
         ...req.body,
         id: `darna-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         userId: viewer.id,
+        transactionType: txType,
+        period: txType === 'vente' ? 'unique' : req.body.period || 'mois',
         slug: (req.body.title || 'annonce')
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, '-')
           .replace(/(^-|-$)/g, ''),
+        images: Array.isArray(req.body.images) ? req.body.images : [],
+        amenities: Array.isArray(req.body.amenities) ? req.body.amenities : [],
+        contact: req.body.contact ? { ...defaultContact, ...req.body.contact } : defaultContact,
         viewsCount: 0,
         favoritesCount: 0,
         createdAt: nowIso,
@@ -2009,12 +2169,20 @@ export function createDarnaApiApp(
         }
       }
 
+      const updatedTxType =
+        req.body.transactionType === 'vente'
+          ? 'vente'
+          : req.body.transactionType === 'location'
+          ? 'location'
+          : existing.transactionType || 'location';
+
       // Prevent non-admins from forging paid boost or changing listing owner
       const updatedListing: Listing = {
         ...existing,
         ...req.body,
         id: existing.id,
         userId: existing.userId,
+        transactionType: updatedTxType,
         boost: viewer.role === 'admin' && req.body.boost !== undefined ? req.body.boost : existing.boost,
         updatedAt: new Date().toISOString(),
       };
@@ -2193,24 +2361,31 @@ export function createDarnaApiApp(
   // ==========================================================================
 
   app.get('/api/monetization/config', (_req, res) => {
-    const liveConfigured = Boolean(
-      process.env.PAYMENT_GATEWAY_MODE === 'production' &&
-        process.env.CMI_MERCHANT_ID &&
-        process.env.CMI_STORE_KEY
-    );
+    // Real bank payments remain strictly disabled by policy until production merchant contract activation
+    const liveConfigured = false;
     res.json({
       success: true,
       plans: db.getAllPlans(),
       boostOptions: db.getAllBoostOptions(),
       paymentGateway: {
-        mode: liveConfigured ? 'production' : 'test',
-        providerName: liveConfigured
-          ? 'Passerelle CMI / Payzone Maroc'
-          : 'Passerelle CMI / Payzone Maroc (Mode Test / Bac à sable)',
+        mode: 'test',
+        providerName: 'Passerelle CMI / Payzone Maroc (Mode Simulation / Bac à sable)',
         liveOperational: liveConfigured,
+        realPaymentsEnabled: false,
         currency: 'MAD',
         notice:
-          'Mode Test actif : aucun débit bancaire réel n’est effectué tant que les identifiants marchands CMI/Payzone de production ne sont pas configurés.',
+          'Paiements réels désactivés : aucun débit bancaire réel n’est effectué. Seule la simulation en bac à sable est active.',
+        disabledRealFeatures: [
+          'Débit bancaire réel par carte CMI / Visa / Mastercard',
+          'Prélèvement réel Payzone Maroc',
+          'Facturation bancaire automatique récurrente',
+        ],
+        simulationCapabilities: [
+          'Souscription simulée aux offres Particulier et Agence (0 DH débité)',
+          'Activation simulée des options de mise en avant « Sponsorisé »',
+          'Simulation d’échec bancaire pour vérifier le non-déclenchement des options',
+          'Test de protection anti-double paiement (clé d’idempotence)',
+        ],
       },
     });
   });
@@ -3556,9 +3731,11 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     res.status(200).setHeader('Content-Type', 'application/xml; charset=utf-8').send(xml);
   });
 
-  app.get('/manifest.webmanifest', (_req, res) => {
-    const manifestPath = path.resolve(process.cwd(), 'public', 'manifest.webmanifest');
-    if (fs.existsSync(manifestPath)) {
+  app.get(['/manifest.webmanifest', '/manifest.json'], (_req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    const manifestPath = resolveStaticAssetPath('manifest.webmanifest');
+    if (manifestPath && fs.existsSync(manifestPath)) {
       const content = fs.readFileSync(manifestPath, 'utf-8');
       return res
         .status(200)
@@ -3567,10 +3744,10 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     }
     const manifest = {
       id: '/',
-      name: 'Darna - Location Immobilière Maroc',
+      name: 'Darna - Immobilier Maroc (Louer & Acheter)',
       short_name: 'Darna',
       description:
-        "Plateforme moderne de location immobilière au Maroc : annonces d'appartements, villas, studios, bureaux et commerces.",
+        "Plateforme moderne de location et vente immobilière au Maroc : annonces d'appartements, villas, studios, bureaux et commerces.",
       start_url: '/',
       scope: '/',
       display: 'standalone',
@@ -3611,9 +3788,33 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       .send(JSON.stringify(manifest, null, 2));
   });
 
+  app.get('/sw.js', (_req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Service-Worker-Allowed', '/');
+    const swPath = resolveStaticAssetPath('sw.js');
+    if (swPath && fs.existsSync(swPath)) {
+      const content = fs.readFileSync(swPath, 'utf-8');
+      return res
+        .status(200)
+        .setHeader('Content-Type', 'application/javascript; charset=utf-8')
+        .send(content);
+    }
+    const fallbackSw = `self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', () => {});\n`;
+    return res
+      .status(200)
+      .setHeader('Content-Type', 'application/javascript; charset=utf-8')
+      .send(fallbackSw);
+  });
+
   app.get(['/favicon.svg', '/favicon.ico'], (_req, res) => {
-    const svgPath = path.resolve(process.cwd(), 'public', 'favicon.svg');
-    const content = fs.existsSync(svgPath) ? fs.readFileSync(svgPath, 'utf-8') : DARNA_FAVICON_SVG;
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    const svgPath = resolveStaticAssetPath('favicon.svg');
+    const content =
+      svgPath && fs.existsSync(svgPath) ? fs.readFileSync(svgPath, 'utf-8') : DARNA_FAVICON_SVG;
     res.status(200).setHeader('Content-Type', 'image/svg+xml; charset=utf-8').send(content);
   });
 
@@ -3627,12 +3828,9 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     ],
     (req, res) => {
       const filename = path.basename(req.path);
-      const distFile = path.resolve(process.cwd(), 'dist', filename);
-      const publicFile = path.resolve(process.cwd(), 'public', filename);
-      const targetFile =
-        process.env.NODE_ENV === 'production' && fs.existsSync(distFile) ? distFile : publicFile;
+      const targetFile = resolveStaticAssetPath(filename);
 
-      if (!fs.existsSync(targetFile)) {
+      if (!targetFile || !fs.existsSync(targetFile)) {
         return res.status(404).send('Fichier introuvable');
       }
 
@@ -3653,7 +3851,22 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     const rawListing = annonceId ? db.getListingById(annonceId) : null;
 
     if (!isPublishedListingStatus(rawListing)) {
-      return rawHtml;
+      // Replace hardcoded https://darna.ma in homepage OpenGraph tags with the actual configured domain
+      const safeHomeUrl = escapeHtml(`${baseHttpsUrl}/`);
+      const safeHomeImg = escapeHtml(defaultOgImageUrl);
+      return rawHtml
+        .replace(
+          /<meta\s+property="og:url"\s+content="[^"]*"\s*\/?>/i,
+          `<meta property="og:url" content="${safeHomeUrl}" />`
+        )
+        .replace(
+          /<meta\s+property="og:image"\s+content="[^"]*"\s*\/?>/i,
+          `<meta property="og:image" content="${safeHomeImg}" />`
+        )
+        .replace(
+          /<meta\s+name="twitter:image"\s+content="[^"]*"\s*\/?>/i,
+          `<meta name="twitter:image" content="${safeHomeImg}" />`
+        );
     }
 
     // Sanitize using visitor rules so phone, WhatsApp, email, and exact street address are NEVER exposed
@@ -3664,20 +3877,31 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       categoryRaw.charAt(0).toUpperCase() + categoryRaw.slice(1);
     const cityLabel = String(listing.city || 'Maroc').trim();
     const districtLabel = String(listing.district || '').trim();
+    const isSale = listing.transactionType === 'vente';
 
     const periodLabel =
       listing.period === 'jour' ? 'jour' : listing.period === 'an' ? 'an' : 'mois';
-    const priceFormatted = `${Number(listing.price || 0).toLocaleString('fr-FR')} MAD/${periodLabel}`;
+    const priceFormatted = isSale
+      ? `${Number(listing.price || 0).toLocaleString('fr-FR')} MAD`
+      : `${Number(listing.price || 0).toLocaleString('fr-FR')} MAD/${periodLabel}`;
     const surfaceFormatted = `${Number(listing.surface || 0)} m²`;
     const roomsCount = Number(listing.rooms || 1);
     const roomsFormatted = `${roomsCount} pièce${roomsCount > 1 ? 's' : ''}`;
 
-    const rawOgTitle = `${categoryLabel} à ${cityLabel}${
-      districtLabel ? ` (${districtLabel})` : ''
-    } | Darna`;
-    const rawOgDescription = `Location ${categoryLabel.toLowerCase()} à ${cityLabel}${
-      districtLabel ? ` (${districtLabel})` : ''
-    } : ${priceFormatted}, ${surfaceFormatted}, ${roomsFormatted}.`;
+    const rawOgTitle = isSale
+      ? `${categoryLabel} à vendre à ${cityLabel}${
+          districtLabel ? ` (${districtLabel})` : ''
+        } | Darna`
+      : `${categoryLabel} à ${cityLabel}${
+          districtLabel ? ` (${districtLabel})` : ''
+        } | Darna`;
+    const rawOgDescription = isSale
+      ? `Vente ${categoryLabel.toLowerCase()} à ${cityLabel}${
+          districtLabel ? ` (${districtLabel})` : ''
+        } : ${priceFormatted}, ${surfaceFormatted}, ${roomsFormatted}.`
+      : `Location ${categoryLabel.toLowerCase()} à ${cityLabel}${
+          districtLabel ? ` (${districtLabel})` : ''
+        } : ${priceFormatted}, ${surfaceFormatted}, ${roomsFormatted}.`;
 
     const firstImg = String(listing.images?.[0] || '').trim();
     let rawOgImage: string;
@@ -3750,12 +3974,18 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
 
   app.get('/', async (req, res, next) => {
     try {
-      const distIndex = path.resolve(process.cwd(), 'dist', 'index.html');
-      const rootIndex = path.resolve(process.cwd(), 'index.html');
+      const distIndex = path.resolve(APP_ROOT_DIR, 'dist', 'index.html');
+      const rootIndex = path.resolve(APP_ROOT_DIR, 'index.html');
+      const cwdDistIndex = path.resolve(process.cwd(), 'dist', 'index.html');
+      const cwdRootIndex = path.resolve(process.cwd(), 'index.html');
       const targetIndex =
         process.env.NODE_ENV === 'production' && fs.existsSync(distIndex)
           ? distIndex
-          : rootIndex;
+          : process.env.NODE_ENV === 'production' && fs.existsSync(cwdDistIndex)
+          ? cwdDistIndex
+          : fs.existsSync(rootIndex)
+          ? rootIndex
+          : cwdRootIndex;
 
       if (!fs.existsSync(targetIndex)) {
         return next();

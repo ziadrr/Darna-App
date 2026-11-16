@@ -427,11 +427,26 @@ export class DarnaPersistentDb {
       const listingCountRow = this.db
         .prepare('SELECT COUNT(*) as cnt FROM listings')
         .get() as { cnt: number };
+      const insertListing = this.db.prepare(
+        'INSERT OR IGNORE INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      );
       if (!listingCountRow || listingCountRow.cnt === 0) {
-        const insertListing = this.db.prepare(
-          'INSERT INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        );
         INITIAL_LISTINGS.forEach((listing, index) => {
+          const sortTime =
+            new Date(listing.createdAt || nowIso).getTime() || Date.now() - index * 1000;
+          insertListing.run(
+            listing.id,
+            listing.userId,
+            listing.status,
+            sortTime,
+            JSON.stringify(listing),
+            listing.createdAt || nowIso,
+            listing.updatedAt || nowIso
+          );
+        });
+      } else {
+        // Ensure new 'vente' demo listings are available in existing demo DBs without modifying or deleting any existing rental listing
+        INITIAL_LISTINGS.filter((l) => l.transactionType === 'vente').forEach((listing, index) => {
           const sortTime =
             new Date(listing.createdAt || nowIso).getTime() || Date.now() - index * 1000;
           insertListing.run(

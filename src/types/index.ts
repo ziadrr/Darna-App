@@ -21,7 +21,9 @@ export type ListingStatus =
 
 export type AdvertiserType = 'particulier' | 'professionnel';
 
-export type RentPeriod = 'mois' | 'jour' | 'an';
+export type RentPeriod = 'mois' | 'jour' | 'an' | 'unique';
+
+export type TransactionType = 'location' | 'vente';
 
 export type UserRole = 'visiteur' | 'particulier' | 'professionnel' | 'admin';
 
@@ -138,6 +140,7 @@ export interface Listing {
   slug: string;
   description: string;
   category: PropertyCategory;
+  transactionType?: TransactionType; // 'location' (À louer, par défaut) | 'vente' (À vendre)
   price: number; // in MAD
   period: RentPeriod;
   deposit?: number; // caution en MAD
@@ -175,6 +178,7 @@ export interface ListingFilter {
   city?: string;
   district?: string;
   category?: PropertyCategory | 'all';
+  transactionType?: TransactionType | 'all';
   priceMin?: number;
   priceMax?: number;
   period?: RentPeriod | 'all';
