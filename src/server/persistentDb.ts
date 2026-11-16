@@ -54,6 +54,7 @@ export class DarnaPersistentDb {
   private cloudSqlHydrated = false;
   private lastCloudSqlSyncAt = 0;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
+  private imageCleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     customDbPath?: string,
@@ -87,6 +88,21 @@ export class DarnaPersistentDb {
     this.db = new sqlite.DatabaseSync(this.dbFilePath);
     this.initSchema();
     this.seedInitialDataIfEmpty();
+    this.cleanupOrphanedUploadedImages();
+
+    const cleanupIntervalMs = Number(
+      process.env.UPLOADED_IMAGES_CLEANUP_INTERVAL_MS || 24 * 60 * 60 * 1000
+    );
+    this.imageCleanupInterval = setInterval(() => {
+      try {
+        this.cleanupOrphanedUploadedImages();
+      } catch {
+        // Ignore cleanup errors if DB is already closed
+      }
+    }, cleanupIntervalMs);
+    if (typeof this.imageCleanupInterval.unref === 'function') {
+      this.imageCleanupInterval.unref();
+    }
   }
 
   /**
@@ -1202,11 +1218,29 @@ export class DarnaPersistentDb {
 
   public async deleteListing(id: string): Promise<boolean> {
     this.assertCloudSqlWritable();
+    const existing = this.getListingById(id);
+    const candidateImageIds = this.extractUploadedImageIdsFromUrls(existing?.images);
+
     if (this.enableCloudSqlSync) {
       await deleteListingFromCloudSql(id);
     }
     const res = this.db.prepare('DELETE FROM listings WHERE id = ?').run(id);
-    return Number(res.changes) > 0;
+    const deleted = Number(res.changes) > 0;
+
+    if (deleted && candidateImageIds.size > 0) {
+      const stillReferencedIds = this.getAllReferencedUploadedImageIds(id);
+      let deletedImagesCount = 0;
+      const deleteImgStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
+      for (const imgId of candidateImageIds) {
+        if (!stillReferencedIds.has(imgId)) {
+          const imgRes = deleteImgStmt.run(imgId);
+          deletedImagesCount += Number(imgRes.changes);
+        }
+      }
+      console.log(`[ImageCleanup] ${deletedImagesCount} image(s) supprimée(s).`);
+    }
+
+    return deleted;
   }
 
   // ==========================================================================
@@ -1624,6 +1658,8 @@ export class DarnaPersistentDb {
     width: number;
     height: number;
     buffer: Buffer;
+    sizeBytes?: number;
+    createdAt?: string;
   }): {
     id: string;
     url: string;
@@ -1633,7 +1669,7 @@ export class DarnaPersistentDb {
     sizeBytes: number;
     createdAt: string;
   } {
-    const nowIso = new Date().toISOString();
+    const createdAtIso = params.createdAt || new Date().toISOString();
     const ext =
       params.mimeType === 'image/jpeg'
         ? 'jpg'
@@ -1643,7 +1679,10 @@ export class DarnaPersistentDb {
             ? 'webp'
             : 'gif';
     const cleanId = params.id.replace(/[^a-zA-Z0-9_-]/g, '');
-    const sizeBytes = params.buffer.length;
+    const sizeBytes =
+      typeof params.sizeBytes === 'number' && Number.isFinite(params.sizeBytes)
+        ? Math.max(0, Math.floor(params.sizeBytes))
+        : params.buffer.length;
 
     this.db
       .prepare(
@@ -1659,7 +1698,7 @@ export class DarnaPersistentDb {
         params.height,
         sizeBytes,
         params.buffer,
-        nowIso
+        createdAtIso
       );
 
     return {
@@ -1669,8 +1708,101 @@ export class DarnaPersistentDb {
       width: params.width,
       height: params.height,
       sizeBytes,
-      createdAt: nowIso,
+      createdAt: createdAtIso,
     };
+  }
+
+  public getUserUploadedImageStats(userId: string): {
+    count: number;
+    totalBytes: number;
+  } {
+    const row = this.db
+      .prepare(
+        'SELECT COUNT(*) as cnt, COALESCE(SUM(size_bytes), 0) as total_bytes FROM uploaded_images WHERE user_id = ?'
+      )
+      .get(userId) as { cnt: number; total_bytes: number } | undefined;
+
+    return {
+      count: Number(row?.cnt || 0),
+      totalBytes: Number(row?.total_bytes || 0),
+    };
+  }
+
+  private extractUploadedImageIdFromUrl(rawUrl: unknown): string | null {
+    const str = String(rawUrl || '').trim();
+    if (!str) return null;
+    const match = str.match(/(?:\/api)?\/uploads\/images\/([^/?#]+)/i);
+    const filename = match ? match[1] : str.startsWith('img-') ? str : '';
+    if (!filename) return null;
+    const baseId = filename.replace(/\.[a-z0-9]+$/i, '').replace(/[^a-zA-Z0-9_-]/g, '');
+    return baseId || null;
+  }
+
+  private extractUploadedImageIdsFromUrls(urls: unknown): Set<string> {
+    const ids = new Set<string>();
+    if (!Array.isArray(urls)) return ids;
+    for (const u of urls) {
+      const id = this.extractUploadedImageIdFromUrl(u);
+      if (id) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  public getAllReferencedUploadedImageIds(excludeListingId?: string): Set<string> {
+    const referenced = new Set<string>();
+    const rows = this.db
+      .prepare('SELECT id, data_json FROM listings')
+      .all() as { id: string; data_json: string }[];
+
+    for (const row of rows) {
+      if (excludeListingId && row.id === excludeListingId) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(row.data_json) as Listing;
+        const ids = this.extractUploadedImageIdsFromUrls(parsed?.images);
+        for (const id of ids) {
+          referenced.add(id);
+        }
+      } catch {
+        // Ignore malformed listing JSON
+      }
+    }
+    return referenced;
+  }
+
+  /**
+   * Deletes uploaded_images rows that are NOT referenced by any listing
+   * AND whose created_at is strictly older than maxAgeMs (defaults to 48 hours).
+   * Logs ONLY the number of deleted images.
+   */
+  public cleanupOrphanedUploadedImages(
+    maxAgeMs: number = 48 * 60 * 60 * 1000,
+    nowMs: number = Date.now()
+  ): number {
+    const referencedIds = this.getAllReferencedUploadedImageIds();
+    const rows = this.db
+      .prepare('SELECT id, created_at FROM uploaded_images')
+      .all() as { id: string; created_at: string }[];
+
+    let deletedCount = 0;
+    const deleteStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
+
+    for (const row of rows) {
+      if (referencedIds.has(row.id)) {
+        continue;
+      }
+      const createdMs = Date.parse(row.created_at);
+      if (!Number.isNaN(createdMs) && nowMs - createdMs > maxAgeMs) {
+        const res = deleteStmt.run(row.id);
+        deletedCount += Number(res.changes);
+      }
+    }
+
+    console.log(`[ImageCleanup] ${deletedCount} image(s) supprimée(s).`);
+    return deletedCount;
   }
 
   public getUploadedImage(idOrFilename: string): {
@@ -1720,6 +1852,10 @@ export class DarnaPersistentDb {
   }
 
   public close(): void {
+    if (this.imageCleanupInterval) {
+      clearInterval(this.imageCleanupInterval);
+      this.imageCleanupInterval = null;
+    }
     try {
       this.db.close();
     } catch {

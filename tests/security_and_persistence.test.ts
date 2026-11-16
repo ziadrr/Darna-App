@@ -3322,6 +3322,547 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       'Server payment confirmation must activate listing boost'
     );
   });
+
+  it('28. Hardened POST /api/uploads/image: requires emailVerified=true (403), enforces 30/h user & IP rate limit (429), 200 images / 300 MB quota (413), and cleans up orphaned (>48h) & deleted-listing images while logging only counts', async () => {
+    const sharp = (await import('sharp')).default;
+    const validTinyPngBuffer = await sharp({
+      create: {
+        width: 16,
+        height: 16,
+        channels: 3,
+        background: { r: 30, g: 61, b: 52 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const validTinyPngDataUri = `data:image/png;base64,${validTinyPngBuffer.toString('base64')}`;
+
+    // -------------------------------------------------------------------------
+    // 1. Require emailVerified === true (403 in French otherwise)
+    // -------------------------------------------------------------------------
+    const unverifiedUserId = 'user-upload-unverified-28';
+    await dbInstance.createUser(
+      {
+        id: unverifiedUserId,
+        firstName: 'Youssef',
+        lastName: 'NonVerifie',
+        name: 'Youssef NonVerifie',
+        email: 'youssef.unverified28@darna.ma',
+        phone: '0661002801',
+        role: 'particulier',
+        advertiserType: 'particulier',
+        verified: false,
+        emailVerified: false,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'Unverified28Pass!'
+    );
+    const unverifiedToken = await dbInstance.createSession(unverifiedUserId);
+
+    const unverifiedRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${unverifiedToken}`,
+        'X-Forwarded-For': '198.51.100.10',
+      },
+      body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+    });
+    assert.equal(
+      unverifiedRes.status,
+      403,
+      'POST /api/uploads/image must reject users with emailVerified !== true with HTTP 403'
+    );
+    const unverifiedBody = await unverifiedRes.json();
+    assert.equal(unverifiedBody.success, false);
+    assert.match(
+      String(unverifiedBody.message || ''),
+      /vérifi|e-mail/i,
+      '403 error message must be in French and mention email verification'
+    );
+
+    // -------------------------------------------------------------------------
+    // 2. Rate limit: 30 uploads/hour per user AND per IP (429 in French)
+    // -------------------------------------------------------------------------
+    // 2A. Per-user rate limit: same user across 30 distinct IPs succeeds 30 times, 31st fails with 429
+    const rlUserId = 'user-upload-rl-user-28';
+    await dbInstance.createUser(
+      {
+        id: rlUserId,
+        firstName: 'Nadia',
+        lastName: 'RateLimitUser',
+        name: 'Nadia RateLimitUser',
+        email: 'nadia.rluser28@darna.ma',
+        phone: '0661002802',
+        role: 'particulier',
+        advertiserType: 'particulier',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'RateLimitUser28!'
+    );
+    const rlUserToken = await dbInstance.createSession(rlUserId);
+
+    for (let i = 1; i <= 30; i++) {
+      const okRes = await fetch(`${baseUrl}/api/uploads/image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${rlUserToken}`,
+          'X-Forwarded-For': `198.51.101.${i}`,
+        },
+        body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+      });
+      assert.equal(okRes.status, 200, `User upload #${i}/30 should succeed`);
+    }
+
+    const user31stRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${rlUserToken}`,
+        'X-Forwarded-For': '198.51.101.250', // Fresh IP, but user has reached 30/h
+      },
+      body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+    });
+    assert.equal(
+      user31stRes.status,
+      429,
+      '31st upload in an hour by the same user must return HTTP 429 even from a new IP'
+    );
+    const user31stBody = await user31stRes.json();
+    assert.match(
+      String(user31stBody.message || ''),
+      /limite|heure|téléversement|patienter/i,
+      '429 per-user rate limit message must be in French'
+    );
+
+    // 2B. Per-IP rate limit: two users sharing the same IP (15 + 15 = 30 uploads) -> 31st from that IP returns 429
+    const sharedIp = '198.51.102.77';
+    const ipUser1 = 'user-upload-rl-ip1-28';
+    const ipUser2 = 'user-upload-rl-ip2-28';
+    const ipUser3 = 'user-upload-rl-ip3-28';
+    for (const [idx, uid] of [ipUser1, ipUser2, ipUser3].entries()) {
+      await dbInstance.createUser(
+        {
+          id: uid,
+          firstName: 'UserIp',
+          lastName: `Num${idx}`,
+          name: `UserIp Num${idx}`,
+          email: `userip.${idx}.28@darna.ma`,
+          phone: `066100281${idx}`,
+          role: 'particulier',
+          advertiserType: 'particulier',
+          verified: true,
+          emailVerified: true,
+          favorites: [],
+          createdAt: new Date().toISOString().split('T')[0],
+        },
+        'SharedIpPass28!'
+      );
+    }
+    const ipToken1 = await dbInstance.createSession(ipUser1);
+    const ipToken2 = await dbInstance.createSession(ipUser2);
+    const ipToken3 = await dbInstance.createSession(ipUser3);
+
+    for (let i = 1; i <= 15; i++) {
+      const r1 = await fetch(`${baseUrl}/api/uploads/image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ipToken1}`,
+          'X-Forwarded-For': sharedIp,
+        },
+        body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+      });
+      assert.equal(r1.status, 200);
+
+      const r2 = await fetch(`${baseUrl}/api/uploads/image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ipToken2}`,
+          'X-Forwarded-For': sharedIp,
+        },
+        body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+      });
+      assert.equal(r2.status, 200);
+    }
+
+    const ip31stRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ipToken3}`, // Brand new user with 0 uploads, but on the rate-limited IP
+        'X-Forwarded-For': sharedIp,
+      },
+      body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+    });
+    assert.equal(
+      ip31stRes.status,
+      429,
+      '31st upload in an hour from the same IP must return HTTP 429 even for a different user'
+    );
+    const ip31stBody = await ip31stRes.json();
+    assert.match(
+      String(ip31stBody.message || ''),
+      /limite|heure|adresse IP|patienter/i,
+      '429 per-IP rate limit message must be in French'
+    );
+
+    // -------------------------------------------------------------------------
+    // 3. Per-User Quota: 200 images max and 300 MB cumulative max (413 in French)
+    // -------------------------------------------------------------------------
+    // 3A. 200 images maximum per user
+    const countQuotaUserId = 'user-upload-quota-count-28';
+    await dbInstance.createUser(
+      {
+        id: countQuotaUserId,
+        firstName: 'Omar',
+        lastName: 'QuotaCount',
+        name: 'Omar QuotaCount',
+        email: 'omar.quotacount28@darna.ma',
+        phone: '0661002820',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'QuotaCountPass28!'
+    );
+    const countQuotaToken = await dbInstance.createSession(countQuotaUserId);
+
+    for (let i = 1; i <= 200; i++) {
+      dbInstance.saveUploadedImage({
+        id: `img-quota-cnt-${i}`,
+        userId: countQuotaUserId,
+        mimeType: 'image/png',
+        width: 16,
+        height: 16,
+        buffer: validTinyPngBuffer,
+      });
+    }
+    assert.equal(dbInstance.getUserUploadedImageStats(countQuotaUserId).count, 200);
+
+    const overCountRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${countQuotaToken}`,
+        'X-Forwarded-For': '198.51.103.10',
+      },
+      body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+    });
+    assert.equal(
+      overCountRes.status,
+      413,
+      '201st image for a user must be rejected with HTTP 413'
+    );
+    const overCountBody = await overCountRes.json();
+    assert.match(
+      String(overCountBody.message || ''),
+      /quota|200 images|300 Mo/i,
+      '413 count quota message must be in French'
+    );
+    assert.equal(
+      dbInstance.getUserUploadedImageStats(countQuotaUserId).count,
+      200,
+      'Over-quota image must not be saved in uploaded_images'
+    );
+
+    // 3B. 300 MB cumulative maximum per user
+    const bytesQuotaUserId = 'user-upload-quota-bytes-28';
+    await dbInstance.createUser(
+      {
+        id: bytesQuotaUserId,
+        firstName: 'Salma',
+        lastName: 'QuotaBytes',
+        name: 'Salma QuotaBytes',
+        email: 'salma.quotabytes28@darna.ma',
+        phone: '0661002821',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'QuotaBytesPass28!'
+    );
+    const bytesQuotaToken = await dbInstance.createSession(bytesQuotaUserId);
+
+    const max300Mb = 300 * 1024 * 1024;
+    // Seed 1 image with sizeBytes = 300 MB - 10 bytes so the next upload exceeds 300 MB
+    dbInstance.saveUploadedImage({
+      id: 'img-quota-bytes-almost-300mb',
+      userId: bytesQuotaUserId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      sizeBytes: max300Mb - 10,
+    });
+    assert.equal(dbInstance.getUserUploadedImageStats(bytesQuotaUserId).totalBytes, max300Mb - 10);
+
+    const overBytesRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${bytesQuotaToken}`,
+        'X-Forwarded-For': '198.51.103.11',
+      },
+      body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+    });
+    assert.equal(
+      overBytesRes.status,
+      413,
+      'Upload exceeding 300 MB cumulative per-user quota must return HTTP 413'
+    );
+    const overBytesBody = await overBytesRes.json();
+    assert.match(
+      String(overBytesBody.message || ''),
+      /quota|300 Mo/i,
+      '413 byte quota message must be in French'
+    );
+    assert.equal(
+      dbInstance.getUserUploadedImageStats(bytesQuotaUserId).count,
+      1,
+      'Over-quota byte upload must not be stored in uploaded_images'
+    );
+
+    // -------------------------------------------------------------------------
+    // 4. Cleanup Jobs (>48h orphan cleanup at startup/24h + listing deletion cleanup) & Count-Only Logging
+    // -------------------------------------------------------------------------
+    const cleanupOwnerId = 'user-upload-cleanup-28';
+    await dbInstance.createUser(
+      {
+        id: cleanupOwnerId,
+        firstName: 'Hicham',
+        lastName: 'Cleanup',
+        name: 'Hicham Cleanup',
+        email: 'hicham.cleanup28@darna.ma',
+        phone: '0661002830',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 100,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'CleanupPass28!'
+    );
+    const cleanupOwnerToken = await dbInstance.createSession(cleanupOwnerId);
+
+    const nowMs = Date.now();
+    const seventyTwoHoursAgoIso = new Date(nowMs - 72 * 3600 * 1000).toISOString();
+    const twelveHoursAgoIso = new Date(nowMs - 12 * 3600 * 1000).toISOString();
+    const ninetySixHoursAgoIso = new Date(nowMs - 96 * 3600 * 1000).toISOString();
+
+    const orphanOld = dbInstance.saveUploadedImage({
+      id: 'img-secret-orphan-old-72h',
+      userId: cleanupOwnerId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: seventyTwoHoursAgoIso,
+    });
+    const orphanRecent = dbInstance.saveUploadedImage({
+      id: 'img-secret-orphan-recent-12h',
+      userId: cleanupOwnerId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: twelveHoursAgoIso,
+    });
+    const referencedOld = dbInstance.saveUploadedImage({
+      id: 'img-secret-referenced-old-96h',
+      userId: cleanupOwnerId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: ninetySixHoursAgoIso,
+    });
+    const exclusiveImgA = dbInstance.saveUploadedImage({
+      id: 'img-secret-exclusive-listing-a',
+      userId: cleanupOwnerId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: ninetySixHoursAgoIso,
+    });
+    const sharedImgAB = dbInstance.saveUploadedImage({
+      id: 'img-secret-shared-listing-ab',
+      userId: cleanupOwnerId,
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: ninetySixHoursAgoIso,
+    });
+
+    // Create Listing A referencing [referencedOld, exclusiveImgA, sharedImgAB]
+    const createARes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cleanupOwnerToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Cleanup A',
+        description: 'Test nettoyage images A',
+        category: 'appartement',
+        price: 7500,
+        city: 'Rabat',
+        district: 'Agdal',
+        images: [referencedOld.url, exclusiveImgA.url, sharedImgAB.url],
+      }),
+    });
+    assert.equal(createARes.status, 201);
+    const { listing: listingA } = await createARes.json();
+
+    // Create Listing B also referencing [sharedImgAB]
+    const createBRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cleanupOwnerToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Cleanup B',
+        description: 'Test nettoyage images B',
+        category: 'appartement',
+        price: 8200,
+        city: 'Rabat',
+        district: 'Hay Riad',
+        images: [sharedImgAB.url],
+      }),
+    });
+    assert.equal(createBRes.status, 201);
+    const { listing: listingB } = await createBRes.json();
+
+    // Capture console.log output during orphan cleanup
+    const capturedLogs: string[] = [];
+    const origConsoleLog = console.log;
+    console.log = (...args: unknown[]) => {
+      capturedLogs.push(args.map((a) => String(a)).join(' '));
+      origConsoleLog(...args);
+    };
+
+    try {
+      const deletedOrphans = dbInstance.cleanupOrphanedUploadedImages(48 * 3600 * 1000, nowMs);
+      assert.equal(
+        deletedOrphans,
+        1,
+        'cleanupOrphanedUploadedImages must delete only the unreferenced image older than 48h'
+      );
+      assert.equal(
+        dbInstance.getUploadedImage(orphanOld.id),
+        null,
+        'Unreferenced image > 48h must be deleted'
+      );
+      assert.ok(
+        dbInstance.getUploadedImage(orphanRecent.id),
+        'Unreferenced image < 48h must be preserved'
+      );
+      assert.ok(
+        dbInstance.getUploadedImage(referencedOld.id),
+        'Referenced image > 48h must be preserved'
+      );
+
+      // Delete Listing A: exclusiveImgA & referencedOld should be deleted, but sharedImgAB must be kept (used by Listing B)
+      const delARes = await fetch(`${baseUrl}/api/listings/${listingA.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${cleanupOwnerToken}` },
+      });
+      assert.equal(delARes.status, 200);
+
+      assert.equal(
+        dbInstance.getUploadedImage(exclusiveImgA.id),
+        null,
+        'Image used exclusively by deleted Listing A must be deleted from uploaded_images'
+      );
+      assert.equal(
+        dbInstance.getUploadedImage(referencedOld.id),
+        null,
+        'Second image used exclusively by deleted Listing A must also be deleted'
+      );
+      assert.ok(
+        dbInstance.getUploadedImage(sharedImgAB.id),
+        'Image shared with Listing B must NOT be deleted when Listing A is deleted'
+      );
+
+      // Now delete Listing B: sharedImgAB is no longer referenced by any listing and must be deleted
+      const delBRes = await fetch(`${baseUrl}/api/listings/${listingB.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${cleanupOwnerToken}` },
+      });
+      assert.equal(delBRes.status, 200);
+      assert.equal(
+        dbInstance.getUploadedImage(sharedImgAB.id),
+        null,
+        'Shared image must be deleted once the last listing referencing it (Listing B) is deleted'
+      );
+    } finally {
+      console.log = origConsoleLog;
+    }
+
+    // Verify logs only contain the count of deleted images and never leak image IDs, URLs, or user info
+    const cleanupLogLines = capturedLogs.filter((line) => line.includes('[ImageCleanup]'));
+    assert.ok(
+      cleanupLogLines.length >= 3,
+      'Cleanup and listing deletions must log the number of deleted images'
+    );
+    for (const line of cleanupLogLines) {
+      assert.match(line, /^\[ImageCleanup\] \d+ image\(s\) supprimée\(s\)\.$/);
+      assert.ok(!line.includes('img-secret'), 'Cleanup log must never leak image IDs or URLs');
+      assert.ok(!line.includes(cleanupOwnerId), 'Cleanup log must never leak user IDs');
+      assert.ok(!line.includes('hicham.cleanup28@darna.ma'), 'Cleanup log must never leak emails');
+    }
+
+    // Also verify startup execution of cleanupOrphanedUploadedImages when initializing a DB instance
+    const startupDbPath = path.join(os.tmpdir(), `darna-startup-cleanup-${Date.now()}.sqlite`);
+    const prepDb = new DarnaPersistentDb(startupDbPath);
+    prepDb.saveUploadedImage({
+      id: 'img-startup-orphan-old',
+      userId: 'user-startup',
+      mimeType: 'image/png',
+      width: 16,
+      height: 16,
+      buffer: validTinyPngBuffer,
+      createdAt: seventyTwoHoursAgoIso,
+    });
+    prepDb.close();
+
+    // Re-opening DarnaPersistentDb on startup must automatically purge the >48h orphan image
+    const reopenedDb = new DarnaPersistentDb(startupDbPath);
+    assert.equal(
+      reopenedDb.getUploadedImage('img-startup-orphan-old'),
+      null,
+      'Startup job must automatically delete unreferenced uploaded_images older than 48h'
+    );
+    reopenedDb.close();
+    if (fs.existsSync(startupDbPath)) {
+      fs.unlinkSync(startupDbPath);
+    }
+  });
 });
+
 
 

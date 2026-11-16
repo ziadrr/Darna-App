@@ -503,6 +503,8 @@ export function createDarnaApiApp(
   const aiImageIpLimiter = new Map<string, { count: number; resetAt: number }>();
   const conversationMessageUserLimiter = new Map<string, { count: number; resetAt: number }>();
   const conversationNewThreadUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const imageUploadUserLimiter = new Map<string, { count: number; resetAt: number }>();
+  const imageUploadIpLimiter = new Map<string, { count: number; resetAt: number }>();
 
   function consumeUserRateLimit(
     userMap: Map<string, { count: number; resetAt: number }>,
@@ -2078,6 +2080,24 @@ export function createDarnaApiApp(
       }
 
       const outMeta = await sharp(outBuffer).metadata();
+      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+      const maxUserImageBytes = Number(
+        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+      );
+      const currentQuota = db.getUserUploadedImageStats(userId);
+      if (
+        currentQuota.count >= maxUserImageCount ||
+        currentQuota.totalBytes + outBuffer.length > maxUserImageBytes ||
+        currentQuota.totalBytes + rawBuffer.length > maxUserImageBytes
+      ) {
+        return {
+          valid: false,
+          code: 'IMAGE_QUOTA_EXCEEDED',
+          message:
+            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+        };
+      }
+
       const imgId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const saved = db.saveUploadedImage({
         id: imgId,
@@ -2261,7 +2281,9 @@ export function createDarnaApiApp(
 
   /**
    * Secure Personal Property Photo Upload Endpoint (POST /api/uploads/image)
-   * - Requires authenticated user
+   * - Requires authenticated user with emailVerified === true (403 in French otherwise)
+   * - Enforces 30 uploads/hour per user AND per IP (429 in French otherwise)
+   * - Enforces per-user quota of 200 images and 300 MB cumulative max (413 in French otherwise)
    * - Accepts only image/jpeg, image/png, image/webp, image/gif up to 5 MB decoded
    * - Verifies real image structure, strips EXIF/GPS metadata via sharp, and stores in uploaded_images
    */
@@ -2273,6 +2295,51 @@ export function createDarnaApiApp(
         success: false,
         code: 'UNAUTHORIZED',
         message: 'Créez un compte ou connectez-vous pour téléverser vos photos personnelles.',
+      });
+    }
+
+    if (viewer.emailVerified !== true) {
+      return res.status(403).json({
+        success: false,
+        code: 'EMAIL_NOT_VERIFIED',
+        message:
+          'Votre adresse e-mail doit être vérifiée avant de pouvoir téléverser des photos.',
+      });
+    }
+
+    const uploadHourlyLimit = Number(process.env.IMAGE_UPLOAD_HOURLY_LIMIT || 30);
+    const uploadRateWindowMs = Number(process.env.IMAGE_UPLOAD_WINDOW_MS || 60 * 60 * 1000);
+    const rateCheck = consumeDualRateLimit(
+      imageUploadUserLimiter,
+      imageUploadIpLimiter,
+      viewer.id,
+      getClientIp(req),
+      uploadHourlyLimit,
+      uploadRateWindowMs
+    );
+    if (!rateCheck.allowed) {
+      return res.status(429).json({
+        success: false,
+        code: 'RATE_LIMIT_EXCEEDED',
+        message:
+          'Limite de téléversement atteinte (maximum 30 envois par heure par utilisateur et par adresse IP). Veuillez patienter avant de réessayer.',
+      });
+    }
+
+    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+    const maxUserImageBytes = Number(
+      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+    );
+    const currentQuota = db.getUserUploadedImageStats(viewer.id);
+    if (
+      currentQuota.count >= maxUserImageCount ||
+      currentQuota.totalBytes >= maxUserImageBytes
+    ) {
+      return res.status(413).json({
+        success: false,
+        code: 'IMAGE_QUOTA_EXCEEDED',
+        message:
+          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
       });
     }
 
@@ -2300,12 +2367,30 @@ export function createDarnaApiApp(
       });
     }
 
+    if (currentQuota.totalBytes + parsed.buffer.length > maxUserImageBytes) {
+      return res.status(413).json({
+        success: false,
+        code: 'IMAGE_QUOTA_EXCEEDED',
+        message:
+          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+      });
+    }
+
     const sanitized = await sanitizeAndStoreImageBuffer(
       parsed.buffer,
       parsed.mimeType,
       viewer.id
     );
     if (!sanitized.valid || !sanitized.saved) {
+      if (sanitized.code === 'IMAGE_QUOTA_EXCEEDED') {
+        return res.status(413).json({
+          success: false,
+          code: 'IMAGE_QUOTA_EXCEEDED',
+          message:
+            sanitized.message ||
+            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+        });
+      }
       return res.status(400).json({
         success: false,
         code: sanitized.code || 'INVALID_IMAGE_CONTENT',
