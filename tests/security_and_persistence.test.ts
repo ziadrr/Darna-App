@@ -2274,4 +2274,369 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     const favSvg = await favRes.text();
     assert.ok(favSvg.includes('<svg') && favSvg.includes('#1E3D34'));
   });
+
+  it('23. serves real multi-resolution PNG PWA icons (192x192, 512x512, 512x512 maskable, 180x180 apple-touch-icon), removes DARNA_ICON_PNG_BUFFER, declares any+maskable in manifest.webmanifest, and includes apple-touch-icon link in index.html', async () => {
+    const apiAppSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/server/apiApp.ts'),
+      'utf-8'
+    );
+    assert.ok(
+      !apiAppSource.includes('DARNA_ICON_PNG_BUFFER'),
+      'DARNA_ICON_PNG_BUFFER 1x1 placeholder must be completely removed from src/server/apiApp.ts'
+    );
+
+    const readPngDimensions = (buf: Buffer): { width: number; height: number } => {
+      // PNG signature (8 bytes) + IHDR length (4 bytes) + "IHDR" (4 bytes) -> width at byte 16, height at byte 20
+      assert.equal(buf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'Must be a valid PNG header');
+      return {
+        width: buf.readUInt32BE(16),
+        height: buf.readUInt32BE(20),
+      };
+    };
+
+    const iconChecks = [
+      { path: '/pwa-192x192.png', width: 192, height: 192 },
+      { path: '/pwa-512x512.png', width: 512, height: 512 },
+      { path: '/pwa-512x512-maskable.png', width: 512, height: 512 },
+      { path: '/apple-touch-icon.png', width: 180, height: 180 },
+    ];
+
+    for (const check of iconChecks) {
+      const res = await fetch(`${baseUrl}${check.path}`);
+      assert.equal(res.status, 200, `${check.path} must return HTTP 200`);
+      assert.equal(res.headers.get('content-type'), 'image/png');
+      const buf = Buffer.from(await res.arrayBuffer());
+      assert.ok(buf.length > 500, `${check.path} must be a real rasterized PNG, not a 1x1 pixel`);
+      const dims = readPngDimensions(buf);
+      assert.equal(dims.width, check.width, `${check.path} width must be ${check.width}px`);
+      assert.equal(dims.height, check.height, `${check.path} height must be ${check.height}px`);
+    }
+
+    // Verify manifest.webmanifest declares both "any" and "maskable" icons
+    const manifestRes = await fetch(`${baseUrl}/manifest.webmanifest`);
+    const manifest = await manifestRes.json();
+    const hasAnyPng = manifest.icons.some(
+      (i: any) => i.type === 'image/png' && i.purpose === 'any' && i.sizes === '512x512'
+    );
+    const hasMaskablePng = manifest.icons.some(
+      (i: any) => i.type === 'image/png' && i.purpose === 'maskable' && i.sizes === '512x512'
+    );
+    assert.ok(hasAnyPng, 'manifest.webmanifest must declare a 512x512 PNG icon with purpose="any"');
+    assert.ok(
+      hasMaskablePng,
+      'manifest.webmanifest must declare a 512x512 PNG icon with purpose="maskable"'
+    );
+
+    // Verify index.html contains <link rel="apple-touch-icon"
+    const indexRes = await fetch(`${baseUrl}/`);
+    const indexHtml = await indexRes.text();
+    assert.ok(
+      /<link\s+[^>]*rel="apple-touch-icon"[^>]*href="\/apple-touch-icon\.png"/i.test(indexHtml),
+      'index.html must include <link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    );
+  });
+
+  it('24. restricts /api/listings/:id/cover.jpg and POST/PUT /api/listings to image/jpeg, image/png, image/webp, and image/gif, sets X-Content-Type-Options: nosniff, and caps decoded size at 5 MB', async () => {
+    const sample1x1PngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const sample1x1GifBase64 =
+      'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const sample1x1WebpBase64 =
+      'UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=';
+
+    // 1. Verify /api/listings/:id/cover.jpg accepts jpeg, png, webp, gif and sets X-Content-Type-Options: nosniff
+    const allowedFormats = [
+      { id: 'darna-cover-png', mime: 'image/png', b64: sample1x1PngBase64 },
+      { id: 'darna-cover-gif', mime: 'image/gif', b64: sample1x1GifBase64 },
+      { id: 'darna-cover-webp', mime: 'image/webp', b64: sample1x1WebpBase64 },
+    ];
+
+    for (const fmt of allowedFormats) {
+      await dbInstance.createListing({
+        id: fmt.id,
+        userId: 'user-pro-1',
+        title: `Test ${fmt.mime}`,
+        slug: fmt.id,
+        description: 'Description valide',
+        category: 'appartement',
+        price: 5000,
+        period: 'mois',
+        surface: 60,
+        city: 'Rabat',
+        district: 'Agdal',
+        latitude: 34.0,
+        longitude: -6.8,
+        images: [`data:${fmt.mime};base64,${fmt.b64}`],
+        amenities: [],
+        contact: {
+          name: 'Pro',
+          type: 'professionnel',
+          phone: '0600000000',
+          email: 'pro@darna.ma',
+          showPhone: true,
+          showEmail: true,
+          showWhatsApp: false,
+          showExactAddress: false,
+        },
+        viewsCount: 0,
+        favoritesCount: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        availableFrom: '2026-06-01',
+        legalConsentAccepted: true,
+        status: 'publiee',
+      });
+
+      const res = await fetch(`${baseUrl}/api/listings/${fmt.id}/cover.jpg`);
+      assert.equal(res.status, 200, `cover.jpg must accept ${fmt.mime}`);
+      assert.equal(res.headers.get('content-type'), fmt.mime);
+      assert.equal(
+        res.headers.get('x-content-type-options'),
+        'nosniff',
+        'cover.jpg must set X-Content-Type-Options: nosniff'
+      );
+    }
+
+    // 2. Verify /api/listings/:id/cover.jpg returns 404 for image/svg+xml and any other disallowed type
+    const svgBase64 = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>').toString(
+      'base64'
+    );
+    await dbInstance.createListing({
+      id: 'darna-cover-svg-blocked',
+      userId: 'user-pro-1',
+      title: 'Test SVG Blocked',
+      slug: 'darna-cover-svg-blocked',
+      description: 'Ne doit jamais servir de SVG sur cover.jpg',
+      category: 'appartement',
+      price: 5000,
+      period: 'mois',
+      surface: 60,
+      city: 'Rabat',
+      district: 'Agdal',
+      latitude: 34.0,
+      longitude: -6.8,
+      images: [`data:image/svg+xml;base64,${svgBase64}`],
+      amenities: [],
+      contact: {
+        name: 'Pro',
+        type: 'professionnel',
+        phone: '0600000000',
+        email: 'pro@darna.ma',
+        showPhone: true,
+        showEmail: true,
+        showWhatsApp: false,
+        showExactAddress: false,
+      },
+      viewsCount: 0,
+      favoritesCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableFrom: '2026-06-01',
+      legalConsentAccepted: true,
+      status: 'publiee',
+    });
+
+    const svgCoverRes = await fetch(`${baseUrl}/api/listings/darna-cover-svg-blocked/cover.jpg`);
+    assert.equal(
+      svgCoverRes.status,
+      404,
+      '/api/listings/:id/cover.jpg must return 404 for image/svg+xml'
+    );
+    assert.equal(svgCoverRes.headers.get('x-content-type-options'), 'nosniff');
+
+    // 3. Verify /api/listings/:id/cover.jpg returns 404 when decoded size exceeds 5 MB
+    const over5MbBuffer = Buffer.alloc(5 * 1024 * 1024 + 1024, 0x41);
+    await dbInstance.createListing({
+      id: 'darna-cover-over-5mb',
+      userId: 'user-pro-1',
+      title: 'Test Over 5MB',
+      slug: 'darna-cover-over-5mb',
+      description: 'Image > 5 Mo',
+      category: 'appartement',
+      price: 5000,
+      period: 'mois',
+      surface: 60,
+      city: 'Rabat',
+      district: 'Agdal',
+      latitude: 34.0,
+      longitude: -6.8,
+      images: [`data:image/jpeg;base64,${over5MbBuffer.toString('base64')}`],
+      amenities: [],
+      contact: {
+        name: 'Pro',
+        type: 'professionnel',
+        phone: '0600000000',
+        email: 'pro@darna.ma',
+        showPhone: true,
+        showEmail: true,
+        showWhatsApp: false,
+        showExactAddress: false,
+      },
+      viewsCount: 0,
+      favoritesCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableFrom: '2026-06-01',
+      legalConsentAccepted: true,
+      status: 'publiee',
+    });
+
+    const over5MbCoverRes = await fetch(`${baseUrl}/api/listings/darna-cover-over-5mb/cover.jpg`);
+    assert.equal(
+      over5MbCoverRes.status,
+      404,
+      '/api/listings/:id/cover.jpg must return 404 when decoded image exceeds 5 MB'
+    );
+
+    // 4. Verify POST /api/listings and PUT /api/listings/:id reject disallowed image types (e.g. image/svg+xml) and >5MB images
+    const imgTestUserId = 'user-pro-img-test';
+    await dbInstance.createUser(
+      {
+        id: imgTestUserId,
+        firstName: 'Agence',
+        lastName: 'ImageTest',
+        name: 'Agence ImageTest',
+        email: 'imgtest.pro@darna.ma',
+        phone: '0611223344',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 100,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'ImgTestPass2026!'
+    );
+    const proToken = await dbInstance.createSession(imgTestUserId);
+
+    const postSvgRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${proToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce avec SVG interdit',
+        description: 'Tentative upload SVG',
+        category: 'appartement',
+        price: 6000,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: [`data:image/svg+xml;base64,${svgBase64}`],
+      }),
+    });
+    assert.equal(
+      postSvgRes.status,
+      400,
+      'POST /api/listings must reject image/svg+xml with HTTP 400'
+    );
+
+    const postValidRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${proToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce PNG Valide',
+        description: 'Upload PNG valide',
+        category: 'appartement',
+        price: 6000,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: [`data:image/png;base64,${sample1x1PngBase64}`],
+      }),
+    });
+    assert.equal(postValidRes.status, 201, 'POST /api/listings must accept valid image/png');
+    const { listing: createdValidListing } = await postValidRes.json();
+
+    const putSvgRes = await fetch(`${baseUrl}/api/listings/${createdValidListing.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${proToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Modification avec SVG interdit',
+        images: [`data:image/svg+xml;base64,${svgBase64}`],
+      }),
+    });
+    assert.equal(
+      putSvgRes.status,
+      400,
+      'PUT /api/listings/:id must reject image/svg+xml with HTTP 400'
+    );
+  });
+
+  it('25. uses Darna-hosted /og-default.png (1200x630) instead of Unsplash when a published listing has no image', async () => {
+    const noImageListingId = 'darna-og-no-image';
+    await dbInstance.createListing({
+      id: noImageListingId,
+      userId: 'user-pro-1',
+      title: 'Appartement Sans Photo',
+      slug: 'appartement-sans-photo',
+      description: 'Appartement sans image pour tester og-default.png.',
+      category: 'appartement',
+      price: 7200,
+      period: 'mois',
+      surface: 95,
+      rooms: 3,
+      bedrooms: 2,
+      bathrooms: 1,
+      city: 'Fès',
+      district: 'Centre Ville',
+      latitude: 34.0331,
+      longitude: -5.0003,
+      images: [],
+      amenities: [],
+      contact: {
+        name: 'Agence Fès',
+        type: 'professionnel',
+        phone: '0655443322',
+        email: 'fes@agence.ma',
+        showPhone: true,
+        showEmail: true,
+        showWhatsApp: false,
+        showExactAddress: false,
+      },
+      viewsCount: 0,
+      favoritesCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableFrom: '2026-06-01',
+      legalConsentAccepted: true,
+      status: 'publiee',
+    });
+
+    const ogRes = await fetch(`${baseUrl}/?annonce=${encodeURIComponent(noImageListingId)}`);
+    assert.equal(ogRes.status, 200);
+    const ogHtml = await ogRes.text();
+
+    assert.ok(
+      ogHtml.includes('property="og:image" content="https://') &&
+        ogHtml.includes('/og-default.png"'),
+      'Listing without image must use Darna-hosted /og-default.png as og:image'
+    );
+    assert.ok(
+      !ogHtml.includes('images.unsplash.com'),
+      'OpenGraph HTML must not fall back to an external Unsplash URL'
+    );
+
+    // Verify /og-default.png is served as a real 1200x630 PNG
+    const ogImgRes = await fetch(`${baseUrl}/og-default.png`);
+    assert.equal(ogImgRes.status, 200);
+    assert.equal(ogImgRes.headers.get('content-type'), 'image/png');
+    const ogImgBuf = Buffer.from(await ogImgRes.arrayBuffer());
+    assert.equal(ogImgBuf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.equal(ogImgBuf.readUInt32BE(16), 1200, '/og-default.png width must be 1200px');
+    assert.equal(ogImgBuf.readUInt32BE(20), 630, '/og-default.png height must be 630px');
+  });
 });

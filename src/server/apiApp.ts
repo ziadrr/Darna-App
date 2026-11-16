@@ -90,11 +90,146 @@ const DARNA_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
   <polygon points="64,46 67.5,54.5 76.5,55.2 69.5,61.2 71.8,70 64,65.2 56.2,70 58.5,61.2 51.5,55.2 60.5,54.5" fill="#FBBF24" />
 </svg>`;
 
-// 1x1 transparent PNG buffer fallback for /pwa-192x192.png, /pwa-512x512.png, /apple-touch-icon.png
-const DARNA_ICON_PNG_BUFFER = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-  'base64'
-);
+export const ALLOWED_LISTING_IMAGE_MIMES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+]);
+
+export const MAX_LISTING_IMAGE_BYTES = 5 * 1024 * 1024; // 5 Mo
+
+export function parseAllowedBase64Image(dataUri: string): {
+  valid: boolean;
+  mimeType?: string;
+  buffer?: Buffer;
+  reason?: 'invalid_type' | 'too_large' | 'invalid_format';
+} {
+  const raw = String(dataUri || '').trim();
+  if (!raw.startsWith('data:')) {
+    return { valid: false, reason: 'invalid_format' };
+  }
+  const commaIdx = raw.indexOf(',');
+  if (commaIdx === -1) {
+    return { valid: false, reason: 'invalid_format' };
+  }
+  const header = raw.slice(5, commaIdx).trim();
+  const payload = raw.slice(commaIdx + 1).trim();
+  const parts = header.split(';').map((p) => p.trim().toLowerCase());
+  const mimeType = parts[0] || '';
+  const isBase64 = parts.includes('base64');
+
+  if (!ALLOWED_LISTING_IMAGE_MIMES.has(mimeType)) {
+    return { valid: false, mimeType, reason: 'invalid_type' };
+  }
+  if (!isBase64 || !payload || !/^[A-Za-z0-9+/=\r\n]+$/.test(payload)) {
+    return { valid: false, mimeType, reason: 'invalid_format' };
+  }
+
+  const buffer = Buffer.from(payload, 'base64');
+  if (buffer.length === 0) {
+    return { valid: false, mimeType, reason: 'invalid_format' };
+  }
+  if (buffer.length > MAX_LISTING_IMAGE_BYTES) {
+    return { valid: false, mimeType, reason: 'too_large' };
+  }
+
+  return { valid: true, mimeType, buffer };
+}
+
+export function validateListingImages(images: unknown): {
+  valid: boolean;
+  code?: string;
+  message?: string;
+} {
+  if (images === undefined || images === null) {
+    return { valid: true };
+  }
+  if (!Array.isArray(images)) {
+    return {
+      valid: false,
+      code: 'INVALID_IMAGES_FORMAT',
+      message: 'Le champ images doit être un tableau.',
+    };
+  }
+  for (const item of images) {
+    if (typeof item !== 'string' || !item.trim()) {
+      return {
+        valid: false,
+        code: 'INVALID_IMAGE_TYPE',
+        message:
+          'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+      };
+    }
+    const trimmed = item.trim();
+    if (trimmed.startsWith('data:')) {
+      const parsed = parseAllowedBase64Image(trimmed);
+      if (!parsed.valid) {
+        if (parsed.reason === 'too_large') {
+          return {
+            valid: false,
+            code: 'IMAGE_TOO_LARGE',
+            message: 'La taille décodée de chaque image ne doit pas dépasser 5 Mo.',
+          };
+        }
+        return {
+          valid: false,
+          code: 'INVALID_IMAGE_TYPE',
+          message:
+            'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+        };
+      }
+      continue;
+    }
+
+    if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('/')) {
+      try {
+        const urlObj = new URL(trimmed, 'https://darna.ma');
+        const pathname = urlObj.pathname.toLowerCase();
+        const extMatch = pathname.match(/\.([a-z0-9]+)$/i);
+        if (extMatch) {
+          const ext = extMatch[1].toLowerCase();
+          if (!['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) {
+            return {
+              valid: false,
+              code: 'INVALID_IMAGE_TYPE',
+              message:
+                'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+            };
+          }
+        }
+        const fmParam = (
+          urlObj.searchParams.get('fm') ||
+          urlObj.searchParams.get('format') ||
+          ''
+        ).toLowerCase();
+        if (fmParam && !['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(fmParam)) {
+          return {
+            valid: false,
+            code: 'INVALID_IMAGE_TYPE',
+            message:
+              'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+          };
+        }
+        continue;
+      } catch {
+        return {
+          valid: false,
+          code: 'INVALID_IMAGE_TYPE',
+          message: 'URL d’image invalide.',
+        };
+      }
+    }
+
+    return {
+      valid: false,
+      code: 'INVALID_IMAGE_TYPE',
+      message:
+        'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+    };
+  }
+  return { valid: true };
+}
 
 export function createDarnaApiApp(
   customDbPath?: string,
@@ -1677,26 +1812,35 @@ export function createDarnaApiApp(
   });
 
   app.get('/api/listings/:id/cover.jpg', (req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
     const listing = db.getListingById(req.params.id);
     if (!isPublishedListingStatus(listing)) {
       return res.status(404).send('Image introuvable');
     }
 
-    const firstImage = listing.images?.[0] || '';
-    if (firstImage.startsWith('data:image/')) {
-      const match = firstImage.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
-      if (!match) {
-        return res.status(404).send('Image invalide');
+    const firstImage = String(listing.images?.[0] || '').trim();
+    if (!firstImage) {
+      return res.status(404).send('Image introuvable');
+    }
+
+    if (firstImage.startsWith('data:')) {
+      const parsed = parseAllowedBase64Image(firstImage);
+      if (!parsed.valid || !parsed.buffer || !parsed.mimeType) {
+        return res.status(404).send('Image invalide ou type non autorisé');
       }
-      const mimeType = match[1] || 'image/jpeg';
-      const imgBuffer = Buffer.from(match[2], 'base64');
-      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Type', parsed.mimeType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'public, max-age=86400');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      return res.status(200).send(imgBuffer);
+      return res.status(200).send(parsed.buffer);
     }
 
     if (firstImage.startsWith('http://') || firstImage.startsWith('https://')) {
+      const imgValidation = validateListingImages([firstImage]);
+      if (!imgValidation.valid) {
+        return res.status(404).send('Image non autorisée');
+      }
       return res.redirect(302, firstImage.replace(/^http:\/\//i, 'https://'));
     }
 
@@ -1778,6 +1922,15 @@ export function createDarnaApiApp(
       });
     }
 
+    const imageValidation = validateListingImages(req.body?.images);
+    if (!imageValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        code: imageValidation.code || 'INVALID_IMAGE_TYPE',
+        message: imageValidation.message,
+      });
+    }
+
     const allListings = db.getAllListings();
     const allPlans = db.getAllPlans();
     const quota = getUserListingQuota(viewer, allListings, allPlans);
@@ -1843,6 +1996,17 @@ export function createDarnaApiApp(
           success: false,
           message: "Vous n'êtes pas autorisé à modifier l'annonce d'un autre utilisateur.",
         });
+      }
+
+      if (req.body?.images !== undefined) {
+        const imageValidation = validateListingImages(req.body.images);
+        if (!imageValidation.valid) {
+          return res.status(400).json({
+            success: false,
+            code: imageValidation.code || 'INVALID_IMAGE_TYPE',
+            message: imageValidation.message,
+          });
+        }
       }
 
       // Prevent non-admins from forging paid boost or changing listing owner
@@ -3393,6 +3557,14 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
   });
 
   app.get('/manifest.webmanifest', (_req, res) => {
+    const manifestPath = path.resolve(process.cwd(), 'public', 'manifest.webmanifest');
+    if (fs.existsSync(manifestPath)) {
+      const content = fs.readFileSync(manifestPath, 'utf-8');
+      return res
+        .status(200)
+        .setHeader('Content-Type', 'application/manifest+json; charset=utf-8')
+        .send(content);
+    }
     const manifest = {
       id: '/',
       name: 'Darna - Location Immobilière Maroc',
@@ -3425,6 +3597,12 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
           type: 'image/png',
           purpose: 'any',
         },
+        {
+          src: '/pwa-512x512-maskable.png',
+          sizes: '512x512',
+          type: 'image/png',
+          purpose: 'maskable',
+        },
       ],
     };
     res
@@ -3434,15 +3612,42 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
   });
 
   app.get(['/favicon.svg', '/favicon.ico'], (_req, res) => {
-    res.status(200).setHeader('Content-Type', 'image/svg+xml; charset=utf-8').send(DARNA_FAVICON_SVG);
+    const svgPath = path.resolve(process.cwd(), 'public', 'favicon.svg');
+    const content = fs.existsSync(svgPath) ? fs.readFileSync(svgPath, 'utf-8') : DARNA_FAVICON_SVG;
+    res.status(200).setHeader('Content-Type', 'image/svg+xml; charset=utf-8').send(content);
   });
 
-  app.get(['/pwa-192x192.png', '/pwa-512x512.png', '/apple-touch-icon.png'], (_req, res) => {
-    res.status(200).setHeader('Content-Type', 'image/png').send(DARNA_ICON_PNG_BUFFER);
-  });
+  app.get(
+    [
+      '/pwa-192x192.png',
+      '/pwa-512x512.png',
+      '/pwa-512x512-maskable.png',
+      '/apple-touch-icon.png',
+      '/og-default.png',
+    ],
+    (req, res) => {
+      const filename = path.basename(req.path);
+      const distFile = path.resolve(process.cwd(), 'dist', filename);
+      const publicFile = path.resolve(process.cwd(), 'public', filename);
+      const targetFile =
+        process.env.NODE_ENV === 'production' && fs.existsSync(distFile) ? distFile : publicFile;
+
+      if (!fs.existsSync(targetFile)) {
+        return res.status(404).send('Fichier introuvable');
+      }
+
+      const buf = fs.readFileSync(targetFile);
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.status(200).send(buf);
+    }
+  );
 
   function buildIndexHtmlForRequest(req: express.Request, rawHtml: string): string {
     const baseHttpsUrl = getBaseHttpsUrl(req);
+    const defaultOgImageUrl = `${baseHttpsUrl}/og-default.png`;
     const annonceId =
       typeof req.query.annonce === 'string' ? req.query.annonce.trim() : '';
     const rawListing = annonceId ? db.getListingById(annonceId) : null;
@@ -3474,19 +3679,24 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       districtLabel ? ` (${districtLabel})` : ''
     } : ${priceFormatted}, ${surfaceFormatted}, ${roomsFormatted}.`;
 
-    const firstImg = listing.images?.[0] || '';
+    const firstImg = String(listing.images?.[0] || '').trim();
     let rawOgImage: string;
-    if (firstImg.startsWith('data:image/')) {
-      rawOgImage = `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`;
+    if (firstImg.startsWith('data:')) {
+      const parsed = parseAllowedBase64Image(firstImg);
+      rawOgImage = parsed.valid
+        ? `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`
+        : defaultOgImageUrl;
     } else if (firstImg.startsWith('https://')) {
-      rawOgImage = firstImg;
+      rawOgImage = validateListingImages([firstImg]).valid ? firstImg : defaultOgImageUrl;
     } else if (firstImg.startsWith('http://')) {
-      rawOgImage = firstImg.replace(/^http:\/\//i, 'https://');
+      const httpsImg = firstImg.replace(/^http:\/\//i, 'https://');
+      rawOgImage = validateListingImages([httpsImg]).valid ? httpsImg : defaultOgImageUrl;
     } else if (firstImg.startsWith('/')) {
-      rawOgImage = `${baseHttpsUrl}${firstImg}`;
+      rawOgImage = validateListingImages([firstImg]).valid
+        ? `${baseHttpsUrl}${firstImg}`
+        : defaultOgImageUrl;
     } else {
-      rawOgImage =
-        'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80';
+      rawOgImage = defaultOgImageUrl;
     }
 
     const rawOgUrl = `${baseHttpsUrl}/?annonce=${encodeURIComponent(listing.id)}`;

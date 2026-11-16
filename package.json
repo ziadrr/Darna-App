@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
+    "generate:assets": "tsx scripts/generate-assets.ts",
     "start": "node server.ts",
     "test": "tsx --test tests/*.test.ts",
     "clean": "rm -rf dist server.js",
@@ -33,6 +34,7 @@
     "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "sharp": "^0.35.5",
     "vite": "^8.3.0"
   },
   "devDependencies": {
