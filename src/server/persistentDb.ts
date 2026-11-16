@@ -420,26 +420,31 @@ export class DarnaPersistentDb {
       });
     }
 
-    const listingCountRow = this.db
-      .prepare('SELECT COUNT(*) as cnt FROM listings')
-      .get() as { cnt: number };
-    if (!listingCountRow || listingCountRow.cnt === 0) {
-      const insertListing = this.db.prepare(
-        'INSERT INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      );
-      INITIAL_LISTINGS.forEach((listing, index) => {
-        const sortTime =
-          new Date(listing.createdAt || nowIso).getTime() || Date.now() - index * 1000;
-        insertListing.run(
-          listing.id,
-          listing.userId,
-          listing.status,
-          sortTime,
-          JSON.stringify(listing),
-          listing.createdAt || nowIso,
-          listing.updatedAt || nowIso
+    const shouldSeedDemoListings =
+      process.env.SEED_DEMO_DATA === 'true' || process.env.NODE_ENV !== 'production';
+
+    if (shouldSeedDemoListings) {
+      const listingCountRow = this.db
+        .prepare('SELECT COUNT(*) as cnt FROM listings')
+        .get() as { cnt: number };
+      if (!listingCountRow || listingCountRow.cnt === 0) {
+        const insertListing = this.db.prepare(
+          'INSERT INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
         );
-      });
+        INITIAL_LISTINGS.forEach((listing, index) => {
+          const sortTime =
+            new Date(listing.createdAt || nowIso).getTime() || Date.now() - index * 1000;
+          insertListing.run(
+            listing.id,
+            listing.userId,
+            listing.status,
+            sortTime,
+            JSON.stringify(listing),
+            listing.createdAt || nowIso,
+            listing.updatedAt || nowIso
+          );
+        });
+      }
     }
 
     const reportCountRow = this.db

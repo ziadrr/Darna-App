@@ -64,7 +64,6 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
 }) => {
   const [activePhotoIdx, setActivePhotoIdx] = useState(0);
   const [isGalleryPaused, setIsGalleryPaused] = useState(false);
-  const [copiedLink, setCopiedLink] = useState(false);
   const [contactMessageSent, setContactMessageSent] = useState(false);
   const [messageText, setMessageText] = useState('');
 
@@ -92,11 +91,29 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
   const isSponsored = isListingBoostActive(listing);
   const isOwner = Boolean(currentUser && currentUser.id === listing.userId);
 
-  const handleShare = () => {
-    const shareUrl = `${window.location.origin}/?annonce=${encodeURIComponent(listing.id)}`;
-    navigator.clipboard.writeText(shareUrl);
-    setCopiedLink(true);
-    setTimeout(() => setCopiedLink(false), 2500);
+  const shareUrl = `${window.location.origin}/?annonce=${encodeURIComponent(listing.id)}`;
+  const shareSummaryText = `${listing.category.toUpperCase()} à ${listing.city} (${listing.district}) — ${formatMAD(
+    listing.price,
+    listing.period
+  )} (${listing.surface} m²)`;
+  const whatsappShareUrl = `https://wa.me/?text=${encodeURIComponent(
+    `${shareSummaryText} : ${shareUrl}`
+  )}`;
+  const canNativeShare =
+    typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+
+  const handleNativeShare = async () => {
+    if (canNativeShare) {
+      try {
+        await navigator.share({
+          title: `${listing.category} à ${listing.city} - Darna`,
+          text: shareSummaryText,
+          url: shareUrl,
+        });
+      } catch {
+        // User cancelled or share failed; WhatsApp fallback button remains available
+      }
+    }
   };
 
   const handleSendInternalMessage = async (e: React.FormEvent) => {
@@ -173,14 +190,27 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
                 <span>{isSponsored ? 'Gérer la mise en avant' : 'Mettre en avant'}</span>
               </button>
             )}
-            <button
-              onClick={handleShare}
-              className="px-3 py-1.5 rounded-xl text-xs font-semibold text-stone-600 hover:text-stone-900 hover:bg-stone-100 transition-colors flex items-center gap-1.5 border border-stone-200"
-              title="Partager le lien de l'annonce"
+            {canNativeShare ? (
+              <button
+                type="button"
+                onClick={handleNativeShare}
+                className="px-3 py-1.5 rounded-xl text-xs font-semibold text-stone-700 hover:text-stone-900 hover:bg-stone-100 transition-colors flex items-center gap-1.5 border border-stone-200"
+                title="Partager l'annonce"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Partager</span>
+              </button>
+            ) : null}
+            <a
+              href={whatsappShareUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-1.5 rounded-xl text-xs font-semibold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 transition-colors flex items-center gap-1.5 border border-emerald-200"
+              title="Partager sur WhatsApp"
             >
-              <Share2 className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Partager</span>
-            </button>
+              <MessageCircle className="w-3.5 h-3.5 text-emerald-600" />
+              <span className="hidden sm:inline">Partager sur WhatsApp</span>
+            </a>
             <button
               onClick={(e) => onToggleFavorite(listing.id, e)}
               className={`p-2 rounded-xl transition-colors border ${
@@ -203,11 +233,6 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
 
         {/* Scrollable Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
-          {copiedLink && (
-            <div className="bg-emerald-50 text-emerald-800 border border-emerald-200 px-4 py-2.5 rounded-xl text-xs font-semibold text-center animate-fade-in">
-              Lien de l'annonce copié dans le presse-papier !
-            </div>
-          )}
 
           {/* Photo Gallery Carousel */}
           <div

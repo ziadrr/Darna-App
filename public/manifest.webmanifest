@@ -1,0 +1,33 @@
+{
+  "id": "/",
+  "name": "Darna - Location Immobilière Maroc",
+  "short_name": "Darna",
+  "description": "Plateforme moderne de location immobilière au Maroc : annonces d'appartements, villas, studios, bureaux et commerces.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#FAF7F2",
+  "theme_color": "#1E3D34",
+  "orientation": "portrait-primary",
+  "lang": "fr-MA",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

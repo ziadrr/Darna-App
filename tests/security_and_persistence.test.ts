@@ -2023,5 +2023,255 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       }
     }
   });
-});
 
+  it('20. seeds INITIAL_LISTINGS only when SEED_DEMO_DATA=true or NODE_ENV !== production, while always seeding subscription plans and boost options', () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    const savedSeedDemo = process.env.SEED_DEMO_DATA;
+
+    const prodNoDemoPath = path.join(
+      os.tmpdir(),
+      `darna-prod-nodemo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
+    );
+    const prodWithDemoPath = path.join(
+      os.tmpdir(),
+      `darna-prod-withdemo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
+    );
+
+    let dbNoDemo: DarnaPersistentDb | null = null;
+    let dbWithDemo: DarnaPersistentDb | null = null;
+
+    try {
+      // Case A: NODE_ENV === 'production' and SEED_DEMO_DATA is not 'true' -> 0 listings, but plans & boosts seeded
+      process.env.NODE_ENV = 'production';
+      delete process.env.SEED_DEMO_DATA;
+      dbNoDemo = new DarnaPersistentDb(prodNoDemoPath, { allowLocalFallbackInProd: true });
+      assert.equal(
+        dbNoDemo.getAllListings().length,
+        0,
+        'INITIAL_LISTINGS must NOT be seeded in production when SEED_DEMO_DATA is not true'
+      );
+      assert.ok(
+        dbNoDemo.getAllPlans().length > 0,
+        'Subscription plans must always be seeded even in production'
+      );
+      assert.ok(
+        dbNoDemo.getAllBoostOptions().length > 0,
+        'Boost options must always be seeded even in production'
+      );
+
+      // Case B: NODE_ENV === 'production' and SEED_DEMO_DATA === 'true' -> INITIAL_LISTINGS seeded
+      process.env.SEED_DEMO_DATA = 'true';
+      dbWithDemo = new DarnaPersistentDb(prodWithDemoPath, { allowLocalFallbackInProd: true });
+      assert.ok(
+        dbWithDemo.getAllListings().length > 0,
+        'INITIAL_LISTINGS must be seeded when SEED_DEMO_DATA=true'
+      );
+    } finally {
+      process.env.NODE_ENV = savedNodeEnv;
+      if (savedSeedDemo !== undefined) {
+        process.env.SEED_DEMO_DATA = savedSeedDemo;
+      } else {
+        delete process.env.SEED_DEMO_DATA;
+      }
+      dbNoDemo?.close();
+      dbWithDemo?.close();
+      for (const base of [prodNoDemoPath, prodWithDemoPath]) {
+        for (const suffix of ['', '-wal', '-shm']) {
+          const f = `${base}${suffix}`;
+          if (fs.existsSync(f)) {
+            try {
+              fs.unlinkSync(f);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('21. injects escaped OpenGraph and Twitter Card metadata on /?annonce=ID for published listings, exposes base64 cover images via /api/listings/:id/cover.jpg, and never leaks phone, WhatsApp, or exact address', async () => {
+    const sampleJpegBase64 = Buffer.from('FFD8FFE000104A4649460001', 'hex').toString('base64');
+    const base64DataUri = `data:image/jpeg;base64,${sampleJpegBase64}`;
+
+    // Create a published listing with base64 cover image, sensitive contact details, and special HTML characters in city/district
+    const ogListingId = 'darna-og-test-base64';
+    await dbInstance.createListing({
+      id: ogListingId,
+      userId: 'user-pro-1',
+      title: 'Superbe Villa Test OpenGraph',
+      slug: 'superbe-villa-test-opengraph',
+      description: 'Grande villa lumineuse avec piscine.',
+      category: 'villa',
+      price: 18500,
+      period: 'mois',
+      surface: 320,
+      rooms: 6,
+      bedrooms: 4,
+      bathrooms: 3,
+      city: 'Marrakech & <script>alert(1)</script>',
+      district: 'Palmeraie "Sud"',
+      address: '44 Rue Secrète Privée Numéro Exact',
+      latitude: 31.6295,
+      longitude: -7.9811,
+      images: [base64DataUri],
+      amenities: ['Piscine'],
+      contact: {
+        name: 'Agence Secrète',
+        type: 'professionnel',
+        phone: '0699887766',
+        whatsapp: '212699887766',
+        email: 'secret@agence.ma',
+        showPhone: true,
+        showWhatsApp: true,
+        showEmail: true,
+        showExactAddress: true,
+        phoneConsentAccepted: true,
+      },
+      viewsCount: 0,
+      favoritesCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableFrom: '2026-06-01',
+      legalConsentAccepted: true,
+      status: 'publiee',
+    });
+
+    // Create a draft (unpublished) listing
+    const draftListingId = 'darna-og-test-draft';
+    await dbInstance.createListing({
+      id: draftListingId,
+      userId: 'user-pro-1',
+      title: 'Brouillon Confidentiel Non Publié',
+      slug: 'brouillon-confidentiel',
+      description: 'Ne doit jamais apparaître dans OpenGraph.',
+      category: 'appartement',
+      price: 9900,
+      period: 'mois',
+      surface: 110,
+      rooms: 4,
+      bedrooms: 2,
+      bathrooms: 2,
+      city: 'TangerBrouillonSecret',
+      district: 'Malabata',
+      address: '99 Avenue Confidentielle',
+      latitude: 35.7595,
+      longitude: -5.834,
+      images: [base64DataUri],
+      amenities: [],
+      contact: {
+        name: 'Privé',
+        type: 'particulier',
+        phone: '0611223344',
+        email: 'prive@example.com',
+        showPhone: true,
+        showWhatsApp: true,
+        showEmail: false,
+        showExactAddress: false,
+      },
+      viewsCount: 0,
+      favoritesCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      availableFrom: '2026-06-01',
+      legalConsentAccepted: true,
+      status: 'brouillon',
+    });
+
+    // 1. Published listing OpenGraph response
+    const ogRes = await fetch(`${baseUrl}/?annonce=${encodeURIComponent(ogListingId)}`);
+    assert.equal(ogRes.status, 200);
+    const ogHtml = await ogRes.text();
+
+    assert.ok(
+      ogHtml.includes('Villa à Marrakech &amp; &lt;script&gt;alert(1)&lt;/script&gt;'),
+      'og:title and <title> must include property category + city with HTML properly escaped'
+    );
+    assert.ok(
+      !ogHtml.includes('<script>alert(1)</script>'),
+      'Raw unescaped <script> tag must never be injected into HTML'
+    );
+    assert.ok(
+      ogHtml.includes('320 m²') && ogHtml.includes('6 pièces') && ogHtml.includes('MAD/mois'),
+      'og:description must include price in MAD, surface in m², and rooms count'
+    );
+    assert.ok(
+      ogHtml.includes(`property="og:image" content="https://`) &&
+        ogHtml.includes(`/api/listings/${ogListingId}/cover.jpg"`),
+      'Base64 listing image must be exposed via absolute https /api/listings/:id/cover.jpg URL in og:image'
+    );
+    assert.ok(
+      ogHtml.includes(`property="og:url" content="https://`) &&
+        ogHtml.includes(`/?annonce=${ogListingId}"`),
+      'og:url must be injected with the canonical listing URL'
+    );
+    assert.ok(
+      ogHtml.includes('name="twitter:card" content="summary_large_image"'),
+      'twitter:card=summary_large_image must be present'
+    );
+
+    // Must NEVER leak phone, WhatsApp, email, or exact street address
+    assert.ok(!ogHtml.includes('0699887766'), 'OpenGraph HTML must never reveal phone number');
+    assert.ok(!ogHtml.includes('212699887766'), 'OpenGraph HTML must never reveal WhatsApp number');
+    assert.ok(
+      !ogHtml.includes('44 Rue Secrète Privée Numéro Exact'),
+      'OpenGraph HTML must never reveal exact street address'
+    );
+
+    // 2. /api/listings/:id/cover.jpg returns decoded binary image for published listing
+    const coverRes = await fetch(`${baseUrl}/api/listings/${ogListingId}/cover.jpg`);
+    assert.equal(coverRes.status, 200);
+    assert.equal(coverRes.headers.get('content-type'), 'image/jpeg');
+    const coverBytes = Buffer.from(await coverRes.arrayBuffer());
+    assert.equal(coverBytes.toString('base64'), sampleJpegBase64);
+
+    // 3. Unpublished (brouillon) listing must NOT get OpenGraph injection or cover.jpg access
+    const draftOgRes = await fetch(`${baseUrl}/?annonce=${encodeURIComponent(draftListingId)}`);
+    const draftOgHtml = await draftOgRes.text();
+    assert.ok(
+      !draftOgHtml.includes('TangerBrouillonSecret'),
+      'Unpublished listing must not have its metadata injected into index.html'
+    );
+    const draftCoverRes = await fetch(`${baseUrl}/api/listings/${draftListingId}/cover.jpg`);
+    assert.equal(draftCoverRes.status, 404, 'cover.jpg must return 404 for unpublished listings');
+  });
+
+  it('22. serves /robots.txt, dynamic /sitemap.xml from published listings only, /manifest.webmanifest with theme-color, and /favicon.svg', async () => {
+    // 1. /robots.txt
+    const robotsRes = await fetch(`${baseUrl}/robots.txt`);
+    assert.equal(robotsRes.status, 200);
+    const robotsText = await robotsRes.text();
+    assert.ok(robotsText.includes('User-agent: *'));
+    assert.ok(robotsText.includes('/sitemap.xml'));
+
+    // 2. /sitemap.xml
+    const sitemapRes = await fetch(`${baseUrl}/sitemap.xml`);
+    assert.equal(sitemapRes.status, 200);
+    assert.ok((sitemapRes.headers.get('content-type') || '').includes('xml'));
+    const sitemapXml = await sitemapRes.text();
+    assert.ok(
+      sitemapXml.includes('?annonce=darna-og-test-base64'),
+      'sitemap.xml must include published listings'
+    );
+    assert.ok(
+      !sitemapXml.includes('darna-og-test-draft'),
+      'sitemap.xml must NOT include unpublished/draft listings'
+    );
+
+    // 3. /manifest.webmanifest
+    const manifestRes = await fetch(`${baseUrl}/manifest.webmanifest`);
+    assert.equal(manifestRes.status, 200);
+    const manifestJson = await manifestRes.json();
+    assert.equal(manifestJson.short_name, 'Darna');
+    assert.equal(manifestJson.theme_color, '#1E3D34');
+    assert.equal(manifestJson.display, 'standalone');
+    assert.ok(Array.isArray(manifestJson.icons) && manifestJson.icons.length >= 2);
+
+    // 4. /favicon.svg
+    const favRes = await fetch(`${baseUrl}/favicon.svg`);
+    assert.equal(favRes.status, 200);
+    assert.ok((favRes.headers.get('content-type') || '').includes('image/svg+xml'));
+    const favSvg = await favRes.text();
+    assert.ok(favSvg.includes('<svg') && favSvg.includes('#1E3D34'));
+  });
+});

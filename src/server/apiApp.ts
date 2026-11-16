@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -50,6 +52,49 @@ export function computePaymentWebhookHmac(
 // SHA-256 hash of the inline fetch-protection script in index.html
 export const INDEX_INLINE_SCRIPT_SHA256 =
   "'sha256-DMa42Zio9vPWS2jraEYgYmFl4E//+9MKWES3Gvn6SO0='";
+
+export function escapeHtml(value: string): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function isPublishedListingStatus(listing: Listing | null | undefined): listing is Listing {
+  if (!listing) return false;
+  const st = String(listing.status || '').toLowerCase();
+  return st === 'publiee' || st === 'published';
+}
+
+function getBaseHttpsUrl(req: express.Request): string {
+  const envUrl = (process.env.APP_URL || '').trim().replace(/\/$/, '');
+  if (envUrl && /^https?:\/\//i.test(envUrl)) {
+    return envUrl.replace(/^http:\/\//i, 'https://');
+  }
+  const host = req.get('host') || 'darna.ma';
+  return `https://${host}`;
+}
+
+const DARNA_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="darnaBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E3D34" />
+      <stop offset="100%" stop-color="#142923" />
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#darnaBg)" />
+  <path d="M64 22 C42 22 30 39 30 58 C30 67 34 74 39 78 L39 102 L89 102 L89 78 C94 74 98 67 98 58 C98 39 86 22 64 22 Z" fill="#FAF7F2" />
+  <path d="M64 34 C49 34 41 46 41 59 C41 66 44 71 48 74 L48 94 L80 94 L80 74 C84 71 87 66 87 59 C87 46 79 34 64 34 Z" fill="#C15C3D" />
+  <polygon points="64,46 67.5,54.5 76.5,55.2 69.5,61.2 71.8,70 64,65.2 56.2,70 58.5,61.2 51.5,55.2 60.5,54.5" fill="#FBBF24" />
+</svg>`;
+
+// 1x1 transparent PNG buffer fallback for /pwa-192x192.png, /pwa-512x512.png, /apple-touch-icon.png
+const DARNA_ICON_PNG_BUFFER = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64'
+);
 
 export function createDarnaApiApp(
   customDbPath?: string,
@@ -1629,6 +1674,33 @@ export function createDarnaApiApp(
       }
     }
     res.json({ success: true, listings: visibleListings });
+  });
+
+  app.get('/api/listings/:id/cover.jpg', (req, res) => {
+    const listing = db.getListingById(req.params.id);
+    if (!isPublishedListingStatus(listing)) {
+      return res.status(404).send('Image introuvable');
+    }
+
+    const firstImage = listing.images?.[0] || '';
+    if (firstImage.startsWith('data:image/')) {
+      const match = firstImage.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
+      if (!match) {
+        return res.status(404).send('Image invalide');
+      }
+      const mimeType = match[1] || 'image/jpeg';
+      const imgBuffer = Buffer.from(match[2], 'base64');
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.status(200).send(imgBuffer);
+    }
+
+    if (firstImage.startsWith('http://') || firstImage.startsWith('https://')) {
+      return res.redirect(302, firstImage.replace(/^http:\/\//i, 'https://'));
+    }
+
+    return res.status(404).send('Image introuvable');
   });
 
   app.get('/api/listings/:id', async (req, res) => {
@@ -3278,6 +3350,221 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       path: req.originalUrl,
       message: "Cet endpoint API n'existe pas sur cette version du serveur Darna.",
     });
+  });
+
+  // ==========================================================================
+  // SEO, PWA MANIFEST, ROBOTS, SITEMAP & SERVER-SIDE OPENGRAPH INJECTION
+  // ==========================================================================
+
+  app.get('/robots.txt', (req, res) => {
+    const baseHttpsUrl = getBaseHttpsUrl(req);
+    const content = [
+      'User-agent: *',
+      'Allow: /',
+      'Disallow: /api/admin/',
+      'Disallow: /api/auth/',
+      `Sitemap: ${baseHttpsUrl}/sitemap.xml`,
+      '',
+    ].join('\n');
+    res.status(200).setHeader('Content-Type', 'text/plain; charset=utf-8').send(content);
+  });
+
+  app.get('/sitemap.xml', (req, res) => {
+    const baseHttpsUrl = getBaseHttpsUrl(req);
+    const publishedListings = db
+      .getAllListings()
+      .filter((l) => isPublishedListingStatus(l));
+
+    const urlsXml = [
+      `  <url>\n    <loc>${escapeHtml(`${baseHttpsUrl}/`)}</loc>\n    <changefreq>hourly</changefreq>\n    <priority>1.0</priority>\n  </url>`,
+      ...publishedListings.map((l) => {
+        const loc = `${baseHttpsUrl}/?annonce=${encodeURIComponent(l.id)}`;
+        const lastmod = String(l.updatedAt || l.createdAt || new Date().toISOString()).split(
+          'T'
+        )[0];
+        return `  <url>\n    <loc>${escapeHtml(loc)}</loc>\n    <lastmod>${escapeHtml(
+          lastmod
+        )}</lastmod>\n    <changefreq>daily</changefreq>\n    <priority>0.8</priority>\n  </url>`;
+      }),
+    ].join('\n');
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urlsXml}\n</urlset>\n`;
+    res.status(200).setHeader('Content-Type', 'application/xml; charset=utf-8').send(xml);
+  });
+
+  app.get('/manifest.webmanifest', (_req, res) => {
+    const manifest = {
+      id: '/',
+      name: 'Darna - Location Immobilière Maroc',
+      short_name: 'Darna',
+      description:
+        "Plateforme moderne de location immobilière au Maroc : annonces d'appartements, villas, studios, bureaux et commerces.",
+      start_url: '/',
+      scope: '/',
+      display: 'standalone',
+      background_color: '#FAF7F2',
+      theme_color: '#1E3D34',
+      orientation: 'portrait-primary',
+      lang: 'fr-MA',
+      icons: [
+        {
+          src: '/favicon.svg',
+          sizes: 'any',
+          type: 'image/svg+xml',
+          purpose: 'any',
+        },
+        {
+          src: '/pwa-192x192.png',
+          sizes: '192x192',
+          type: 'image/png',
+          purpose: 'any',
+        },
+        {
+          src: '/pwa-512x512.png',
+          sizes: '512x512',
+          type: 'image/png',
+          purpose: 'any',
+        },
+      ],
+    };
+    res
+      .status(200)
+      .setHeader('Content-Type', 'application/manifest+json; charset=utf-8')
+      .send(JSON.stringify(manifest, null, 2));
+  });
+
+  app.get(['/favicon.svg', '/favicon.ico'], (_req, res) => {
+    res.status(200).setHeader('Content-Type', 'image/svg+xml; charset=utf-8').send(DARNA_FAVICON_SVG);
+  });
+
+  app.get(['/pwa-192x192.png', '/pwa-512x512.png', '/apple-touch-icon.png'], (_req, res) => {
+    res.status(200).setHeader('Content-Type', 'image/png').send(DARNA_ICON_PNG_BUFFER);
+  });
+
+  function buildIndexHtmlForRequest(req: express.Request, rawHtml: string): string {
+    const baseHttpsUrl = getBaseHttpsUrl(req);
+    const annonceId =
+      typeof req.query.annonce === 'string' ? req.query.annonce.trim() : '';
+    const rawListing = annonceId ? db.getListingById(annonceId) : null;
+
+    if (!isPublishedListingStatus(rawListing)) {
+      return rawHtml;
+    }
+
+    // Sanitize using visitor rules so phone, WhatsApp, email, and exact street address are NEVER exposed
+    const listing = authorizeAndFormatListingForViewer(rawListing, null) || rawListing;
+
+    const categoryRaw = String(listing.category || 'Bien immobilier').trim();
+    const categoryLabel =
+      categoryRaw.charAt(0).toUpperCase() + categoryRaw.slice(1);
+    const cityLabel = String(listing.city || 'Maroc').trim();
+    const districtLabel = String(listing.district || '').trim();
+
+    const periodLabel =
+      listing.period === 'jour' ? 'jour' : listing.period === 'an' ? 'an' : 'mois';
+    const priceFormatted = `${Number(listing.price || 0).toLocaleString('fr-FR')} MAD/${periodLabel}`;
+    const surfaceFormatted = `${Number(listing.surface || 0)} m²`;
+    const roomsCount = Number(listing.rooms || 1);
+    const roomsFormatted = `${roomsCount} pièce${roomsCount > 1 ? 's' : ''}`;
+
+    const rawOgTitle = `${categoryLabel} à ${cityLabel}${
+      districtLabel ? ` (${districtLabel})` : ''
+    } | Darna`;
+    const rawOgDescription = `Location ${categoryLabel.toLowerCase()} à ${cityLabel}${
+      districtLabel ? ` (${districtLabel})` : ''
+    } : ${priceFormatted}, ${surfaceFormatted}, ${roomsFormatted}.`;
+
+    const firstImg = listing.images?.[0] || '';
+    let rawOgImage: string;
+    if (firstImg.startsWith('data:image/')) {
+      rawOgImage = `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`;
+    } else if (firstImg.startsWith('https://')) {
+      rawOgImage = firstImg;
+    } else if (firstImg.startsWith('http://')) {
+      rawOgImage = firstImg.replace(/^http:\/\//i, 'https://');
+    } else if (firstImg.startsWith('/')) {
+      rawOgImage = `${baseHttpsUrl}${firstImg}`;
+    } else {
+      rawOgImage =
+        'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=1200&q=80';
+    }
+
+    const rawOgUrl = `${baseHttpsUrl}/?annonce=${encodeURIComponent(listing.id)}`;
+
+    const safeTitle = escapeHtml(rawOgTitle);
+    const safeDesc = escapeHtml(rawOgDescription);
+    const safeImg = escapeHtml(rawOgImage);
+    const safeUrl = escapeHtml(rawOgUrl);
+
+    let html = rawHtml;
+    html = html.replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`);
+    html = html.replace(
+      /<meta\s+name="description"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="description" content="${safeDesc}" />`
+    );
+    html = html.replace(
+      /<meta\s+property="og:title"\s+content="[^"]*"\s*\/?>/i,
+      `<meta property="og:title" content="${safeTitle}" />`
+    );
+    html = html.replace(
+      /<meta\s+property="og:description"\s+content="[^"]*"\s*\/?>/i,
+      `<meta property="og:description" content="${safeDesc}" />`
+    );
+    html = html.replace(
+      /<meta\s+property="og:image"\s+content="[^"]*"\s*\/?>/i,
+      `<meta property="og:image" content="${safeImg}" />`
+    );
+    html = html.replace(
+      /<meta\s+property="og:url"\s+content="[^"]*"\s*\/?>/i,
+      `<meta property="og:url" content="${safeUrl}" />`
+    );
+    html = html.replace(
+      /<meta\s+name="twitter:card"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="twitter:card" content="summary_large_image" />`
+    );
+    html = html.replace(
+      /<meta\s+name="twitter:title"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="twitter:title" content="${safeTitle}" />`
+    );
+    html = html.replace(
+      /<meta\s+name="twitter:description"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="twitter:description" content="${safeDesc}" />`
+    );
+    html = html.replace(
+      /<meta\s+name="twitter:image"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="twitter:image" content="${safeImg}" />`
+    );
+
+    return html;
+  }
+
+  app.get('/', async (req, res, next) => {
+    try {
+      const distIndex = path.resolve(process.cwd(), 'dist', 'index.html');
+      const rootIndex = path.resolve(process.cwd(), 'index.html');
+      const targetIndex =
+        process.env.NODE_ENV === 'production' && fs.existsSync(distIndex)
+          ? distIndex
+          : rootIndex;
+
+      if (!fs.existsSync(targetIndex)) {
+        return next();
+      }
+
+      let html = fs.readFileSync(targetIndex, 'utf-8');
+      const viteServer = app.locals.viteServer;
+      if (viteServer && typeof viteServer.transformIndexHtml === 'function') {
+        html = await viteServer.transformIndexHtml(req.originalUrl, html);
+      }
+
+      const rendered = buildIndexHtmlForRequest(req, html);
+      return res
+        .status(200)
+        .setHeader('Content-Type', 'text/html; charset=utf-8')
+        .send(rendered);
+    } catch (err) {
+      return next(err);
+    }
   });
 
   return { app, db };
