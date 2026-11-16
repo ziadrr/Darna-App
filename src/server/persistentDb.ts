@@ -601,6 +601,85 @@ export class DarnaPersistentDb {
   }
 
   public async ensureOwnerAdminAccounts(syncRemote = false): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
+    const adminEmails = (process.env.ADMIN_EMAILS || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean);
+
+    // If ADMIN_EMAILS is non-empty, demote any existing 'admin' user whose email is NOT in ADMIN_EMAILS
+    // and invalidate their active sessions. If ADMIN_EMAILS is empty, demote nobody.
+    if (adminEmails.length > 0) {
+      const plans = this.getAllPlans();
+      const particulierPlan = plans.find((p) => p.id === 'particulier') ||
+        plans[0] || {
+          id: 'particulier',
+          name: 'Particulier (Gratuit)',
+          maxListings: 3,
+        };
+
+      const rows = this.db
+        .prepare('SELECT id, email, password_hash, role, data_json FROM users')
+        .all() as Array<{
+        id: string;
+        email: string;
+        password_hash: string;
+        role: string;
+        data_json: string;
+      }>;
+
+      let demotedCount = 0;
+      for (const row of rows) {
+        let parsedUser: User;
+        try {
+          parsedUser = JSON.parse(row.data_json) as User;
+        } catch {
+          continue;
+        }
+        const normalizedUserEmail = String(parsedUser.email || row.email || '')
+          .trim()
+          .toLowerCase();
+        if (
+          (row.role === 'admin' || parsedUser.role === 'admin') &&
+          !adminEmails.includes(normalizedUserEmail)
+        ) {
+          const demotedUser: User = {
+            ...parsedUser,
+            role: 'particulier',
+            verified: false,
+            subscription: {
+              planId: particulierPlan.id,
+              planName: particulierPlan.name,
+              status: 'active',
+              maxListings: particulierPlan.maxListings,
+              startedAt: parsedUser.subscription?.startedAt || nowIso,
+              expiresAt: parsedUser.subscription?.expiresAt || nextYearIso,
+            },
+          };
+
+          this.db
+            .prepare('UPDATE users SET role = ?, data_json = ?, updated_at = ? WHERE id = ?')
+            .run('particulier', JSON.stringify(demotedUser), nowIso, parsedUser.id);
+          this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(parsedUser.id);
+
+          if (syncRemote && this.enableCloudSqlSync) {
+            await syncUserToCloudSql(demotedUser, row.password_hash);
+            await deleteUserSessionsFromCloudSql(parsedUser.id);
+          }
+
+          demotedCount += 1;
+        }
+      }
+
+      if (demotedCount > 0) {
+        console.warn(
+          `[Security] Demoted ${demotedCount} unauthorized admin account(s) to particulier and invalidated their active sessions.`
+        );
+      }
+    }
+
     const initialPassword = (process.env.OWNER_ADMIN_INITIAL_PASSWORD || '').trim();
     if (!initialPassword || initialPassword.length < 12) {
       console.warn(
@@ -609,17 +688,9 @@ export class DarnaPersistentDb {
       return;
     }
 
-    const adminEmails = (process.env.ADMIN_EMAILS || '')
-      .split(',')
-      .map((e) => e.trim().toLowerCase())
-      .filter(Boolean);
-
     if (adminEmails.length === 0) {
       return;
     }
-
-    const nowIso = new Date().toISOString();
-    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
 
     for (const email of adminEmails) {
       const existing = this.getUserByEmail(email);

@@ -1858,7 +1858,170 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       delete process.env.CONVERSATION_MESSAGE_RATE_LIMIT;
     }
   });
+
+  it('19. demotes unauthorized admins on startup when ADMIN_EMAILS is non-empty, invalidates their sessions, preserves admins when ADMIN_EMAILS is empty, and logs only the count', async () => {
+    const savedAdminEmails = process.env.ADMIN_EMAILS;
+    const savedInitialPass = process.env.OWNER_ADMIN_INITIAL_PASSWORD;
+    const demoteDbPath = path.join(
+      os.tmpdir(),
+      `darna-demote-admin-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.sqlite`
+    );
+    const demoteDb = new DarnaPersistentDb(demoteDbPath);
+
+    const nowIso = new Date().toISOString();
+    const nextYearIso = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+
+    try {
+      // Seed 2 existing admin users: one authorized ('legit.admin@example.com') and one unauthorized ('rogue.admin@example.com')
+      const legitSecret = 'LegitAdminSecret2026!';
+      const rogueSecret = 'RogueAdminSecret2026!';
+
+      const legitAdmin = await demoteDb.createUser(
+        {
+          id: 'user-legit-admin',
+          firstName: 'Legit',
+          lastName: 'Admin',
+          name: 'Legit Admin',
+          email: 'legit.admin@example.com',
+          phone: '',
+          role: 'admin',
+          advertiserType: 'professionnel',
+          verified: true,
+          emailVerified: true,
+          favorites: [],
+          subscription: {
+            planId: 'agence',
+            planName: 'Administrateur',
+            status: 'active',
+            maxListings: 999,
+            startedAt: nowIso,
+            expiresAt: nextYearIso,
+          },
+          createdAt: nowIso.split('T')[0],
+        },
+        legitSecret
+      );
+
+      const rogueAdmin = await demoteDb.createUser(
+        {
+          id: 'user-rogue-admin',
+          firstName: 'Rogue',
+          lastName: 'Admin',
+          name: 'Rogue Admin',
+          email: 'rogue.admin@example.com',
+          phone: '',
+          role: 'admin',
+          advertiserType: 'professionnel',
+          verified: true,
+          emailVerified: true,
+          favorites: [],
+          subscription: {
+            planId: 'agence',
+            planName: 'Administrateur',
+            status: 'active',
+            maxListings: 999,
+            startedAt: nowIso,
+            expiresAt: nextYearIso,
+          },
+          createdAt: nowIso.split('T')[0],
+        },
+        rogueSecret
+      );
+
+      const legitSession = await demoteDb.createSession(legitAdmin.id);
+      const rogueSession = await demoteDb.createSession(rogueAdmin.id);
+
+      // Case A: ADMIN_EMAILS is empty -> must NOT demote anyone or invalidate sessions
+      process.env.ADMIN_EMAILS = '';
+      delete process.env.OWNER_ADMIN_INITIAL_PASSWORD;
+      await demoteDb.ensureOwnerAdminAccounts(false);
+
+      assert.equal(
+        demoteDb.getUserById(rogueAdmin.id)?.role,
+        'admin',
+        'When ADMIN_EMAILS is empty, existing admin must not be demoted'
+      );
+      assert.equal(
+        demoteDb.getUserById(legitAdmin.id)?.role,
+        'admin',
+        'When ADMIN_EMAILS is empty, legit admin must remain admin'
+      );
+      assert.ok(
+        demoteDb.getUserBySessionToken(rogueSession),
+        'Rogue session must remain active when ADMIN_EMAILS is empty'
+      );
+
+      // Case B: ADMIN_EMAILS is set to 'legit.admin@example.com' -> rogue.admin@example.com must be demoted to particulier,
+      // subscription set to particulier plan, verified=false, active sessions invalidated, and log contains only count (no email/password)
+      process.env.ADMIN_EMAILS = 'legit.admin@example.com';
+      const capturedWarnings: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: unknown[]) => {
+        capturedWarnings.push(args.map((a) => String(a)).join(' '));
+      };
+      try {
+        await demoteDb.ensureOwnerAdminAccounts(false);
+      } finally {
+        console.warn = origWarn;
+      }
+
+      const updatedRogue = demoteDb.getUserById(rogueAdmin.id);
+      assert.ok(updatedRogue);
+      assert.equal(updatedRogue.role, 'particulier', 'Unauthorized admin must be demoted to particulier');
+      assert.equal(updatedRogue.verified, false, 'Demoted user must have verified=false');
+      assert.equal(
+        updatedRogue.subscription?.planId,
+        'particulier',
+        'Demoted user subscription must be reset to particulier plan'
+      );
+      assert.equal(
+        demoteDb.getUserBySessionToken(rogueSession),
+        null,
+        'Demoted admin active sessions must be invalidated'
+      );
+
+      const updatedLegit = demoteDb.getUserById(legitAdmin.id);
+      assert.ok(updatedLegit);
+      assert.equal(updatedLegit.role, 'admin', 'Authorized admin in ADMIN_EMAILS must stay admin');
+      assert.equal(updatedLegit.verified, true);
+      assert.ok(
+        demoteDb.getUserBySessionToken(legitSession),
+        'Authorized admin session must remain valid'
+      );
+
+      const allLogText = capturedWarnings.join('\n');
+      assert.ok(
+        allLogText.includes('1'),
+        'Warning log must mention the count (1) of demoted accounts'
+      );
+      assert.ok(
+        !allLogText.includes('rogue.admin@example.com') &&
+          !allLogText.includes('legit.admin@example.com'),
+        'Logs must never contain admin emails'
+      );
+      assert.ok(
+        !allLogText.includes(rogueSecret) && !allLogText.includes(legitSecret),
+        'Logs must never contain passwords'
+      );
+    } finally {
+      process.env.ADMIN_EMAILS = savedAdminEmails;
+      if (savedInitialPass !== undefined) {
+        process.env.OWNER_ADMIN_INITIAL_PASSWORD = savedInitialPass;
+      } else {
+        delete process.env.OWNER_ADMIN_INITIAL_PASSWORD;
+      }
+      demoteDb.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        const f = `${demoteDbPath}${suffix}`;
+        if (fs.existsSync(f)) {
+          try {
+            fs.unlinkSync(f);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  });
 });
-
-
 
