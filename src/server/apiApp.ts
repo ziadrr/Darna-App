@@ -1852,6 +1852,25 @@ export function createDarnaApiApp(
     res.json({ success: true, listings: visibleListings });
   });
 
+  app.get(['/api/uploads/images/:filename', '/uploads/images/:filename'], (req, res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const stored = db.getUploadedImage(req.params.filename);
+    if (
+      !stored ||
+      !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
+      stored.buffer.length === 0 ||
+      stored.buffer.length > MAX_LISTING_IMAGE_BYTES
+    ) {
+      return res.status(404).send('Image introuvable');
+    }
+
+    res.setHeader('Content-Type', stored.mimeType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    return res.status(200).send(stored.buffer);
+  });
+
   app.get('/api/listings/:id/cover.jpg', (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
@@ -1863,6 +1882,26 @@ export function createDarnaApiApp(
     const firstImage = String(listing.images?.[0] || '').trim();
     if (!firstImage) {
       return res.status(404).send('Image introuvable');
+    }
+
+    if (
+      firstImage.startsWith('/api/uploads/images/') ||
+      firstImage.startsWith('/uploads/images/')
+    ) {
+      const stored = db.getUploadedImage(path.basename(firstImage));
+      if (
+        !stored ||
+        !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
+        stored.buffer.length === 0 ||
+        stored.buffer.length > MAX_LISTING_IMAGE_BYTES
+      ) {
+        return res.status(404).send('Image invalide ou introuvable');
+      }
+      res.setHeader('Content-Type', stored.mimeType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.status(200).send(stored.buffer);
     }
 
     if (firstImage.startsWith('data:')) {
@@ -1955,10 +1994,276 @@ export function createDarnaApiApp(
   });
 
   /**
+   * Validates image structure, strips all EXIF/GPS/XMP/IPTC metadata via sharp,
+   * resizes within 1920x1920, and persists the clean binary in dedicated storage (`uploaded_images`).
+   */
+  async function sanitizeAndStoreImageBuffer(
+    rawBuffer: Buffer,
+    mimeType: string,
+    userId: string
+  ): Promise<{
+    valid: boolean;
+    saved?: {
+      id: string;
+      url: string;
+      mimeType: string;
+      width: number;
+      height: number;
+      sizeBytes: number;
+      createdAt: string;
+    };
+    code?: string;
+    message?: string;
+  }> {
+    if (!ALLOWED_LISTING_IMAGE_MIMES.has(mimeType)) {
+      return {
+        valid: false,
+        code: 'INVALID_IMAGE_TYPE',
+        message:
+          'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+      };
+    }
+    if (!rawBuffer || rawBuffer.length === 0 || rawBuffer.length > MAX_LISTING_IMAGE_BYTES) {
+      return {
+        valid: false,
+        code: rawBuffer && rawBuffer.length > MAX_LISTING_IMAGE_BYTES ? 'IMAGE_TOO_LARGE' : 'INVALID_IMAGE_DATA',
+        message:
+          rawBuffer && rawBuffer.length > MAX_LISTING_IMAGE_BYTES
+            ? 'La taille décodée de chaque photo ne doit pas dépasser 5 Mo.'
+            : 'Le fichier sélectionné n’est pas une image valide.',
+      };
+    }
+
+    try {
+      const pipeline = sharp(rawBuffer, {
+        failOn: 'error',
+        animated: mimeType === 'image/gif',
+      }).rotate(); // Auto-orients and strips EXIF/GPS/XMP/IPTC metadata by default
+
+      const metadata = await pipeline.metadata();
+      const detectedFormat = String(metadata.format || '').toLowerCase();
+      if (
+        !metadata.width ||
+        !metadata.height ||
+        !['jpeg', 'png', 'webp', 'gif'].includes(detectedFormat)
+      ) {
+        return {
+          valid: false,
+          code: 'INVALID_IMAGE_DATA',
+          message: 'Le fichier fourni n’est pas une image valide (JPEG, PNG, WebP ou GIF requis).',
+        };
+      }
+
+      const resized = pipeline.resize({
+        width: 1920,
+        height: 1920,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+
+      let outBuffer: Buffer;
+      let outMime = mimeType;
+      if (detectedFormat === 'jpeg') {
+        outMime = 'image/jpeg';
+        outBuffer = await resized.jpeg({ quality: 86, mozjpeg: true }).toBuffer();
+      } else if (detectedFormat === 'png') {
+        outMime = 'image/png';
+        outBuffer = await resized.png({ compressionLevel: 8 }).toBuffer();
+      } else if (detectedFormat === 'webp') {
+        outMime = 'image/webp';
+        outBuffer = await resized.webp({ quality: 86 }).toBuffer();
+      } else {
+        outMime = 'image/gif';
+        outBuffer = await resized.gif().toBuffer();
+      }
+
+      const outMeta = await sharp(outBuffer).metadata();
+      const imgId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const saved = db.saveUploadedImage({
+        id: imgId,
+        userId,
+        mimeType: outMime,
+        width: outMeta.width || metadata.width,
+        height: outMeta.height || metadata.height,
+        buffer: outBuffer,
+      });
+
+      return { valid: true, saved };
+    } catch {
+      return {
+        valid: false,
+        code: 'INVALID_IMAGE_CONTENT',
+        message:
+          'Impossible de décoder cette image. Veuillez fournir une vraie photo JPEG, PNG, WebP ou GIF.',
+      };
+    }
+  }
+
+  /**
+   * Ensures every image submitted on POST/PUT /api/listings is validated, stripped of EXIF metadata
+   * via sharp if sent as base64, and stored in dedicated image storage rather than kept inline as base64.
+   */
+  async function processAndSanitizeListingImages(
+    rawImages: unknown,
+    userId: string
+  ): Promise<{
+    valid: boolean;
+    images?: string[];
+    code?: string;
+    message?: string;
+  }> {
+    const preCheck = validateListingImages(rawImages);
+    if (!preCheck.valid) {
+      return {
+        valid: false,
+        code: preCheck.code || 'INVALID_IMAGE_TYPE',
+        message: preCheck.message,
+      };
+    }
+    if (!Array.isArray(rawImages)) {
+      return { valid: true, images: [] };
+    }
+
+    const processedUrls: string[] = [];
+    for (const item of rawImages) {
+      const trimmed = String(item || '').trim();
+      if (trimmed.startsWith('data:')) {
+        const parsed = parseAllowedBase64Image(trimmed);
+        if (!parsed.valid || !parsed.buffer || !parsed.mimeType) {
+          return {
+            valid: false,
+            code: parsed.reason === 'too_large' ? 'IMAGE_TOO_LARGE' : 'INVALID_IMAGE_TYPE',
+            message:
+              parsed.reason === 'too_large'
+                ? 'La taille décodée de chaque image ne doit pas dépasser 5 Mo.'
+                : 'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+          };
+        }
+        const sanitized = await sanitizeAndStoreImageBuffer(
+          parsed.buffer,
+          parsed.mimeType,
+          userId
+        );
+        if (!sanitized.valid || !sanitized.saved) {
+          return {
+            valid: false,
+            code: sanitized.code || 'INVALID_IMAGE_CONTENT',
+            message: sanitized.message,
+          };
+        }
+        processedUrls.push(sanitized.saved.url);
+        continue;
+      }
+
+      if (
+        trimmed.startsWith('/api/uploads/images/') ||
+        trimmed.startsWith('/uploads/images/')
+      ) {
+        const existingImg = db.getUploadedImage(path.basename(trimmed));
+        if (!existingImg) {
+          return {
+            valid: false,
+            code: 'IMAGE_NOT_FOUND',
+            message: 'L’image téléversée référencée est introuvable sur le serveur.',
+          };
+        }
+        processedUrls.push(`/api/uploads/images/${path.basename(trimmed)}`);
+        continue;
+      }
+
+      processedUrls.push(trimmed);
+    }
+
+    return { valid: true, images: processedUrls };
+  }
+
+  /**
+   * Strips any promotion, boost, or payment fields supplied directly by the client
+   * on listing creation or update. Only the server payment verification flow can activate a boost.
+   */
+  function stripClientPromotionAndPaymentFields(
+    rawBody: Record<string, any> | undefined | null
+  ): any {
+    if (!rawBody || typeof rawBody !== 'object') return {};
+    const cleaned = { ...rawBody };
+    const forbiddenFields = [
+      'boost',
+      'boostOptionId',
+      'isBoosted',
+      'promoted',
+      'isPromoted',
+      'featured',
+      'isFeatured',
+      'sponsored',
+      'isSponsored',
+      'highlighted',
+      'priority',
+      'payment',
+      'paymentId',
+      'paymentStatus',
+      'transactionId',
+      'paid',
+      'isPaid',
+    ];
+    for (const key of forbiddenFields) {
+      delete cleaned[key];
+    }
+    return cleaned;
+  }
+
+  /**
+   * Builds a strictly validated ListingContact object on the server.
+   * - Defaults all visibility and consent flags to false on creation unless explicitly opted in.
+   * - Never makes phone or WhatsApp visible unless both `phoneConsentAccepted === true`
+   *   AND the corresponding `showPhone === true` / `showWhatsApp === true` choice are explicitly set.
+   */
+  function buildSanitizedServerContact(
+    rawContactInput: unknown,
+    viewer: User,
+    existingContact?: Listing['contact']
+  ): Listing['contact'] {
+    const base =
+      rawContactInput && typeof rawContactInput === 'object'
+        ? { ...(existingContact || {}), ...(rawContactInput as Record<string, any>) }
+        : existingContact
+          ? { ...existingContact }
+          : {};
+
+    const explicitPhoneConsent = base.phoneConsentAccepted === true;
+    const showPhone = explicitPhoneConsent && base.showPhone === true;
+    const showWhatsApp = explicitPhoneConsent && base.showWhatsApp === true;
+    const showEmail = base.showEmail === true;
+    const showExactAddress = base.showExactAddress === true;
+    const showMapLocation = base.showMapLocation !== false;
+
+    const rawPhone = String(base.phone ?? viewer.phone ?? '').trim();
+    const rawWhatsApp = String(base.whatsapp ?? rawPhone).trim();
+    const rawEmail = String(base.email ?? viewer.email ?? '').trim();
+
+    return {
+      name: String(base.name || viewer.name || 'Annonceur Darna').trim(),
+      type:
+        base.type === 'professionnel' || base.type === 'particulier'
+          ? base.type
+          : viewer.advertiserType ||
+            (viewer.role === 'professionnel' ? 'professionnel' : 'particulier'),
+      phone: showPhone ? rawPhone : '',
+      whatsapp: showWhatsApp && rawWhatsApp ? rawWhatsApp : undefined,
+      email: showEmail ? rawEmail : '',
+      showPhone,
+      showWhatsApp,
+      showEmail,
+      showExactAddress,
+      showMapLocation,
+      phoneConsentAccepted: explicitPhoneConsent,
+    };
+  }
+
+  /**
    * Secure Personal Property Photo Upload Endpoint (POST /api/uploads/image)
    * - Requires authenticated user
    * - Accepts only image/jpeg, image/png, image/webp, image/gif up to 5 MB decoded
-   * - Verifies real image structure and strips EXIF/GPS metadata via sharp before storage
+   * - Verifies real image structure, strips EXIF/GPS metadata via sharp, and stores in uploaded_images
    */
   app.post('/api/uploads/image', async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1995,63 +2300,36 @@ export function createDarnaApiApp(
       });
     }
 
-    try {
-      const pipeline = sharp(parsed.buffer, {
-        failOn: 'error',
-        animated: parsed.mimeType === 'image/gif',
-      }).rotate(); // Auto-orient and strip EXIF/GPS metadata by default
-
-      const metadata = await pipeline.metadata();
-      if (!metadata.width || !metadata.height) {
-        return res.status(400).json({
-          success: false,
-          code: 'INVALID_IMAGE_DATA',
-          message: 'Le fichier sélectionné n’est pas une image valide.',
-        });
-      }
-
-      const resized = pipeline.resize({
-        width: 1920,
-        height: 1920,
-        fit: 'inside',
-        withoutEnlargement: true,
-      });
-
-      let outBuffer: Buffer;
-      const outMime = parsed.mimeType;
-      if (parsed.mimeType === 'image/jpeg') {
-        outBuffer = await resized.jpeg({ quality: 86, mozjpeg: true }).toBuffer();
-      } else if (parsed.mimeType === 'image/png') {
-        outBuffer = await resized.png({ compressionLevel: 8 }).toBuffer();
-      } else if (parsed.mimeType === 'image/webp') {
-        outBuffer = await resized.webp({ quality: 86 }).toBuffer();
-      } else {
-        outBuffer = await resized.gif().toBuffer();
-      }
-
-      const outMeta = await sharp(outBuffer).metadata();
-      const sanitizedDataUri = `data:${outMime};base64,${outBuffer.toString('base64')}`;
-
-      return res.status(200).json({
-        success: true,
-        dataUri: sanitizedDataUri,
-        dataUrl: sanitizedDataUri,
-        mimeType: outMime,
-        width: outMeta.width || metadata.width,
-        height: outMeta.height || metadata.height,
-        sizeBytes: outBuffer.length,
-        exifStripped: true,
-        isDemo: false,
-        isPersonalUpload: true,
-      });
-    } catch {
+    const sanitized = await sanitizeAndStoreImageBuffer(
+      parsed.buffer,
+      parsed.mimeType,
+      viewer.id
+    );
+    if (!sanitized.valid || !sanitized.saved) {
       return res.status(400).json({
         success: false,
-        code: 'INVALID_IMAGE_CONTENT',
+        code: sanitized.code || 'INVALID_IMAGE_CONTENT',
         message:
+          sanitized.message ||
           'Impossible de décoder cette image. Veuillez sélectionner une vraie photo JPEG, PNG, WebP ou GIF.',
       });
     }
+
+    return res.status(200).json({
+      success: true,
+      id: sanitized.saved.id,
+      url: sanitized.saved.url,
+      imageUrl: sanitized.saved.url,
+      dataUri: sanitized.saved.url,
+      dataUrl: sanitized.saved.url,
+      mimeType: sanitized.saved.mimeType,
+      width: sanitized.saved.width,
+      height: sanitized.saved.height,
+      sizeBytes: sanitized.saved.sizeBytes,
+      exifStripped: true,
+      isDemo: false,
+      isPersonalUpload: true,
+    });
   });
 
   app.post('/api/listings', async (req, res) => {
@@ -2063,12 +2341,15 @@ export function createDarnaApiApp(
       });
     }
 
-    const imageValidation = validateListingImages(req.body?.images);
-    if (!imageValidation.valid) {
+    const processedImages = await processAndSanitizeListingImages(
+      req.body?.images,
+      viewer.id
+    );
+    if (!processedImages.valid) {
       return res.status(400).json({
         success: false,
-        code: imageValidation.code || 'INVALID_IMAGE_TYPE',
-        message: imageValidation.message,
+        code: processedImages.code || 'INVALID_IMAGE_TYPE',
+        message: processedImages.message,
       });
     }
 
@@ -2085,44 +2366,38 @@ export function createDarnaApiApp(
     }
 
     try {
-      const titleCheck = detectContactInPublicText(req.body.title || '');
-      const descCheck = detectContactInPublicText(req.body.description || '');
+      const cleanedBody = stripClientPromotionAndPaymentFields(req.body);
+      const titleCheck = detectContactInPublicText(cleanedBody.title || '');
+      const descCheck = detectContactInPublicText(cleanedBody.description || '');
       const flagged = titleCheck.hasContactInfo || descCheck.hasContactInfo;
       const nowIso = new Date().toISOString();
-      const txType = req.body.transactionType === 'vente' ? 'vente' : 'location';
+      const txType = cleanedBody.transactionType === 'vente' ? 'vente' : 'location';
 
-      const defaultContact = {
-        name: viewer.name || 'Annonceur Darna',
-        type: viewer.advertiserType || (viewer.role === 'professionnel' ? 'professionnel' : 'particulier'),
-        phone: viewer.phone || '',
-        email: viewer.email || '',
-        showPhone: true,
-        showEmail: true,
-        showWhatsApp: false,
-        showExactAddress: false,
-        showMapLocation: true,
-        phoneConsentAccepted: true,
-      };
+      const sanitizedContact = buildSanitizedServerContact(
+        cleanedBody.contact,
+        viewer
+      );
 
       const newListing: Listing = {
-        ...req.body,
+        ...cleanedBody,
         id: `darna-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         userId: viewer.id,
         transactionType: txType,
-        period: txType === 'vente' ? 'unique' : req.body.period || 'mois',
-        slug: (req.body.title || 'annonce')
+        period: txType === 'vente' ? 'unique' : cleanedBody.period || 'mois',
+        slug: (cleanedBody.title || 'annonce')
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, '-')
           .replace(/(^-|-$)/g, ''),
-        images: Array.isArray(req.body.images) ? req.body.images : [],
-        amenities: Array.isArray(req.body.amenities) ? req.body.amenities : [],
-        contact: req.body.contact ? { ...defaultContact, ...req.body.contact } : defaultContact,
+        images: processedImages.images || [],
+        amenities: Array.isArray(cleanedBody.amenities) ? cleanedBody.amenities : [],
+        contact: sanitizedContact,
+        boost: undefined,
         viewsCount: 0,
         favoritesCount: 0,
         createdAt: nowIso,
         updatedAt: nowIso,
-        status: req.body.status === 'brouillon' ? 'brouillon' : 'publiee',
-        isDemo: Boolean(req.body.isDemo),
+        status: cleanedBody.status === 'brouillon' ? 'brouillon' : 'publiee',
+        isDemo: Boolean(cleanedBody.isDemo),
         flaggedForContactInText: flagged,
       };
       await db.createListing(newListing);
@@ -2158,32 +2433,46 @@ export function createDarnaApiApp(
         });
       }
 
+      let updatedImages = existing.images;
       if (req.body?.images !== undefined) {
-        const imageValidation = validateListingImages(req.body.images);
-        if (!imageValidation.valid) {
+        const processedImages = await processAndSanitizeListingImages(
+          req.body.images,
+          existing.userId
+        );
+        if (!processedImages.valid) {
           return res.status(400).json({
             success: false,
-            code: imageValidation.code || 'INVALID_IMAGE_TYPE',
-            message: imageValidation.message,
+            code: processedImages.code || 'INVALID_IMAGE_TYPE',
+            message: processedImages.message,
           });
         }
+        updatedImages = processedImages.images || [];
       }
 
+      const cleanedBody = stripClientPromotionAndPaymentFields(req.body);
       const updatedTxType =
-        req.body.transactionType === 'vente'
+        cleanedBody.transactionType === 'vente'
           ? 'vente'
-          : req.body.transactionType === 'location'
-          ? 'location'
-          : existing.transactionType || 'location';
+          : cleanedBody.transactionType === 'location'
+            ? 'location'
+            : existing.transactionType || 'location';
 
-      // Prevent non-admins from forging paid boost or changing listing owner
+      const sanitizedContact = buildSanitizedServerContact(
+        cleanedBody.contact,
+        viewer,
+        existing.contact
+      );
+
+      // Ignore any client-supplied promotion/payment fields; preserve server-managed existing.boost only
       const updatedListing: Listing = {
         ...existing,
-        ...req.body,
+        ...cleanedBody,
         id: existing.id,
         userId: existing.userId,
         transactionType: updatedTxType,
-        boost: viewer.role === 'admin' && req.body.boost !== undefined ? req.body.boost : existing.boost,
+        images: updatedImages,
+        contact: sanitizedContact,
+        boost: existing.boost,
         updatedAt: new Date().toISOString(),
       };
       const saved = await db.updateListing(updatedListing);
@@ -3905,7 +4194,15 @@ self.addEventListener('fetch', () => {});\n`;
 
     const firstImg = String(listing.images?.[0] || '').trim();
     let rawOgImage: string;
-    if (firstImg.startsWith('data:')) {
+    if (
+      firstImg.startsWith('/api/uploads/images/') ||
+      firstImg.startsWith('/uploads/images/')
+    ) {
+      const stored = db.getUploadedImage(path.basename(firstImg));
+      rawOgImage = stored
+        ? `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`
+        : defaultOgImageUrl;
+    } else if (firstImg.startsWith('data:')) {
       const parsed = parseAllowedBase64Image(firstImg);
       rawOgImage = parsed.valid
         ? `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`

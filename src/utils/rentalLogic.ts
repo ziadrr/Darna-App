@@ -567,23 +567,25 @@ export function sanitizeListingForVisitor(listing: Listing): Listing {
     type: 'particulier' as const,
     phone: '',
     email: '',
-    showPhone: true,
-    showEmail: true,
+    showPhone: false,
+    showEmail: false,
     showWhatsApp: false,
     showExactAddress: false,
+    phoneConsentAccepted: false,
   };
+  const hasExplicitPhoneConsent = rawContact.phoneConsentAccepted === true;
   const sanitizedContact: ListingContact = {
     name: rawContact.name || 'Annonceur Darna',
     type: rawContact.type || 'particulier',
     phone: '',
     whatsapp: undefined,
     email: '',
-    showPhone: Boolean(rawContact.showPhone),
-    showEmail: Boolean(rawContact.showEmail),
-    showWhatsApp: Boolean(rawContact.showWhatsApp),
-    showExactAddress: Boolean(rawContact.showExactAddress),
+    showPhone: Boolean(rawContact.showPhone === true && hasExplicitPhoneConsent),
+    showEmail: Boolean(rawContact.showEmail === true),
+    showWhatsApp: Boolean(rawContact.showWhatsApp === true && hasExplicitPhoneConsent),
+    showExactAddress: Boolean(rawContact.showExactAddress === true),
     showMapLocation: rawContact.showMapLocation ?? true,
-    phoneConsentAccepted: rawContact.phoneConsentAccepted ?? true
+    phoneConsentAccepted: hasExplicitPhoneConsent
   };
 
   return {
@@ -597,7 +599,7 @@ export function sanitizeListingForVisitor(listing: Listing): Listing {
 
 /**
  * Sanitize listing contact details for authenticated users (or public if specified).
- * Only reveals contact channels that the advertiser explicitly opted to share.
+ * Only reveals contact channels that the advertiser explicitly opted and consented to share.
  */
 export function sanitizeListingForPublic(listing: Listing, isAuthenticated: boolean = true): Listing {
   if (!isAuthenticated) {
@@ -609,23 +611,34 @@ export function sanitizeListingForPublic(listing: Listing, isAuthenticated: bool
     type: 'particulier' as const,
     phone: '',
     email: '',
-    showPhone: true,
-    showEmail: true,
+    showPhone: false,
+    showEmail: false,
     showWhatsApp: false,
     showExactAddress: false,
+    phoneConsentAccepted: false,
   };
-  const allowPhone = Boolean(rawContact.showPhone && rawContact.phoneConsentAccepted !== false);
+  const hasExplicitPhoneConsent = rawContact.phoneConsentAccepted === true;
+  const allowPhone = Boolean(rawContact.showPhone === true && hasExplicitPhoneConsent);
+  const allowWhatsApp = Boolean(rawContact.showWhatsApp === true && hasExplicitPhoneConsent);
+  const allowEmail = Boolean(rawContact.showEmail === true);
+  const allowExactAddress = Boolean(rawContact.showExactAddress === true);
+
   const sanitizedContact: ListingContact = {
     ...rawContact,
     phone: allowPhone ? rawContact.phone : '',
-    email: rawContact.showEmail ? rawContact.email : '',
-    whatsapp: rawContact.showWhatsApp ? rawContact.whatsapp : undefined,
+    email: allowEmail ? rawContact.email : '',
+    whatsapp: allowWhatsApp ? rawContact.whatsapp : undefined,
+    showPhone: allowPhone,
+    showWhatsApp: allowWhatsApp,
+    showEmail: allowEmail,
+    showExactAddress: allowExactAddress,
+    phoneConsentAccepted: hasExplicitPhoneConsent,
   };
 
   return {
     ...listing,
     contact: sanitizedContact,
-    address: rawContact.showExactAddress ? listing.address : `${listing.district}, ${listing.city}`,
+    address: allowExactAddress ? listing.address : `${listing.district}, ${listing.city}`,
     latitude: rawContact.showMapLocation === false ? 0 : listing.latitude,
     longitude: rawContact.showMapLocation === false ? 0 : listing.longitude
   };

@@ -390,6 +390,17 @@ export class DarnaPersistentDb {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS uploaded_images (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        binary_data BLOB NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -1604,6 +1615,108 @@ export class DarnaPersistentDb {
       .prepare('UPDATE conversations SET data_json = ?, updated_at = ? WHERE id = ?')
       .run(JSON.stringify(updated), nowIso, conversationId);
     return updated;
+  }
+
+  public saveUploadedImage(params: {
+    id: string;
+    userId: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    buffer: Buffer;
+  }): {
+    id: string;
+    url: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+    createdAt: string;
+  } {
+    const nowIso = new Date().toISOString();
+    const ext =
+      params.mimeType === 'image/jpeg'
+        ? 'jpg'
+        : params.mimeType === 'image/png'
+          ? 'png'
+          : params.mimeType === 'image/webp'
+            ? 'webp'
+            : 'gif';
+    const cleanId = params.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const sizeBytes = params.buffer.length;
+
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO uploaded_images
+         (id, user_id, mime_type, width, height, size_bytes, binary_data, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        cleanId,
+        params.userId,
+        params.mimeType,
+        params.width,
+        params.height,
+        sizeBytes,
+        params.buffer,
+        nowIso
+      );
+
+    return {
+      id: cleanId,
+      url: `/api/uploads/images/${cleanId}.${ext}`,
+      mimeType: params.mimeType,
+      width: params.width,
+      height: params.height,
+      sizeBytes,
+      createdAt: nowIso,
+    };
+  }
+
+  public getUploadedImage(idOrFilename: string): {
+    id: string;
+    userId: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+    buffer: Buffer;
+    createdAt: string;
+  } | null {
+    const raw = String(idOrFilename || '').trim();
+    if (!raw) return null;
+    const baseId = raw.replace(/\.[a-z0-9]+$/i, '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!baseId) return null;
+
+    const row = this.db
+      .prepare(
+        'SELECT id, user_id, mime_type, width, height, size_bytes, binary_data, created_at FROM uploaded_images WHERE id = ?'
+      )
+      .get(baseId) as
+      | {
+          id: string;
+          user_id: string;
+          mime_type: string;
+          width: number;
+          height: number;
+          size_bytes: number;
+          binary_data: Uint8Array | Buffer;
+          created_at: string;
+        }
+      | undefined;
+
+    if (!row || !row.binary_data) return null;
+
+    return {
+      id: row.id,
+      userId: row.user_id,
+      mimeType: row.mime_type,
+      width: Number(row.width),
+      height: Number(row.height),
+      sizeBytes: Number(row.size_bytes),
+      buffer: Buffer.from(row.binary_data),
+      createdAt: row.created_at,
+    };
   }
 
   public close(): void {

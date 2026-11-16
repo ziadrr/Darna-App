@@ -2721,12 +2721,12 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(uploadedPhoto.height, 1);
     assert.equal(uploadedPhoto.isPersonalUpload, true);
     assert.ok(
-      typeof uploadedPhoto.dataUrl === 'string' &&
-        uploadedPhoto.dataUrl.startsWith('data:image/png;base64,'),
-      'Uploaded personal photo must return sanitized data:image/png;base64,...'
+      typeof uploadedPhoto.url === 'string' &&
+        uploadedPhoto.url.startsWith('/api/uploads/images/'),
+      'Uploaded personal photo must return a dedicated storage URL /api/uploads/images/...'
     );
     assert.equal(
-      isDemoImageUrl(uploadedPhoto.dataUrl),
+      isDemoImageUrl(uploadedPhoto.url),
       false,
       'Uploaded personal photo must NOT be marked as a demo photo'
     );
@@ -2766,7 +2766,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         bathrooms: 2,
         city: 'Casablanca',
         district: 'Gauthier',
-        images: [uploadedPhoto.dataUrl],
+        images: [uploadedPhoto.url],
       }),
     });
     assert.equal(createSaleRes.status, 201, 'POST /api/listings must create a "vente" listing');
@@ -2899,5 +2899,429 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       'Monetization config must list simulation-only capabilities'
     );
   });
+
+  it('27. enforces server-only boost activation (ignoring client promotion/payment fields on POST & PUT), strips EXIF and moves direct base64 images to dedicated storage on POST & PUT /api/listings, and enforces explicit advertiser choice & consent before exposing phone or WhatsApp', async () => {
+    const sharpMod = (await import('sharp')).default;
+
+    // Create two users: Advertiser and Reader
+    const advertiserId = 'user-pro-sec-27';
+    await dbInstance.createUser(
+      {
+        id: advertiserId,
+        firstName: 'Samir',
+        lastName: 'Annonceur',
+        name: 'Samir Annonceur',
+        email: 'samir.sec27@darna.ma',
+        phone: '0661776655',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 100,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'SamirPass2026!'
+    );
+    const advertiserToken = await dbInstance.createSession(advertiserId);
+
+    const readerId = 'user-part-reader-27';
+    await dbInstance.createUser(
+      {
+        id: readerId,
+        firstName: 'Amina',
+        lastName: 'Lectrice',
+        name: 'Amina Lectrice',
+        email: 'amina.reader27@darna.ma',
+        phone: '0662001122',
+        role: 'particulier',
+        advertiserType: 'particulier',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'AminaPass2026!'
+    );
+    const readerToken = await dbInstance.createSession(readerId);
+
+    // Also create an admin user to verify that even admin calls to POST/PUT /api/listings cannot inject boost directly
+    const adminId = 'user-admin-sec-27';
+    await dbInstance.createUser(
+      {
+        id: adminId,
+        firstName: 'Admin',
+        lastName: 'Test27',
+        name: 'Admin Test27',
+        email: 'admin.test27@darna.ma',
+        phone: '0660000027',
+        role: 'admin',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 100,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'AdminPass2026!'
+    );
+    const adminToken = await dbInstance.createSession(adminId);
+
+    // =========================================================================
+    // A. DIRECT RAW PHOTO WITH EXIF METADATA + UNAUTHORIZED BOOST ATTEMPT + NO CONTACT CONSENT
+    // =========================================================================
+    const rawExifBuffer = await sharpMod({
+      create: {
+        width: 32,
+        height: 32,
+        channels: 3,
+        background: { r: 193, g: 92, b: 61 },
+      },
+    })
+      .withMetadata({
+        exif: {
+          IFD0: {
+            Copyright: 'SECRET_EXIF_CAMERA_SERIAL_2026',
+            ImageDescription: 'GPS_HOME_COORDINATES_PRIVATE',
+          },
+        },
+      })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    // Confirm the raw JPEG actually contains the EXIF strings before sending to the API
+    assert.ok(
+      rawExifBuffer.includes(Buffer.from('SECRET_EXIF_CAMERA_SERIAL_2026')),
+      'Raw test JPEG must contain EXIF Copyright marker before upload'
+    );
+    assert.ok(
+      rawExifBuffer.includes(Buffer.from('GPS_HOME_COORDINATES_PRIVATE')),
+      'Raw test JPEG must contain EXIF ImageDescription marker before upload'
+    );
+
+    const directRawDataUri = `data:image/jpeg;base64,${rawExifBuffer.toString('base64')}`;
+
+    // 1. POST /api/listings with:
+    //    - forged boost & payment fields
+    //    - raw unprocessed base64 JPEG with EXIF
+    //    - contact with showPhone: true, showWhatsApp: true, BUT phoneConsentAccepted: false
+    const createRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${advertiserToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Villa Test Sécurité Direct API',
+        description: 'Annonce envoyée directement à POST /api/listings.',
+        category: 'villa',
+        transactionType: 'location',
+        price: 15000,
+        period: 'mois',
+        surface: 220,
+        rooms: 5,
+        city: 'Rabat',
+        district: 'Souissi',
+        images: [directRawDataUri],
+        // Forged promotion & payment fields that MUST be ignored
+        boost: {
+          optionId: 'boost-30d',
+          optionName: 'Pack Visibilité 30 Jours',
+          startsAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+          badgeLabel: 'Sponsorisé',
+          priorityScore: 100,
+        },
+        promoted: true,
+        isPromoted: true,
+        featured: true,
+        isSponsored: true,
+        paymentStatus: 'paye',
+        transactionId: 'tx-forged-999',
+        paid: true,
+        // Contact with showPhone/showWhatsApp requested WITHOUT explicit consent
+        contact: {
+          name: 'Samir Annonceur',
+          type: 'professionnel',
+          phone: '0661776655',
+          whatsapp: '0661776655',
+          email: 'samir.sec27@darna.ma',
+          showPhone: true,
+          showWhatsApp: true,
+          showEmail: false,
+          showExactAddress: false,
+          phoneConsentAccepted: false,
+        },
+      }),
+    });
+    assert.equal(createRes.status, 201, 'POST /api/listings must succeed while sanitizing inputs');
+    const { listing: createdListing } = await createRes.json();
+
+    // Verify 1A: Forged promotion and payment fields are completely ignored on creation
+    assert.equal(
+      createdListing.boost,
+      undefined,
+      'Client-supplied boost must be ignored on POST /api/listings'
+    );
+    assert.equal(createdListing.promoted, undefined);
+    assert.equal(createdListing.isPromoted, undefined);
+    assert.equal(createdListing.featured, undefined);
+    assert.equal(createdListing.isSponsored, undefined);
+    assert.equal(createdListing.paymentStatus, undefined);
+    assert.equal(createdListing.transactionId, undefined);
+    assert.equal(createdListing.paid, undefined);
+
+    // Verify 1B: Direct base64 photo was converted to dedicated image storage URL and stripped of EXIF
+    assert.equal(createdListing.images.length, 1);
+    const storedImgUrl = createdListing.images[0];
+    assert.ok(
+      storedImgUrl.startsWith('/api/uploads/images/') && storedImgUrl.endsWith('.jpg'),
+      `Listing image must be stored in dedicated storage (/api/uploads/images/*.jpg), got ${storedImgUrl}`
+    );
+    assert.ok(
+      !storedImgUrl.startsWith('data:'),
+      'Listing record must NOT keep raw base64 encoded image data'
+    );
+
+    const imgFetchRes = await fetch(`${baseUrl}${storedImgUrl}`);
+    assert.equal(imgFetchRes.status, 200, 'Dedicated image URL must return HTTP 200');
+    assert.equal(imgFetchRes.headers.get('content-type'), 'image/jpeg');
+    assert.equal(imgFetchRes.headers.get('x-content-type-options'), 'nosniff');
+    const sanitizedImgBuffer = Buffer.from(await imgFetchRes.arrayBuffer());
+    assert.ok(
+      !sanitizedImgBuffer.includes(Buffer.from('SECRET_EXIF_CAMERA_SERIAL_2026')),
+      'EXIF Copyright metadata must be stripped from direct API photo on POST /api/listings'
+    );
+    assert.ok(
+      !sanitizedImgBuffer.includes(Buffer.from('GPS_HOME_COORDINATES_PRIVATE')),
+      'EXIF ImageDescription metadata must be stripped from direct API photo on POST /api/listings'
+    );
+
+    // Verify 1C: Without explicit phoneConsentAccepted === true, phone & WhatsApp are NOT visible
+    assert.equal(createdListing.contact.phoneConsentAccepted, false);
+    assert.equal(createdListing.contact.showPhone, false);
+    assert.equal(createdListing.contact.showWhatsApp, false);
+    assert.equal(createdListing.contact.phone, '');
+    assert.equal(createdListing.contact.whatsapp, undefined);
+
+    // Verify authenticated reader cannot see phone or WhatsApp on /api/listings/:id or /api/listings/:id/contact
+    const readerContactRes = await fetch(
+      `${baseUrl}/api/listings/${createdListing.id}/contact`,
+      {
+        headers: { Authorization: `Bearer ${readerToken}` },
+      }
+    );
+    assert.equal(readerContactRes.status, 200);
+    const readerContactData = await readerContactRes.json();
+    assert.equal(
+      readerContactData.contact.phone,
+      '',
+      'Phone must not be visible to authenticated users when phoneConsentAccepted is false'
+    );
+    assert.equal(
+      readerContactData.contact.whatsapp,
+      undefined,
+      'WhatsApp must not be visible to authenticated users when phoneConsentAccepted is false'
+    );
+
+    // =========================================================================
+    // B. SERVER DEFAULT CONTACT VALUES WHEN OMITTED COMPLETELY
+    // =========================================================================
+    const defaultContactListingRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${advertiserToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Studio Sans Objet Contact',
+        description: 'Test des valeurs par défaut côté serveur.',
+        category: 'studio',
+        price: 4500,
+        city: 'Casablanca',
+        district: 'Maârif',
+      }),
+    });
+    assert.equal(defaultContactListingRes.status, 201);
+    const { listing: defaultContactListing } = await defaultContactListingRes.json();
+    assert.equal(
+      defaultContactListing.contact.phoneConsentAccepted,
+      false,
+      'Server default phoneConsentAccepted must be false'
+    );
+    assert.equal(
+      defaultContactListing.contact.showPhone,
+      false,
+      'Server default showPhone must be false'
+    );
+    assert.equal(
+      defaultContactListing.contact.showWhatsApp,
+      false,
+      'Server default showWhatsApp must be false'
+    );
+    assert.equal(
+      defaultContactListing.contact.phone,
+      '',
+      'Server default phone must be empty until explicit choice & consent'
+    );
+    assert.equal(
+      defaultContactListing.contact.whatsapp,
+      undefined,
+      'Server default whatsapp must be undefined until explicit choice & consent'
+    );
+
+    // =========================================================================
+    // C. PUT /api/listings/:id — UNAUTHORIZED BOOST ATTEMPT (EVEN BY ADMIN), DIRECT EXIF PHOTO, AND EXPLICIT CONSENT
+    // =========================================================================
+    const secondExifBuffer = await sharpMod({
+      create: {
+        width: 24,
+        height: 24,
+        channels: 3,
+        background: { r: 30, g: 61, b: 52 },
+      },
+    })
+      .withMetadata({
+        exif: {
+          IFD0: {
+            Copyright: 'PUT_EXIF_SECRET_2026',
+          },
+        },
+      })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    assert.ok(secondExifBuffer.includes(Buffer.from('PUT_EXIF_SECRET_2026')));
+
+    const putAttemptRes = await fetch(`${baseUrl}/api/listings/${createdListing.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Villa Modifiée Avec Tentative Boost',
+        images: [`data:image/jpeg;base64,${secondExifBuffer.toString('base64')}`],
+        boost: {
+          optionId: 'boost-30d',
+          optionName: 'Forged Admin PUT Boost',
+          startsAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+          badgeLabel: 'Sponsorisé',
+          priorityScore: 999,
+        },
+        promoted: true,
+        paymentStatus: 'paye',
+        contact: {
+          name: 'Samir Annonceur',
+          type: 'professionnel',
+          phone: '0661776655',
+          whatsapp: '0661776655',
+          showPhone: true,
+          showWhatsApp: true,
+          phoneConsentAccepted: true,
+        },
+      }),
+    });
+    assert.equal(putAttemptRes.status, 200);
+    const { listing: updatedListing } = await putAttemptRes.json();
+
+    // Even on PUT by admin, direct boost/payment fields in listing payload are ignored
+    assert.equal(
+      updatedListing.boost,
+      undefined,
+      'PUT /api/listings/:id must ignore client-supplied boost field'
+    );
+    assert.equal(updatedListing.promoted, undefined);
+    assert.equal(updatedListing.paymentStatus, undefined);
+
+    // Direct base64 image on PUT was sanitized (EXIF stripped) and stored in dedicated storage
+    assert.ok(updatedListing.images[0].startsWith('/api/uploads/images/'));
+    const putImgRes = await fetch(`${baseUrl}${updatedListing.images[0]}`);
+    const putImgBuf = Buffer.from(await putImgRes.arrayBuffer());
+    assert.ok(
+      !putImgBuf.includes(Buffer.from('PUT_EXIF_SECRET_2026')),
+      'EXIF metadata must be stripped on PUT /api/listings/:id direct image upload'
+    );
+
+    // Because explicit choice (showPhone: true, showWhatsApp: true) AND consent (phoneConsentAccepted: true) were provided,
+    // authenticated readers can now view phone & WhatsApp, while unauthenticated visitors still cannot
+    const readerContactAfterConsentRes = await fetch(
+      `${baseUrl}/api/listings/${createdListing.id}/contact`,
+      {
+        headers: { Authorization: `Bearer ${readerToken}` },
+      }
+    );
+    assert.equal(readerContactAfterConsentRes.status, 200);
+    const readerContactAfterConsent = await readerContactAfterConsentRes.json();
+    assert.equal(readerContactAfterConsent.contact.phone, '0661776655');
+    assert.equal(readerContactAfterConsent.contact.whatsapp, '0661776655');
+
+    const visitorViewRes = await fetch(`${baseUrl}/api/listings/${createdListing.id}`);
+    const visitorViewData = await visitorViewRes.json();
+    assert.equal(visitorViewData.listing.contact.phone, '');
+    assert.equal(visitorViewData.listing.contact.whatsapp, undefined);
+
+    // Corrupt fake image disguised as base64 PNG must be rejected with 400 on direct POST /api/listings
+    const fakePngBase64 = Buffer.from('not-a-valid-png-binary-payload').toString('base64');
+    const corruptPostRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${advertiserToken}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Image Corrompue',
+        description: 'Test rejet binaire non-image',
+        category: 'appartement',
+        price: 5000,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: [`data:image/png;base64,${fakePngBase64}`],
+      }),
+    });
+    assert.equal(
+      corruptPostRes.status,
+      400,
+      'POST /api/listings must reject corrupt/non-image binary disguised as data:image/png'
+    );
+
+    // Finally, verify that ONLY the server payment checkout endpoint can activate boost on the listing
+    const validBoostCheckoutRes = await fetch(`${baseUrl}/api/payments/checkout`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${advertiserToken}`,
+      },
+      body: JSON.stringify({
+        type: 'boost',
+        optionId: 'premium',
+        targetId: createdListing.id,
+        idempotencyKey: 'idem-sec27-valid-boost',
+        testScenario: 'success',
+      }),
+    });
+    assert.equal(validBoostCheckoutRes.status, 200);
+    const listingAfterServerBoost = dbInstance.getListingById(createdListing.id);
+    assert.equal(
+      listingAfterServerBoost?.boost?.optionId,
+      'premium',
+      'Server payment confirmation must activate listing boost'
+    );
+  });
 });
+
 

@@ -84,17 +84,17 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
   const [images, setImages] = useState<string[]>([]);
   const [availableFrom, setAvailableFrom] = useState('Immédiate');
 
-  // Contact & Privacy State
+  // Contact & Privacy State (explicit opt-in required: phone and WhatsApp are never visible by default)
   const [advertiserType, setAdvertiserType] = useState<AdvertiserType>('particulier');
   const [contactName, setContactName] = useState(currentUser?.name || '');
   const [contactPhone, setContactPhone] = useState(currentUser?.phone || '');
   const [contactEmail, setContactEmail] = useState(currentUser?.email || '');
   const [contactWhatsApp, setContactWhatsApp] = useState(currentUser?.phone || '');
-  const [showPhone, setShowPhone] = useState(true);
+  const [showPhone, setShowPhone] = useState(false);
   const [showEmail, setShowEmail] = useState(false);
-  const [showWhatsApp, setShowWhatsApp] = useState(true);
+  const [showWhatsApp, setShowWhatsApp] = useState(false);
   const [showExactAddress, setShowExactAddress] = useState(false);
-  const [phoneConsentAccepted, setPhoneConsentAccepted] = useState(true);
+  const [phoneConsentAccepted, setPhoneConsentAccepted] = useState(false);
   const [legalConsentAccepted, setLegalConsentAccepted] = useState(true);
 
   useEffect(() => {
@@ -128,11 +128,12 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
       setContactPhone(editingListing.contact?.phone || currentUser?.phone || '');
       setContactEmail(editingListing.contact?.email || currentUser?.email || '');
       setContactWhatsApp(editingListing.contact?.whatsapp || editingListing.contact?.phone || '');
-      setShowPhone(editingListing.contact?.showPhone ?? true);
-      setShowEmail(editingListing.contact?.showEmail ?? false);
-      setShowWhatsApp(editingListing.contact?.showWhatsApp ?? true);
-      setShowExactAddress(editingListing.contact?.showExactAddress ?? false);
-      setPhoneConsentAccepted(editingListing.contact?.phoneConsentAccepted !== false);
+      const hasConsent = editingListing.contact?.phoneConsentAccepted === true;
+      setShowPhone(Boolean(editingListing.contact?.showPhone === true && hasConsent));
+      setShowEmail(Boolean(editingListing.contact?.showEmail === true));
+      setShowWhatsApp(Boolean(editingListing.contact?.showWhatsApp === true && hasConsent));
+      setShowExactAddress(Boolean(editingListing.contact?.showExactAddress === true));
+      setPhoneConsentAccepted(hasConsent);
       setLegalConsentAccepted(true);
       setUploadStatusMsg(null);
     } else if (currentUser) {
@@ -145,6 +146,11 @@ export const PostListingWizard: React.FC<PostListingWizardProps> = ({
       setContactWhatsApp(currentUser.phone || '');
       setContactEmail(currentUser.email || '');
       setAdvertiserType(currentUser.advertiserType || 'particulier');
+      setShowPhone(false);
+      setShowEmail(false);
+      setShowWhatsApp(false);
+      setShowExactAddress(false);
+      setPhoneConsentAccepted(false);
     }
   }, [editingListing, currentUser, isOpen]);
 
