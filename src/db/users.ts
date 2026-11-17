@@ -695,6 +695,194 @@ export async function syncConversationToCloudSql(
   }
 }
 
+export async function getUserRecordByEmailFromCloudSql(email: string): Promise<{
+  user: User;
+  passwordHash: string;
+} | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const normalized = String(email || '').trim().toLowerCase();
+    if (!normalized) return null;
+    const rows = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, normalized))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      user: JSON.parse(row.dataJson) as User,
+      passwordHash: row.passwordHash,
+    };
+  } catch (error) {
+    console.error('Database query failed in getUserRecordByEmailFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getUserRecordByIdFromCloudSql(uid: string): Promise<{
+  user: User;
+  passwordHash: string;
+} | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const cleanUid = String(uid || '').trim();
+    if (!cleanUid) return null;
+    const rows = await db
+      .select()
+      .from(users)
+      .where(eq(users.uid, cleanUid))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      user: JSON.parse(row.dataJson) as User,
+      passwordHash: row.passwordHash,
+    };
+  } catch (error) {
+    console.error('Database query failed in getUserRecordByIdFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getSessionByTokenHashFromCloudSql(tokenHash: string): Promise<{
+  tokenHash: string;
+  userUid: string;
+  expiresAt: number;
+} | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const cleanHash = String(tokenHash || '').trim();
+    if (!cleanHash) return null;
+    const rows = await db
+      .select()
+      .from(sessions)
+      .where(eq(sessions.tokenHash, cleanHash))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      tokenHash: row.tokenHash,
+      userUid: row.userUid,
+      expiresAt: Number(row.expiresAt),
+    };
+  } catch (error) {
+    console.error('Database query failed in getSessionByTokenHashFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getPasswordResetTokenByHashFromCloudSql(
+  tokenHashes: string[]
+): Promise<{
+  tokenHash: string;
+  userUid: string;
+  email: string;
+  expiresAt: number;
+  used: number;
+} | null> {
+  const validHashes = tokenHashes.map((h) => String(h || '').trim()).filter(Boolean);
+  if (!isCloudSqlConfigured() || validHashes.length === 0) return null;
+  try {
+    const rows = await db
+      .select()
+      .from(passwordResetTokens)
+      .where(inArray(passwordResetTokens.tokenHash, validHashes))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      tokenHash: row.tokenHash,
+      userUid: row.userUid,
+      email: row.email,
+      expiresAt: Number(row.expiresAt),
+      used: Number(row.used),
+    };
+  } catch (error) {
+    console.error('Database query failed in getPasswordResetTokenByHashFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getListingsFromCloudSql(): Promise<Listing[]> {
+  if (!isCloudSqlConfigured()) return [];
+  try {
+    const rows = await db.select().from(listings).orderBy(desc(listings.createdAt));
+    return rows.map((l) => JSON.parse(l.dataJson) as Listing);
+  } catch (error) {
+    console.error('Database query failed in getListingsFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getListingByIdFromCloudSql(id: string): Promise<Listing | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const cleanId = String(id || '').trim();
+    if (!cleanId) return null;
+    const rows = await db
+      .select()
+      .from(listings)
+      .where(eq(listings.id, cleanId))
+      .limit(1);
+    const row = rows[0];
+    return row ? (JSON.parse(row.dataJson) as Listing) : null;
+  } catch (error) {
+    console.error('Database query failed in getListingByIdFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getConversationsFromCloudSql(): Promise<ConversationThread[]> {
+  if (!isCloudSqlConfigured()) return [];
+  try {
+    const rows = await db
+      .select()
+      .from(conversations)
+      .orderBy(desc(conversations.sortTime));
+    return rows.map((c) => JSON.parse(c.dataJson) as ConversationThread);
+  } catch (error) {
+    console.error('Database query failed in getConversationsFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getConversationByIdFromCloudSql(
+  id: string
+): Promise<ConversationThread | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const cleanId = String(id || '').trim();
+    if (!cleanId) return null;
+    const rows = await db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, cleanId))
+      .limit(1);
+    const row = rows[0];
+    return row ? (JSON.parse(row.dataJson) as ConversationThread) : null;
+  } catch (error) {
+    console.error('Database query failed in getConversationByIdFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
 export async function fetchAllCloudSqlState() {
   if (!isCloudSqlConfigured()) return null;
   try {
@@ -753,4 +941,5 @@ export async function fetchAllCloudSqlState() {
     });
   }
 }
+
 

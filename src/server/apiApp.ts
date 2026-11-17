@@ -442,7 +442,7 @@ export function createDarnaApiApp(
 
   // Check memorized Cloud SQL readiness before serving /api requests.
   // Never trigger per-request hydration or blocking queries in middleware.
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req, res, next) => {
     if (
       req.path === '/health' ||
       req.path === '/health/' ||
@@ -473,6 +473,15 @@ export function createDarnaApiApp(
         message:
           'Base de données PostgreSQL (Cloud SQL) temporairement indisponible ou en cours d’initialisation.',
       });
+    }
+
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ') && db.isCloudSqlSyncEnabled()) {
+      try {
+        await db.syncSessionTokenFromCloudSql(authHeader.slice(7).trim());
+      } catch (err) {
+        console.error('[CloudSQL] Session token reconciliation error:', err);
+      }
     }
 
     next();
@@ -943,7 +952,7 @@ export function createDarnaApiApp(
       }
 
       const normalizedEmail = String(email).trim().toLowerCase();
-      const existing = db.getUserByEmail(normalizedEmail);
+      const existing = await db.getUserByEmailAsync(normalizedEmail);
       if (existing) {
         return res.status(409).json({
           success: false,
@@ -1060,7 +1069,7 @@ export function createDarnaApiApp(
         });
       }
 
-      const user = db.verifyUserCredentials(normalizedEmail, String(password));
+      const user = await db.verifyUserCredentialsAsync(normalizedEmail, String(password));
       if (!user) {
         if (!attemptEntry || now >= attemptEntry.resetAt) {
           loginRateLimiter.set(loginKey, { count: 1, resetAt: now + 5 * 60_000 });
@@ -1890,17 +1899,26 @@ export function createDarnaApiApp(
   // LISTINGS & ADVERTISER CONTACT PRIVACY
   // ==========================================================================
 
-  app.get('/api/listings', (req, res) => {
-    const viewer = getAuthUser(req);
-    const allListings = db.getAllListings();
-    const visibleListings: Listing[] = [];
-    for (const l of allListings) {
-      const formatted = authorizeAndFormatListingForViewer(l, viewer);
-      if (formatted) {
-        visibleListings.push(formatted);
+  app.get('/api/listings', async (req, res) => {
+    try {
+      const viewer = getAuthUser(req);
+      const allListings = await db.getAllListingsAsync();
+      const visibleListings: Listing[] = [];
+      for (const l of allListings) {
+        const formatted = authorizeAndFormatListingForViewer(l, viewer);
+        if (formatted) {
+          visibleListings.push(formatted);
+        }
       }
+      res.json({ success: true, listings: visibleListings });
+    } catch (err) {
+      console.error('Error in GET /api/listings:', err);
+      res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message: 'Impossible de récupérer les annonces depuis PostgreSQL.',
+      });
     }
-    res.json({ success: true, listings: visibleListings });
   });
 
   app.get(['/api/uploads/images/:filename', '/uploads/images/:filename'], async (req, res) => {
@@ -1990,7 +2008,7 @@ export function createDarnaApiApp(
 
   app.get('/api/listings/:id', async (req, res) => {
     const viewer = getAuthUser(req);
-    const listing = db.getListingById(req.params.id);
+    const listing = await db.getListingByIdAsync(req.params.id);
     if (!listing) {
       return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
     }
@@ -2504,7 +2522,7 @@ export function createDarnaApiApp(
       });
     }
 
-    const allListings = db.getAllListings();
+    const allListings = await db.getAllListingsAsync();
     const allPlans = db.getAllPlans();
     const quota = getUserListingQuota(viewer, allListings, allPlans);
     if (!quota.canPublish) {
@@ -2585,7 +2603,7 @@ export function createDarnaApiApp(
           message: 'Créez un compte ou connectez-vous pour continuer.',
         });
       }
-      const existing = db.getListingById(req.params.id);
+      const existing = await db.getListingByIdAsync(req.params.id);
       if (!existing) {
         return res.status(404).json({ success: false, message: 'Annonce non trouvée' });
       }
@@ -2660,7 +2678,7 @@ export function createDarnaApiApp(
           message: 'Créez un compte ou connectez-vous pour continuer.',
         });
       }
-      const target = db.getListingById(req.params.id);
+      const target = await db.getListingByIdAsync(req.params.id);
       if (!target) {
         return res.status(404).json({ success: false, message: 'Annonce introuvable' });
       }
@@ -3926,7 +3944,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
   // CONVERSATIONS & INTERNAL MESSAGING ROUTES
   // ==========================================================================
 
-  app.get('/api/conversations', (req, res) => {
+  app.get('/api/conversations', async (req, res) => {
     const viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({
@@ -3935,7 +3953,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: 'Veuillez vous connecter pour accéder à vos conversations.',
       });
     }
-    const conversations = db.getConversationsForUser(viewer);
+    const conversations = await db.getConversationsForUserAsync(viewer);
     return res.json({
       success: true,
       conversations,
@@ -3979,7 +3997,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       });
     }
 
-    let listing = listingId ? db.getListingById(listingId) : null;
+    let listing = listingId ? await db.getListingByIdAsync(listingId) : null;
     if (!conversationId && !listing) {
       return res.status(404).json({
         success: false,
@@ -3987,7 +4005,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
       });
     }
 
-    let existingConv = conversationId ? db.getConversationById(conversationId) : null;
+    let existingConv = conversationId ? await db.getConversationByIdAsync(conversationId) : null;
     if (conversationId) {
       if (!existingConv) {
         return res.status(404).json({
@@ -4007,17 +4025,15 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         });
       }
       if (!listing) {
-        listing = db.getListingById(existingConv.listingId);
+        listing = await db.getListingByIdAsync(existingConv.listingId);
       }
     } else if (listing) {
       existingConv =
-        db
-          .getAllConversations()
-          .find(
-            (c) =>
-              c.listingId === listing!.id &&
-              (c.initiatorId === viewer.id || c.participantIds.includes(viewer.id))
-          ) || null;
+        (await db.getAllConversationsAsync()).find(
+          (c) =>
+            c.listingId === listing!.id &&
+            (c.initiatorId === viewer.id || c.participantIds.includes(viewer.id))
+        ) || null;
     }
 
     if (!existingConv && listing && listing.userId === viewer.id) {
@@ -4125,7 +4141,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: 'Veuillez vérifier votre adresse e-mail pour accéder à la messagerie.',
       });
     }
-    const existingConv = db.getConversationById(req.params.id);
+    const existingConv = await db.getConversationByIdAsync(req.params.id);
     if (!existingConv) {
       return res.status(404).json({
         success: false,

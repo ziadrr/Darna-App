@@ -5327,7 +5327,223 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       'PostListingWizard.tsx must only scroll via scrollToFirstInvalidField when validation fails'
     );
   });
+
+  it('34. Multi-instance PostgreSQL consistency across two concurrently running instances: account creation on Instance 1, immediate login & session recognition on Instance 2, listing creation on Instance 1 visible on Instance 2, and session revocation on Instance 1 immediately enforced on Instance 2', async (t) => {
+    const hasPgEnv = Boolean(
+      process.env.SQL_HOST?.trim() &&
+        process.env.SQL_USER?.trim() &&
+        process.env.SQL_PASSWORD?.trim() &&
+        process.env.SQL_DB_NAME?.trim()
+    );
+    if (!hasPgEnv) {
+      t.skip(
+        'Ignoré : variables PostgreSQL (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) non définies.'
+      );
+      return;
+    }
+
+    const dbPath1 = path.join(os.tmpdir(), `darna-multi-inst1-${Date.now()}.sqlite`);
+    const dbPath2 = path.join(os.tmpdir(), `darna-multi-inst2-${Date.now()}.sqlite`);
+
+    // Start BOTH instances concurrently and run boot hydration BEFORE any test action
+    const inst1 = createDarnaApiApp(dbPath1, { enableCloudSqlSync: true });
+    const inst2 = createDarnaApiApp(dbPath2, { enableCloudSqlSync: true });
+    await Promise.all([inst1.db.hydrateOnce(), inst2.db.hydrateOnce()]);
+
+    const srv1 = http.createServer(inst1.app);
+    const srv2 = http.createServer(inst2.app);
+    await Promise.all([
+      new Promise<void>((resolve) => srv1.listen(0, '127.0.0.1', resolve)),
+      new Promise<void>((resolve) => srv2.listen(0, '127.0.0.1', resolve)),
+    ]);
+
+    const url1 = `http://127.0.0.1:${(srv1.address() as { port: number }).port}`;
+    const url2 = `http://127.0.0.1:${(srv2.address() as { port: number }).port}`;
+
+    try {
+      // 0. Verify /api/health on both instances shows demoMode=false, realPaymentsEnabled=false, cloudSql.ready=true
+      const [h1Res, h2Res] = await Promise.all([
+        fetch(`${url1}/api/health`),
+        fetch(`${url2}/api/health`),
+      ]);
+      assert.equal(h1Res.status, 200);
+      assert.equal(h2Res.status, 200);
+      const h1 = await h1Res.json();
+      const h2 = await h2Res.json();
+      assert.equal(h1.demoMode, false, 'demoMode must be false');
+      assert.equal(h2.demoMode, false, 'demoMode must be false');
+      assert.equal(h1.payments?.realPaymentsEnabled, false, 'realPaymentsEnabled must be false');
+      assert.equal(h1.cloudSql?.ready, true, 'Instance 1 cloudSql.ready must be true');
+      assert.equal(h2.cloudSql?.ready, true, 'Instance 2 cloudSql.ready must be true');
+
+      // 1. Account creation on Instance 1 (POST /api/auth/register on url1)
+      const uniqueTs = Date.now();
+      const multiEmail = `multi.instance.${uniqueTs}@darna.ma`;
+      const multiPassword = 'MultiInstancePass2026!';
+
+      const regRes = await fetch(`${url1}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.134.10',
+        },
+        body: JSON.stringify({
+          firstName: 'Yassine',
+          lastName: 'MultiInst',
+          email: multiEmail,
+          password: multiPassword,
+          phone: '0661340010',
+          advertiserType: 'particulier',
+          termsAccepted: true,
+        }),
+      });
+      assert.equal(regRes.status, 201, 'Registration on Instance 1 must succeed');
+      const regData = await regRes.json();
+      const tokenFromInst1: string = regData.token;
+      const createdUserId: string = regData.user.id;
+      assert.ok(tokenFromInst1);
+
+      // 2. Immediate session recognition & login on Instance 2 (already running, no restart!)
+      const meOnInst2Res = await fetch(`${url2}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${tokenFromInst1}` },
+      });
+      assert.equal(
+        meOnInst2Res.status,
+        200,
+        'Session token created on Instance 1 must be immediately recognized on already-running Instance 2'
+      );
+      const meOnInst2Data = await meOnInst2Res.json();
+      assert.equal(meOnInst2Data.user.id, createdUserId);
+      assert.equal(meOnInst2Data.user.email, multiEmail);
+
+      // Duplicate registration on Instance 2 with the same email must be rejected with 409
+      const dupRegInst2Res = await fetch(`${url2}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.134.11',
+        },
+        body: JSON.stringify({
+          firstName: 'Yassine',
+          lastName: 'Dup',
+          email: multiEmail,
+          password: multiPassword,
+          phone: '0661340011',
+          advertiserType: 'particulier',
+          termsAccepted: true,
+        }),
+      });
+      assert.equal(
+        dupRegInst2Res.status,
+        409,
+        'Instance 2 must detect account created on Instance 1 and reject duplicate registration with 409'
+      );
+
+      // Login on Instance 2 with credentials created on Instance 1
+      const loginInst2Res = await fetch(`${url2}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.134.12',
+        },
+        body: JSON.stringify({
+          email: multiEmail,
+          password: multiPassword,
+        }),
+      });
+      assert.equal(
+        loginInst2Res.status,
+        200,
+        'Login on Instance 2 must succeed immediately for an account created on Instance 1'
+      );
+      const loginInst2Data = await loginInst2Res.json();
+      const tokenFromInst2: string = loginInst2Data.token;
+      assert.ok(tokenFromInst2);
+
+      // Verify tokenFromInst2 also works on Instance 1 (so both instances have tokenFromInst2 cached in local SQLite)
+      const meOnInst1WithToken2Res = await fetch(`${url1}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${tokenFromInst2}` },
+      });
+      assert.equal(meOnInst1WithToken2Res.status, 200);
+
+      // 3. Create a listing on Instance 1 and verify immediate visibility on Instance 2
+      const createListingInst1Res = await fetch(`${url1}/api/listings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokenFromInst1}`,
+        },
+        body: JSON.stringify({
+          title: `Appartement Multi-Instance ${uniqueTs}`,
+          description: 'Annonce créée sur Instance 1 et lue immédiatement sur Instance 2.',
+          category: 'appartement',
+          transactionType: 'location',
+          price: 8200,
+          surface: 96,
+          rooms: 3,
+          city: 'Rabat',
+          district: 'Agdal',
+        }),
+      });
+      assert.equal(createListingInst1Res.status, 201);
+      const { listing: createdListing } = await createListingInst1Res.json();
+      assert.ok(createdListing.id);
+
+      // Read listing by ID on Instance 2 (without restarting Instance 2)
+      const getByIdInst2Res = await fetch(`${url2}/api/listings/${createdListing.id}`);
+      assert.equal(
+        getByIdInst2Res.status,
+        200,
+        'Listing created on Instance 1 must be immediately readable by ID on Instance 2'
+      );
+      const getByIdInst2Data = await getByIdInst2Res.json();
+      assert.equal(getByIdInst2Data.listing.title, `Appartement Multi-Instance ${uniqueTs}`);
+
+      // Read all listings on Instance 2 and confirm the new listing is present
+      const getAllInst2Res = await fetch(`${url2}/api/listings`);
+      assert.equal(getAllInst2Res.status, 200);
+      const getAllInst2Data = await getAllInst2Res.json();
+      assert.ok(
+        (getAllInst2Data.listings || []).some((l: { id: string }) => l.id === createdListing.id),
+        'GET /api/listings on Instance 2 must include the listing just created on Instance 1'
+      );
+
+      // 4. Revoke session (tokenFromInst2) on Instance 1 via POST /api/auth/logout
+      //    and verify Instance 2 immediately rejects tokenFromInst2 with 401!
+      const logoutOnInst1Res = await fetch(`${url1}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tokenFromInst2}` },
+      });
+      assert.equal(logoutOnInst1Res.status, 200);
+
+      const meAfterRevokeInst2Res = await fetch(`${url2}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${tokenFromInst2}` },
+      });
+      assert.equal(
+        meAfterRevokeInst2Res.status,
+        401,
+        'Session revoked on Instance 1 must be immediately rejected (401) on Instance 2'
+      );
+    } finally {
+      await Promise.all([
+        new Promise<void>((resolve) => srv1.close(() => resolve())),
+        new Promise<void>((resolve) => srv2.close(() => resolve())),
+      ]);
+      inst1.db.close();
+      inst2.db.close();
+      for (const p of [dbPath1, dbPath2]) {
+        if (fs.existsSync(p)) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  });
 });
+
 
 
 

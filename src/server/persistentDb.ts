@@ -48,6 +48,14 @@ import {
   getAllUploadedImageMetadataFromCloudSql,
   getUserUploadedImageStatsFromCloudSql,
   syncConversationToCloudSql,
+  getUserRecordByEmailFromCloudSql,
+  getUserRecordByIdFromCloudSql,
+  getSessionByTokenHashFromCloudSql,
+  getPasswordResetTokenByHashFromCloudSql,
+  getListingsFromCloudSql,
+  getListingByIdFromCloudSql,
+  getConversationsFromCloudSql,
+  getConversationByIdFromCloudSql,
 } from '../db/users.ts';
 
 const requireModule = createRequire(import.meta.url);
@@ -1078,8 +1086,52 @@ export class DarnaPersistentDb {
     this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
   }
 
+  private upsertUserToSqliteCache(user: User, passwordHash: string): void {
+    const nowIso = new Date().toISOString();
+    const normalizedEmail = user.email.trim().toLowerCase();
+    const cleanUser: User = { ...user, email: normalizedEmail };
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO users (id, email, password_hash, role, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+      .run(
+        cleanUser.id,
+        normalizedEmail,
+        passwordHash,
+        cleanUser.role,
+        JSON.stringify(cleanUser),
+        cleanUser.createdAt || nowIso,
+        nowIso
+      );
+  }
+
+  public async getUserByEmailAsync(
+    email: string
+  ): Promise<{ user: User; passwordHash: string } | null> {
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgRecord = await getUserRecordByEmailFromCloudSql(email);
+      if (pgRecord) {
+        this.upsertUserToSqliteCache(pgRecord.user, pgRecord.passwordHash);
+        return pgRecord;
+      }
+      return null;
+    }
+    return this.getUserByEmail(email);
+  }
+
   public verifyUserCredentials(email: string, plainPassword: string): User | null {
     const record = this.getUserByEmail(email);
+    if (!record) return null;
+    const isValid = verifyPassword(plainPassword, record.passwordHash);
+    if (!isValid) return null;
+    return record.user;
+  }
+
+  public async verifyUserCredentialsAsync(
+    email: string,
+    plainPassword: string
+  ): Promise<User | null> {
+    const record = await this.getUserByEmailAsync(email);
     if (!record) return null;
     const isValid = verifyPassword(plainPassword, record.passwordHash);
     if (!isValid) return null;
@@ -1127,6 +1179,41 @@ export class DarnaPersistentDb {
     }
 
     return this.getUserById(row.user_id);
+  }
+
+  /**
+   * Authoritatively reconciles a single session token against PostgreSQL (Cloud SQL)
+   * when `enableCloudSqlSync` is active. If the session was created on another instance,
+   * caches it locally (along with the user); if it was revoked on another instance,
+   * evicts it immediately from local SQLite.
+   */
+  public async syncSessionTokenFromCloudSql(rawToken: string): Promise<void> {
+    if (!rawToken || !this.enableCloudSqlSync || !isCloudSqlConfigured()) {
+      return;
+    }
+    const tokenHash = hashToken(rawToken);
+    const pgSession = await getSessionByTokenHashFromCloudSql(tokenHash);
+    if (!pgSession) {
+      this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+      return;
+    }
+    if (Date.now() > pgSession.expiresAt) {
+      this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+      await deleteSessionFromCloudSql(tokenHash).catch(() => {});
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+      )
+      .run(pgSession.tokenHash, pgSession.userUid, pgSession.expiresAt, nowIso);
+
+    const pgUser = await getUserRecordByIdFromCloudSql(pgSession.userUid);
+    if (pgUser) {
+      this.upsertUserToSqliteCache(pgUser.user, pgUser.passwordHash);
+    }
   }
 
   public async deleteSession(rawToken: string): Promise<void> {
@@ -1350,11 +1437,71 @@ export class DarnaPersistentDb {
     return rows.map((r) => JSON.parse(r.data_json) as Listing);
   }
 
+  public async getAllListingsAsync(): Promise<Listing[]> {
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgListings = await getListingsFromCloudSql();
+      const nowIso = new Date().toISOString();
+      const upsertStmt = this.db.prepare(
+        'INSERT OR REPLACE INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      );
+      const pgIds = new Set<string>();
+      for (const l of pgListings) {
+        pgIds.add(l.id);
+        const sortTime = new Date(l.createdAt || nowIso).getTime() || Date.now();
+        upsertStmt.run(
+          l.id,
+          l.userId,
+          l.status,
+          sortTime,
+          JSON.stringify(l),
+          l.createdAt || nowIso,
+          l.updatedAt || nowIso
+        );
+      }
+      const localIds = this.db.prepare('SELECT id FROM listings').all() as Array<{ id: string }>;
+      const delStmt = this.db.prepare('DELETE FROM listings WHERE id = ?');
+      for (const row of localIds) {
+        if (!pgIds.has(row.id)) {
+          delStmt.run(row.id);
+        }
+      }
+      return pgListings;
+    }
+    return this.getAllListings();
+  }
+
   public getListingById(id: string): Listing | null {
     const row = this.db
       .prepare('SELECT data_json FROM listings WHERE id = ?')
       .get(id) as { data_json: string } | undefined;
     return row ? (JSON.parse(row.data_json) as Listing) : null;
+  }
+
+  public async getListingByIdAsync(id: string): Promise<Listing | null> {
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgListing = await getListingByIdFromCloudSql(id);
+      if (pgListing) {
+        const nowIso = new Date().toISOString();
+        const sortTime = new Date(pgListing.createdAt || nowIso).getTime() || Date.now();
+        this.db
+          .prepare(
+            'INSERT OR REPLACE INTO listings (id, user_id, status, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          )
+          .run(
+            pgListing.id,
+            pgListing.userId,
+            pgListing.status,
+            sortTime,
+            JSON.stringify(pgListing),
+            pgListing.createdAt || nowIso,
+            pgListing.updatedAt || nowIso
+          );
+        return pgListing;
+      }
+      this.db.prepare('DELETE FROM listings WHERE id = ?').run(id);
+      return null;
+    }
+    return this.getListingById(id);
   }
 
   public async createListing(listing: Listing): Promise<Listing> {
@@ -1684,8 +1831,45 @@ export class DarnaPersistentDb {
     return rows.map((r) => JSON.parse(r.data_json) as ConversationThread);
   }
 
+  public async getAllConversationsAsync(): Promise<ConversationThread[]> {
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgConvs = await getConversationsFromCloudSql();
+      const nowIso = new Date().toISOString();
+      const upsertStmt = this.db.prepare(
+        'INSERT OR REPLACE INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      for (const conv of pgConvs) {
+        const sortTime = new Date(conv.lastMessageAt || nowIso).getTime() || Date.now();
+        const createdAt = conv.messages?.[0]?.createdAt || conv.lastMessageAt || nowIso;
+        upsertStmt.run(
+          conv.id,
+          conv.listingId,
+          sortTime,
+          JSON.stringify(conv),
+          createdAt,
+          nowIso
+        );
+      }
+      return pgConvs;
+    }
+    return this.getAllConversations();
+  }
+
   public getConversationsForUser(user: User): ConversationThread[] {
     const all = this.getAllConversations();
+    if (user.role === 'admin') {
+      return all;
+    }
+    return all.filter(
+      (c) =>
+        c.participantIds.includes(user.id) ||
+        c.advertiserId === user.id ||
+        c.initiatorId === user.id
+    );
+  }
+
+  public async getConversationsForUserAsync(user: User): Promise<ConversationThread[]> {
+    const all = await this.getAllConversationsAsync();
     if (user.role === 'admin') {
       return all;
     }
@@ -1702,6 +1886,25 @@ export class DarnaPersistentDb {
       .prepare('SELECT data_json FROM conversations WHERE id = ?')
       .get(id) as { data_json: string } | undefined;
     return row ? (JSON.parse(row.data_json) as ConversationThread) : null;
+  }
+
+  public async getConversationByIdAsync(id: string): Promise<ConversationThread | null> {
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgConv = await getConversationByIdFromCloudSql(id);
+      if (pgConv) {
+        const nowIso = new Date().toISOString();
+        const sortTime = new Date(pgConv.lastMessageAt || nowIso).getTime() || Date.now();
+        const createdAt = pgConv.messages?.[0]?.createdAt || pgConv.lastMessageAt || nowIso;
+        this.db
+          .prepare(
+            'INSERT OR REPLACE INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+          )
+          .run(pgConv.id, pgConv.listingId, sortTime, JSON.stringify(pgConv), createdAt, nowIso);
+        return pgConv;
+      }
+      return null;
+    }
+    return this.getConversationById(id);
   }
 
   public sendConversationMessage(params: {
