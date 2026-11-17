@@ -3514,9 +3514,10 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
 
     // -------------------------------------------------------------------------
-    // 3. Per-User Quota: 200 images max and 300 MB cumulative max (413 in French)
+    // 3. Per-User Quota: 60 images max and 100 MB cumulative max by default (413 in French)
+    //    (overridable via IMAGE_UPLOAD_MAX_USER_COUNT and IMAGE_UPLOAD_MAX_USER_BYTES)
     // -------------------------------------------------------------------------
-    // 3A. 200 images maximum per user
+    // 3A. 60 images maximum per user by default
     const countQuotaUserId = 'user-upload-quota-count-28';
     await dbInstance.createUser(
       {
@@ -3537,8 +3538,8 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
     const countQuotaToken = await dbInstance.createSession(countQuotaUserId);
 
-    for (let i = 1; i <= 200; i++) {
-      dbInstance.saveUploadedImage({
+    for (let i = 1; i <= 60; i++) {
+      await dbInstance.saveUploadedImage({
         id: `img-quota-cnt-${i}`,
         userId: countQuotaUserId,
         mimeType: 'image/png',
@@ -3547,7 +3548,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         buffer: validTinyPngBuffer,
       });
     }
-    assert.equal(dbInstance.getUserUploadedImageStats(countQuotaUserId).count, 200);
+    assert.equal(dbInstance.getUserUploadedImageStats(countQuotaUserId).count, 60);
 
     const overCountRes = await fetch(`${baseUrl}/api/uploads/image`, {
       method: 'POST',
@@ -3561,21 +3562,42 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(
       overCountRes.status,
       413,
-      '201st image for a user must be rejected with HTTP 413'
+      '61st image for a user must be rejected with HTTP 413 by default'
     );
     const overCountBody = await overCountRes.json();
     assert.match(
       String(overCountBody.message || ''),
-      /quota|200 images|300 Mo/i,
-      '413 count quota message must be in French'
+      /quota|60 images|100 Mo/i,
+      '413 count quota message must be in French and mention 60 images and 100 Mo'
     );
     assert.equal(
       dbInstance.getUserUploadedImageStats(countQuotaUserId).count,
-      200,
+      60,
       'Over-quota image must not be saved in uploaded_images'
     );
 
-    // 3B. 300 MB cumulative maximum per user
+    // Verify IMAGE_UPLOAD_MAX_USER_COUNT override works
+    process.env.IMAGE_UPLOAD_MAX_USER_COUNT = '61';
+    try {
+      const overrideCountRes = await fetch(`${baseUrl}/api/uploads/image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${countQuotaToken}`,
+          'X-Forwarded-For': '198.51.103.10',
+        },
+        body: JSON.stringify({ dataUri: validTinyPngDataUri }),
+      });
+      assert.equal(
+        overrideCountRes.status,
+        200,
+        'Setting IMAGE_UPLOAD_MAX_USER_COUNT=61 must allow the 61st image'
+      );
+    } finally {
+      delete process.env.IMAGE_UPLOAD_MAX_USER_COUNT;
+    }
+
+    // 3B. 100 MB cumulative maximum per user by default
     const bytesQuotaUserId = 'user-upload-quota-bytes-28';
     await dbInstance.createUser(
       {
@@ -3596,18 +3618,18 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
     const bytesQuotaToken = await dbInstance.createSession(bytesQuotaUserId);
 
-    const max300Mb = 300 * 1024 * 1024;
-    // Seed 1 image with sizeBytes = 300 MB - 10 bytes so the next upload exceeds 300 MB
-    dbInstance.saveUploadedImage({
-      id: 'img-quota-bytes-almost-300mb',
+    const max100Mb = 100 * 1024 * 1024;
+    // Seed 1 image with sizeBytes = 100 MB - 10 bytes so the next upload exceeds 100 MB
+    await dbInstance.saveUploadedImage({
+      id: 'img-quota-bytes-almost-100mb',
       userId: bytesQuotaUserId,
       mimeType: 'image/png',
       width: 16,
       height: 16,
       buffer: validTinyPngBuffer,
-      sizeBytes: max300Mb - 10,
+      sizeBytes: max100Mb - 10,
     });
-    assert.equal(dbInstance.getUserUploadedImageStats(bytesQuotaUserId).totalBytes, max300Mb - 10);
+    assert.equal(dbInstance.getUserUploadedImageStats(bytesQuotaUserId).totalBytes, max100Mb - 10);
 
     const overBytesRes = await fetch(`${baseUrl}/api/uploads/image`, {
       method: 'POST',
@@ -3621,13 +3643,13 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(
       overBytesRes.status,
       413,
-      'Upload exceeding 300 MB cumulative per-user quota must return HTTP 413'
+      'Upload exceeding 100 MB cumulative per-user quota must return HTTP 413'
     );
     const overBytesBody = await overBytesRes.json();
     assert.match(
       String(overBytesBody.message || ''),
-      /quota|300 Mo/i,
-      '413 byte quota message must be in French'
+      /quota|100 Mo/i,
+      '413 byte quota message must be in French and mention 100 Mo'
     );
     assert.equal(
       dbInstance.getUserUploadedImageStats(bytesQuotaUserId).count,
@@ -3671,7 +3693,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     const twelveHoursAgoIso = new Date(nowMs - 12 * 3600 * 1000).toISOString();
     const ninetySixHoursAgoIso = new Date(nowMs - 96 * 3600 * 1000).toISOString();
 
-    const orphanOld = dbInstance.saveUploadedImage({
+    const orphanOld = await dbInstance.saveUploadedImage({
       id: 'img-secret-orphan-old-72h',
       userId: cleanupOwnerId,
       mimeType: 'image/png',
@@ -3680,7 +3702,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       buffer: validTinyPngBuffer,
       createdAt: seventyTwoHoursAgoIso,
     });
-    const orphanRecent = dbInstance.saveUploadedImage({
+    const orphanRecent = await dbInstance.saveUploadedImage({
       id: 'img-secret-orphan-recent-12h',
       userId: cleanupOwnerId,
       mimeType: 'image/png',
@@ -3689,7 +3711,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       buffer: validTinyPngBuffer,
       createdAt: twelveHoursAgoIso,
     });
-    const referencedOld = dbInstance.saveUploadedImage({
+    const referencedOld = await dbInstance.saveUploadedImage({
       id: 'img-secret-referenced-old-96h',
       userId: cleanupOwnerId,
       mimeType: 'image/png',
@@ -3698,7 +3720,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       buffer: validTinyPngBuffer,
       createdAt: ninetySixHoursAgoIso,
     });
-    const exclusiveImgA = dbInstance.saveUploadedImage({
+    const exclusiveImgA = await dbInstance.saveUploadedImage({
       id: 'img-secret-exclusive-listing-a',
       userId: cleanupOwnerId,
       mimeType: 'image/png',
@@ -3707,7 +3729,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       buffer: validTinyPngBuffer,
       createdAt: ninetySixHoursAgoIso,
     });
-    const sharedImgAB = dbInstance.saveUploadedImage({
+    const sharedImgAB = await dbInstance.saveUploadedImage({
       id: 'img-secret-shared-listing-ab',
       userId: cleanupOwnerId,
       mimeType: 'image/png',
@@ -3839,7 +3861,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     // Also verify startup execution of cleanupOrphanedUploadedImages when initializing a DB instance
     const startupDbPath = path.join(os.tmpdir(), `darna-startup-cleanup-${Date.now()}.sqlite`);
     const prepDb = new DarnaPersistentDb(startupDbPath);
-    prepDb.saveUploadedImage({
+    await prepDb.saveUploadedImage({
       id: 'img-startup-orphan-old',
       userId: 'user-startup',
       mimeType: 'image/png',
@@ -3863,7 +3885,19 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     }
   });
 
-  it('29. Persists uploaded_images and conversations in PostgreSQL (Cloud SQL): recovers uploaded image on-demand after local SQLite cache deletion, counts PostgreSQL quota, deletes from PostgreSQL on cleanup/listing delete, and restores conversations after a simulated restart', async () => {
+  it('29. Persists uploaded_images and conversations in PostgreSQL (Cloud SQL): recovers uploaded image on-demand after local SQLite cache deletion, counts PostgreSQL quota, deletes from PostgreSQL on cleanup/listing delete, and restores conversations after a simulated restart', async (t) => {
+    if (
+      !process.env.SQL_HOST?.trim() ||
+      !process.env.SQL_USER?.trim() ||
+      !process.env.SQL_PASSWORD?.trim() ||
+      !process.env.SQL_DB_NAME?.trim()
+    ) {
+      t.skip(
+        'Ignoré : variables PostgreSQL (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) non définies.'
+      );
+      return;
+    }
+
     const sharp = (await import('sharp')).default;
     const {
       getUploadedImageFromCloudSql,
@@ -4103,7 +4137,9 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       const { conversation: readConv } = await markReadRes.json();
       assert.equal(readConv.unreadCountByUser[buyerId], 0);
       assert.equal(
-        readConv.messages.filter((m: { senderId: string }) => m.senderId !== buyerId).every((m: { read: boolean }) => m.read === true),
+        readConv.messages
+          .filter((m: { senderId: string }) => m.senderId !== buyerId)
+          .every((m: { read: boolean }) => m.read === true),
         true
       );
 
@@ -4197,7 +4233,193 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       }
     }
   });
+
+  it('30. Verifies Cloud SQL schema tables at startup when configured, logs missing tables + `npm run db:push` without credentials, and exposes cloudSql.missingTables in /api/health', async () => {
+    const { REQUIRED_CLOUD_SQL_TABLES } = await import('../src/db/users.ts');
+    assert.deepEqual(
+      [...REQUIRED_CLOUD_SQL_TABLES],
+      [
+        'users',
+        'sessions',
+        'password_reset_tokens',
+        'listings',
+        'reports',
+        'subscription_plans',
+        'boost_options',
+        'transactions',
+        'uploaded_images',
+        'conversations',
+      ],
+      'REQUIRED_CLOUD_SQL_TABLES must list all 10 Drizzle schema tables'
+    );
+
+    const savedEnv = {
+      SQL_HOST: process.env.SQL_HOST,
+      SQL_USER: process.env.SQL_USER,
+      SQL_PASSWORD: process.env.SQL_PASSWORD,
+      SQL_DB_NAME: process.env.SQL_DB_NAME,
+    };
+
+    const fakeHost = 'secret-db-host-30.internal';
+    const fakeUser = 'secret_db_user_30';
+    const fakePassword = 'SuperSecretPgPassword30!';
+    const fakeDbName = 'secret_darna_db_30';
+
+    process.env.SQL_HOST = fakeHost;
+    process.env.SQL_USER = fakeUser;
+    process.env.SQL_PASSWORD = fakePassword;
+    process.env.SQL_DB_NAME = fakeDbName;
+
+    const dbPathMissing = path.join(os.tmpdir(), `darna-schema-missing-${Date.now()}.sqlite`);
+    const dbPathComplete = path.join(os.tmpdir(), `darna-schema-complete-${Date.now()}.sqlite`);
+
+    const capturedErrors: string[] = [];
+    const origConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      capturedErrors.push(args.map((a) => String(a)).join(' '));
+      origConsoleError(...args);
+    };
+
+    let serverMissing: http.Server | null = null;
+    let instMissing: ReturnType<typeof createDarnaApiApp> | null = null;
+    let serverComplete: http.Server | null = null;
+    let instComplete: ReturnType<typeof createDarnaApiApp> | null = null;
+
+    try {
+      // Case A: Missing `uploaded_images` and `conversations` tables at startup
+      instMissing = createDarnaApiApp(dbPathMissing, {
+        enableCloudSqlSync: false,
+        simulatedCloudSqlTables: [
+          'users',
+          'sessions',
+          'password_reset_tokens',
+          'listings',
+          'reports',
+          'subscription_plans',
+          'boost_options',
+          'transactions',
+        ],
+      });
+      await instMissing.db.ensureCloudSqlSchemaChecked();
+
+      serverMissing = http.createServer(instMissing.app);
+      await new Promise<void>((resolve) => serverMissing!.listen(0, '127.0.0.1', resolve));
+      const addrMissing = serverMissing.address() as { port: number };
+      const urlMissing = `http://127.0.0.1:${addrMissing.port}`;
+
+      // Verify explicit error logged with missing tables and `npm run db:push`, without credentials
+      const schemaErrorLogs = capturedErrors.filter((line) => line.includes('[CloudSQL]'));
+      assert.ok(
+        schemaErrorLogs.length >= 1,
+        'Startup check must log an explicit error when Drizzle tables are missing'
+      );
+      const combinedErrorLog = schemaErrorLogs.join('\n');
+      assert.match(
+        combinedErrorLog,
+        /uploaded_images/,
+        'Error log must include missing table uploaded_images'
+      );
+      assert.match(
+        combinedErrorLog,
+        /conversations/,
+        'Error log must include missing table conversations'
+      );
+      assert.match(
+        combinedErrorLog,
+        /npm run db:push/,
+        'Error log must include the command `npm run db:push`'
+      );
+      for (const secret of [fakeHost, fakeUser, fakePassword, fakeDbName]) {
+        assert.equal(
+          combinedErrorLog.includes(secret),
+          false,
+          'Startup error log must NEVER expose any database credential'
+        );
+      }
+
+      // Verify /api/health exposes cloudSql.missingTables without leaking credentials
+      const healthMissingRes = await fetch(`${urlMissing}/api/health`);
+      assert.equal(healthMissingRes.status, 200);
+      const healthMissingRaw = await healthMissingRes.text();
+      for (const secret of [fakeHost, fakeUser, fakePassword, fakeDbName]) {
+        assert.equal(
+          healthMissingRaw.includes(secret),
+          false,
+          '/api/health response must NEVER expose any database credential'
+        );
+      }
+      const healthMissingJson = JSON.parse(healthMissingRaw);
+      assert.ok(healthMissingJson.cloudSql, '/api/health must include cloudSql object');
+      assert.deepEqual(
+        healthMissingJson.cloudSql.missingTables,
+        ['uploaded_images', 'conversations'],
+        '/api/health cloudSql.missingTables must list missing tables'
+      );
+
+      // Case B: All 10 Drizzle tables exist -> no missing tables error and cloudSql.missingTables is []
+      capturedErrors.length = 0;
+      instComplete = createDarnaApiApp(dbPathComplete, {
+        enableCloudSqlSync: false,
+        simulatedCloudSqlTables: [...REQUIRED_CLOUD_SQL_TABLES],
+      });
+      await instComplete.db.ensureCloudSqlSchemaChecked();
+
+      serverComplete = http.createServer(instComplete.app);
+      await new Promise<void>((resolve) => serverComplete!.listen(0, '127.0.0.1', resolve));
+      const addrComplete = serverComplete.address() as { port: number };
+      const urlComplete = `http://127.0.0.1:${addrComplete.port}`;
+
+      const completeErrorLogs = capturedErrors.filter((line) =>
+        line.includes('Tables manquantes')
+      );
+      assert.equal(
+        completeErrorLogs.length,
+        0,
+        'No missing-table error should be logged when all 10 tables exist'
+      );
+
+      const healthCompleteRes = await fetch(`${urlComplete}/api/health`);
+      assert.equal(healthCompleteRes.status, 200);
+      const healthCompleteJson = await healthCompleteRes.json();
+      assert.deepEqual(
+        healthCompleteJson.cloudSql.missingTables,
+        [],
+        '/api/health cloudSql.missingTables must be empty when all 10 tables exist'
+      );
+    } finally {
+      console.error = origConsoleError;
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = v;
+        }
+      }
+      if (serverMissing) {
+        await new Promise<void>((resolve) => serverMissing!.close(() => resolve()));
+      }
+      if (instMissing) {
+        instMissing.db.close();
+      }
+      if (serverComplete) {
+        await new Promise<void>((resolve) => serverComplete!.close(() => resolve()));
+      }
+      if (instComplete) {
+        instComplete.db.close();
+      }
+      for (const p of [dbPathMissing, dbPathComplete]) {
+        if (fs.existsSync(p)) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  });
 });
+
 
 
 

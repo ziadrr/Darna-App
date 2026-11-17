@@ -28,6 +28,7 @@ import {
 } from '../utils/security.ts';
 import {
   isCloudSqlConfigured,
+  verifyCloudSqlSchemaTables,
   fetchAllCloudSqlState,
   syncUserToCloudSql,
   syncSessionToCloudSql,
@@ -61,10 +62,18 @@ export class DarnaPersistentDb {
   private lastCloudSqlSyncAt = 0;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
   private imageCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  private missingCloudSqlTables: string[] = [];
+  private cloudSqlSchemaChecked = false;
+  private cloudSqlSchemaCheckPromise: Promise<string[]> | null = null;
+  private simulatedCloudSqlTables?: string[];
 
   constructor(
     customDbPath?: string,
-    options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
+    options?: {
+      enableCloudSqlSync?: boolean;
+      allowLocalFallbackInProd?: boolean;
+      simulatedCloudSqlTables?: string[];
+    }
   ) {
     const isProd = process.env.NODE_ENV === 'production';
     if (isProd && !customDbPath && !options?.allowLocalFallbackInProd && !isCloudSqlConfigured()) {
@@ -74,6 +83,7 @@ export class DarnaPersistentDb {
     }
 
     this.isCustomTestDb = Boolean(customDbPath);
+    this.simulatedCloudSqlTables = options?.simulatedCloudSqlTables;
     this.enableCloudSqlSync =
       options?.enableCloudSqlSync !== undefined
         ? Boolean(options.enableCloudSqlSync && isCloudSqlConfigured())
@@ -96,6 +106,10 @@ export class DarnaPersistentDb {
     this.seedInitialDataIfEmpty();
     this.cleanupOrphanedUploadedImages();
 
+    if (isCloudSqlConfigured() || Array.isArray(this.simulatedCloudSqlTables)) {
+      void this.checkCloudSqlSchemaTables(this.simulatedCloudSqlTables);
+    }
+
     const cleanupIntervalMs = Number(
       process.env.UPLOADED_IMAGES_CLEANUP_INTERVAL_MS || 24 * 60 * 60 * 1000
     );
@@ -109,6 +123,54 @@ export class DarnaPersistentDb {
     if (typeof this.imageCleanupInterval.unref === 'function') {
       this.imageCleanupInterval.unref();
     }
+  }
+
+  public async checkCloudSqlSchemaTables(
+    existingTableNamesOverride?: string[]
+  ): Promise<string[]> {
+    const overrideToUse =
+      existingTableNamesOverride !== undefined
+        ? existingTableNamesOverride
+        : this.simulatedCloudSqlTables;
+
+    if (!overrideToUse && !isCloudSqlConfigured()) {
+      this.missingCloudSqlTables = [];
+      this.cloudSqlSchemaChecked = false;
+      return [];
+    }
+
+    const runPromise = (async () => {
+      const res = await verifyCloudSqlSchemaTables(overrideToUse);
+      this.missingCloudSqlTables = res.missingTables;
+      this.cloudSqlSchemaChecked = true;
+      return [...this.missingCloudSqlTables];
+    })();
+
+    this.cloudSqlSchemaCheckPromise = runPromise;
+    try {
+      return await runPromise;
+    } finally {
+      if (this.cloudSqlSchemaCheckPromise === runPromise) {
+        this.cloudSqlSchemaCheckPromise = null;
+      }
+    }
+  }
+
+  public async ensureCloudSqlSchemaChecked(): Promise<string[]> {
+    if (this.cloudSqlSchemaCheckPromise) {
+      return this.cloudSqlSchemaCheckPromise;
+    }
+    if (
+      !this.cloudSqlSchemaChecked &&
+      (isCloudSqlConfigured() || Array.isArray(this.simulatedCloudSqlTables))
+    ) {
+      return this.checkCloudSqlSchemaTables(this.simulatedCloudSqlTables);
+    }
+    return [...this.missingCloudSqlTables];
+  }
+
+  public getMissingCloudSqlTables(): string[] {
+    return [...this.missingCloudSqlTables];
   }
 
   /**

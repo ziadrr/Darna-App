@@ -273,7 +273,11 @@ export function validateListingImages(images: unknown): {
 
 export function createDarnaApiApp(
   customDbPath?: string,
-  options?: { enableCloudSqlSync?: boolean; allowLocalFallbackInProd?: boolean }
+  options?: {
+    enableCloudSqlSync?: boolean;
+    allowLocalFallbackInProd?: boolean;
+    simulatedCloudSqlTables?: string[];
+  }
 ): {
   app: express.Express;
   db: DarnaPersistentDb;
@@ -444,35 +448,52 @@ export function createDarnaApiApp(
     next();
   });
 
-  app.get(['/api/system/status', '/api/system/status/', '/api/health', '/api/health/'], (_req, res) => {
-    const cloudSqlConfigured = isCloudSqlConfigured();
-    const emailConfigured = isEmailServiceConfigured();
-    return res.json({
-      success: true,
-      version: '2026-11-11-v2',
-      nodeEnv: process.env.NODE_ENV || 'development',
-      persistence: {
-        postgresqlConfigured: cloudSqlConfigured,
-        postgresqlSyncEnabled: db.isCloudSqlSyncEnabled(),
-        productionLocalFallbackAllowed: false,
-        storageEngine: db.isCloudSqlSyncEnabled() ? 'postgresql_cloudsql' : 'sqlite_local',
-      },
-      email: {
-        configured: emailConfigured,
-        smtpHostConfigured: Boolean(process.env.SMTP_HOST?.trim()),
-        resendConfigured: Boolean(process.env.RESEND_API_KEY?.trim()),
-      },
-      auth: {
-        googleEnabled: false,
-        appleEnabled: false,
-        activeSessionsCount: db.getActiveSessionCount(),
-      },
-      payments: {
-        mode: 'simulation',
-        realPaymentsEnabled: false,
-      },
-    });
-  });
+  app.get(
+    ['/api/system/status', '/api/system/status/', '/api/health', '/api/health/'],
+    async (_req, res) => {
+      const cloudSqlConfigured = isCloudSqlConfigured();
+      if (cloudSqlConfigured) {
+        try {
+          await Promise.race([
+            db.ensureCloudSqlSchemaChecked(),
+            new Promise((resolve) => setTimeout(resolve, 2500)),
+          ]);
+        } catch {
+          // Non-fatal in health endpoint
+        }
+      }
+      const emailConfigured = isEmailServiceConfigured();
+      return res.json({
+        success: true,
+        version: '2026-11-11-v2',
+        nodeEnv: process.env.NODE_ENV || 'development',
+        cloudSql: {
+          configured: cloudSqlConfigured,
+          missingTables: db.getMissingCloudSqlTables(),
+        },
+        persistence: {
+          postgresqlConfigured: cloudSqlConfigured,
+          postgresqlSyncEnabled: db.isCloudSqlSyncEnabled(),
+          productionLocalFallbackAllowed: false,
+          storageEngine: db.isCloudSqlSyncEnabled() ? 'postgresql_cloudsql' : 'sqlite_local',
+        },
+        email: {
+          configured: emailConfigured,
+          smtpHostConfigured: Boolean(process.env.SMTP_HOST?.trim()),
+          resendConfigured: Boolean(process.env.RESEND_API_KEY?.trim()),
+        },
+        auth: {
+          googleEnabled: false,
+          appleEnabled: false,
+          activeSessionsCount: db.getActiveSessionCount(),
+        },
+        payments: {
+          mode: 'simulation',
+          realPaymentsEnabled: false,
+        },
+      });
+    }
+  );
 
   const apiKey = process.env.GEMINI_API_KEY || '';
   const ai = new GoogleGenAI({
@@ -2104,9 +2125,9 @@ export function createDarnaApiApp(
       };
     }
 
-    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 60);
     const maxUserImageBytes = Number(
-      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 100 * 1024 * 1024
     );
     const currentQuota = await db.getUserUploadedImageStatsAsync(userId);
     if (
@@ -2118,7 +2139,7 @@ export function createDarnaApiApp(
         valid: false,
         code: 'IMAGE_QUOTA_EXCEEDED',
         message:
-          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+          'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
       };
     }
 
@@ -2299,7 +2320,7 @@ export function createDarnaApiApp(
    * Secure Personal Property Photo Upload Endpoint (POST /api/uploads/image)
    * - Requires authenticated user with emailVerified === true (403 in French otherwise)
    * - Enforces 30 uploads/hour per user AND per IP (429 in French otherwise)
-   * - Enforces per-user quota of 200 images and 300 MB cumulative max (413 in French otherwise)
+   * - Enforces per-user quota of 60 images and 100 MB cumulative max (413 in French otherwise)
    * - Accepts only image/jpeg, image/png, image/webp, image/gif up to 5 MB decoded
    * - Verifies real image structure, strips EXIF/GPS metadata via sharp, and stores in uploaded_images
    */
@@ -2343,9 +2364,9 @@ export function createDarnaApiApp(
         });
       }
 
-      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 60);
       const maxUserImageBytes = Number(
-        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 100 * 1024 * 1024
       );
       const currentQuota = await db.getUserUploadedImageStatsAsync(viewer.id);
       if (
@@ -2356,7 +2377,7 @@ export function createDarnaApiApp(
           success: false,
           code: 'IMAGE_QUOTA_EXCEEDED',
           message:
-            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+            'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
         });
       }
 
@@ -2389,7 +2410,7 @@ export function createDarnaApiApp(
           success: false,
           code: 'IMAGE_QUOTA_EXCEEDED',
           message:
-            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+            'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
         });
       }
 
@@ -2405,7 +2426,7 @@ export function createDarnaApiApp(
             code: 'IMAGE_QUOTA_EXCEEDED',
             message:
               sanitized.message ||
-              'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+              'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
           });
         }
         return res.status(400).json({

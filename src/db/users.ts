@@ -32,6 +32,75 @@ export function isCloudSqlConfigured(): boolean {
   );
 }
 
+export const REQUIRED_CLOUD_SQL_TABLES = [
+  'users',
+  'sessions',
+  'password_reset_tokens',
+  'listings',
+  'reports',
+  'subscription_plans',
+  'boost_options',
+  'transactions',
+  'uploaded_images',
+  'conversations',
+] as const;
+
+/**
+ * Verifies at startup that all 10 tables defined in the Drizzle schema exist in Cloud SQL PostgreSQL.
+ * If any table is missing, logs an explicit error with the list of missing tables and the command
+ * `npm run db:push`, without ever logging any database credentials.
+ */
+export async function verifyCloudSqlSchemaTables(
+  existingTableNamesOverride?: string[]
+): Promise<{
+  missingTables: string[];
+  checked: boolean;
+}> {
+  if (!existingTableNamesOverride && !isCloudSqlConfigured()) {
+    return { missingTables: [], checked: false };
+  }
+
+  try {
+    let existingNames: string[];
+    if (Array.isArray(existingTableNamesOverride)) {
+      existingNames = existingTableNamesOverride;
+    } else {
+      const queryResult = await db.execute(
+        sql`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`
+      );
+      const rows: Array<Record<string, unknown>> = Array.isArray(queryResult)
+        ? (queryResult as Array<Record<string, unknown>>)
+        : Array.isArray((queryResult as { rows?: unknown[] })?.rows)
+          ? ((queryResult as { rows: Array<Record<string, unknown>> }).rows)
+          : [];
+      existingNames = rows.map((r) => String(r.table_name || '').trim().toLowerCase());
+    }
+
+    const existingSet = new Set(existingNames.map((n) => n.trim().toLowerCase()));
+    const missingTables = REQUIRED_CLOUD_SQL_TABLES.filter((t) => !existingSet.has(t));
+
+    if (missingTables.length > 0) {
+      console.error(
+        `[CloudSQL] Tables manquantes dans le schéma PostgreSQL : ${missingTables.join(', ')}. Exécutez la commande \`npm run db:push\` pour créer ces tables dans Cloud SQL.`
+      );
+    }
+
+    return {
+      missingTables: [...missingTables],
+      checked: true,
+    };
+  } catch {
+    const missingTables = [...REQUIRED_CLOUD_SQL_TABLES];
+    console.error(
+      `[CloudSQL] Impossible de vérifier le schéma PostgreSQL (tables attendues : ${missingTables.join(', ')}). Vérifiez la connexion et exécutez \`npm run db:push\`.`
+    );
+    return {
+      missingTables,
+      checked: false,
+    };
+  }
+}
+
 /**
  * Safely registers or updates a user in Cloud SQL PostgreSQL using Drizzle's upsert
  * (onConflictDoUpdate) to avoid unique constraint race conditions.
