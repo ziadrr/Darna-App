@@ -1,4 +1,4 @@
-import { eq, asc, desc } from 'drizzle-orm';
+import { eq, asc, desc, inArray, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   users,
@@ -9,6 +9,8 @@ import {
   subscriptionPlans,
   boostOptions,
   transactions,
+  uploadedImages,
+  conversations,
 } from './schema.ts';
 import type {
   User,
@@ -17,6 +19,7 @@ import type {
   SubscriptionPlan,
   BoostOption,
   PaymentTransaction,
+  ConversationThread,
 } from '../types/index.ts';
 import { hashPassword } from '../utils/security.ts';
 
@@ -406,6 +409,223 @@ export async function syncTransactionToCloudSql(
   }
 }
 
+export async function syncUploadedImageToCloudSql(img: {
+  id: string;
+  userId: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  buffer: Buffer;
+  createdAt: string;
+}): Promise<void> {
+  if (!isCloudSqlConfigured()) return;
+  try {
+    const createdAtDate = new Date(img.createdAt);
+    const validCreatedAt = Number.isNaN(createdAtDate.getTime())
+      ? new Date()
+      : createdAtDate;
+
+    await db
+      .insert(uploadedImages)
+      .values({
+        id: img.id,
+        userId: img.userId,
+        mimeType: img.mimeType,
+        width: img.width,
+        height: img.height,
+        sizeBytes: img.sizeBytes,
+        binaryData: img.buffer,
+        createdAt: validCreatedAt,
+      })
+      .onConflictDoUpdate({
+        target: uploadedImages.id,
+        set: {
+          userId: img.userId,
+          mimeType: img.mimeType,
+          width: img.width,
+          height: img.height,
+          sizeBytes: img.sizeBytes,
+          binaryData: img.buffer,
+          createdAt: validCreatedAt,
+        },
+      });
+  } catch (error) {
+    console.error('Database query failed in syncUploadedImageToCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getUploadedImageFromCloudSql(id: string): Promise<{
+  id: string;
+  userId: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  sizeBytes: number;
+  buffer: Buffer;
+  createdAt: string;
+} | null> {
+  if (!isCloudSqlConfigured()) return null;
+  try {
+    const rows = await db
+      .select()
+      .from(uploadedImages)
+      .where(eq(uploadedImages.id, id))
+      .limit(1);
+    const row = rows[0];
+    if (!row || !row.binaryData) return null;
+
+    return {
+      id: row.id,
+      userId: row.userId,
+      mimeType: row.mimeType,
+      width: Number(row.width),
+      height: Number(row.height),
+      sizeBytes: Number(row.sizeBytes),
+      buffer: Buffer.from(row.binaryData),
+      createdAt:
+        row.createdAt instanceof Date
+          ? row.createdAt.toISOString()
+          : String(row.createdAt || new Date().toISOString()),
+    };
+  } catch (error) {
+    console.error('Database query failed in getUploadedImageFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function deleteUploadedImagesFromCloudSql(ids: string[]): Promise<void> {
+  if (!isCloudSqlConfigured() || ids.length === 0) return;
+  try {
+    await db.delete(uploadedImages).where(inArray(uploadedImages.id, ids));
+  } catch (error) {
+    console.error('Database query failed in deleteUploadedImagesFromCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getAllUploadedImageMetadataFromCloudSql(): Promise<
+  Array<{
+    id: string;
+    userId: string;
+    sizeBytes: number;
+    createdAt: string;
+  }>
+> {
+  if (!isCloudSqlConfigured()) return [];
+  try {
+    const rows = await db
+      .select({
+        id: uploadedImages.id,
+        userId: uploadedImages.userId,
+        sizeBytes: uploadedImages.sizeBytes,
+        createdAt: uploadedImages.createdAt,
+      })
+      .from(uploadedImages);
+    return rows.map((r) => ({
+      id: r.id,
+      userId: r.userId,
+      sizeBytes: Number(r.sizeBytes),
+      createdAt:
+        r.createdAt instanceof Date
+          ? r.createdAt.toISOString()
+          : String(r.createdAt || new Date().toISOString()),
+    }));
+  } catch (error) {
+    console.error(
+      'Database query failed in getAllUploadedImageMetadataFromCloudSql:',
+      error
+    );
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function getUserUploadedImageStatsFromCloudSql(userId: string): Promise<{
+  count: number;
+  totalBytes: number;
+}> {
+  if (!isCloudSqlConfigured()) {
+    return { count: 0, totalBytes: 0 };
+  }
+  try {
+    const rows = await db
+      .select({
+        count: sql<number>`count(*)`,
+        totalBytes: sql<number>`coalesce(sum(${uploadedImages.sizeBytes}), 0)`,
+      })
+      .from(uploadedImages)
+      .where(eq(uploadedImages.userId, userId));
+
+    const row = rows[0];
+    return {
+      count: Number(row?.count || 0),
+      totalBytes: Number(row?.totalBytes || 0),
+    };
+  } catch (error) {
+    console.error(
+      'Database query failed in getUserUploadedImageStatsFromCloudSql:',
+      error
+    );
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
+export async function syncConversationToCloudSql(
+  conv: ConversationThread,
+  sortTime?: number
+): Promise<void> {
+  if (!isCloudSqlConfigured()) return;
+  try {
+    const computedSortTime =
+      typeof sortTime === 'number' && Number.isFinite(sortTime)
+        ? Math.floor(sortTime)
+        : new Date(conv.lastMessageAt || new Date().toISOString()).getTime() || Date.now();
+    const createdAtDate = new Date(
+      conv.messages?.[0]?.createdAt || conv.lastMessageAt || new Date().toISOString()
+    );
+    const validCreatedAt = Number.isNaN(createdAtDate.getTime())
+      ? new Date()
+      : createdAtDate;
+    const nowDate = new Date();
+
+    await db
+      .insert(conversations)
+      .values({
+        id: conv.id,
+        listingId: conv.listingId,
+        sortTime: computedSortTime,
+        dataJson: JSON.stringify(conv),
+        createdAt: validCreatedAt,
+        updatedAt: nowDate,
+      })
+      .onConflictDoUpdate({
+        target: conversations.id,
+        set: {
+          listingId: conv.listingId,
+          sortTime: computedSortTime,
+          dataJson: JSON.stringify(conv),
+          updatedAt: nowDate,
+        },
+      });
+  } catch (error) {
+    console.error('Database query failed in syncConversationToCloudSql:', error);
+    throw new Error('Database query failed. Please try again later.', {
+      cause: error,
+    });
+  }
+}
+
 export async function fetchAllCloudSqlState() {
   if (!isCloudSqlConfigured()) return null;
   try {
@@ -418,6 +638,7 @@ export async function fetchAllCloudSqlState() {
       planRows,
       boostRows,
       txRows,
+      conversationRows,
     ] = await Promise.all([
       db.select().from(users),
       db.select().from(sessions),
@@ -427,6 +648,7 @@ export async function fetchAllCloudSqlState() {
       db.select().from(subscriptionPlans).orderBy(asc(subscriptionPlans.sortOrder)),
       db.select().from(boostOptions).orderBy(asc(boostOptions.sortOrder)),
       db.select().from(transactions).orderBy(desc(transactions.createdAt)),
+      db.select().from(conversations).orderBy(desc(conversations.sortTime)),
     ]);
 
     return {
@@ -451,6 +673,9 @@ export async function fetchAllCloudSqlState() {
       plans: planRows.map((p) => JSON.parse(p.dataJson) as SubscriptionPlan),
       boostOptions: boostRows.map((b) => JSON.parse(b.dataJson) as BoostOption),
       transactions: txRows.map((t) => JSON.parse(t.dataJson) as PaymentTransaction),
+      conversations: conversationRows.map(
+        (c) => JSON.parse(c.dataJson) as ConversationThread
+      ),
     };
   } catch (error) {
     console.error('Database query failed in fetchAllCloudSqlState:', error);
@@ -459,3 +684,4 @@ export async function fetchAllCloudSqlState() {
     });
   }
 }
+

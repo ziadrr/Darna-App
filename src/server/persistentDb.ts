@@ -41,6 +41,12 @@ import {
   syncPlanToCloudSql,
   syncBoostOptionToCloudSql,
   syncTransactionToCloudSql,
+  syncUploadedImageToCloudSql,
+  getUploadedImageFromCloudSql,
+  deleteUploadedImagesFromCloudSql,
+  getAllUploadedImageMetadataFromCloudSql,
+  getUserUploadedImageStatsFromCloudSql,
+  syncConversationToCloudSql,
 } from '../db/users.ts';
 
 const requireModule = createRequire(import.meta.url);
@@ -307,6 +313,40 @@ export class DarnaPersistentDb {
               tx.createdAt || nowIso,
               nowIso
             );
+        }
+
+        if (state.conversations) {
+          if (state.conversations.length === 0 && !this.cloudSqlHydrated) {
+            const allConversations = this.getAllConversations();
+            await Promise.all(
+              allConversations.map((c) =>
+                syncConversationToCloudSql(
+                  c,
+                  new Date(c.lastMessageAt || nowIso).getTime() || Date.now()
+                )
+              )
+            );
+          } else if (state.conversations.length > 0) {
+            this.db.prepare('DELETE FROM conversations').run();
+            for (const conv of state.conversations) {
+              const sortTime =
+                new Date(conv.lastMessageAt || nowIso).getTime() || Date.now();
+              const createdAt =
+                conv.messages?.[0]?.createdAt || conv.lastMessageAt || nowIso;
+              this.db
+                .prepare(
+                  'INSERT OR REPLACE INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+                )
+                .run(
+                  conv.id,
+                  conv.listingId,
+                  sortTime,
+                  JSON.stringify(conv),
+                  createdAt,
+                  nowIso
+                );
+            }
+          }
         }
 
         if (!this.isCustomTestDb) {
@@ -1229,13 +1269,25 @@ export class DarnaPersistentDb {
 
     if (deleted && candidateImageIds.size > 0) {
       const stillReferencedIds = this.getAllReferencedUploadedImageIds(id);
-      let deletedImagesCount = 0;
-      const deleteImgStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
+      const idsToDelete: string[] = [];
       for (const imgId of candidateImageIds) {
         if (!stillReferencedIds.has(imgId)) {
-          const imgRes = deleteImgStmt.run(imgId);
-          deletedImagesCount += Number(imgRes.changes);
+          idsToDelete.push(imgId);
         }
+      }
+
+      if (this.enableCloudSqlSync && idsToDelete.length > 0) {
+        await deleteUploadedImagesFromCloudSql(idsToDelete);
+      }
+
+      let deletedImagesCount = 0;
+      const deleteImgStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
+      for (const imgId of idsToDelete) {
+        const imgRes = deleteImgStmt.run(imgId);
+        deletedImagesCount += Number(imgRes.changes);
+      }
+      if (this.enableCloudSqlSync && idsToDelete.length > deletedImagesCount) {
+        deletedImagesCount = idsToDelete.length;
       }
       console.log(`[ImageCleanup] ${deletedImagesCount} image(s) supprimée(s).`);
     }
@@ -1512,8 +1564,10 @@ export class DarnaPersistentDb {
     sender: User;
     text: string;
     conversationId?: string;
-  }): ConversationThread {
+  }): Promise<ConversationThread> & ConversationThread {
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
+    const sortTime = Date.now();
     const cleanText = String(params.text || '').trim().slice(0, 1500);
 
     let thread: ConversationThread | null = null;
@@ -1529,7 +1583,7 @@ export class DarnaPersistentDb {
         ) || null;
     }
 
-    const msgId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const msgId = `msg-${sortTime}-${Math.random().toString(36).slice(2, 7)}`;
 
     if (thread) {
       const newMessage: ConversationMessage = {
@@ -1563,16 +1617,29 @@ export class DarnaPersistentDb {
         messages: [...thread.messages, newMessage],
       };
 
-      this.db
-        .prepare(
-          'UPDATE conversations SET sort_time = ?, data_json = ?, updated_at = ? WHERE id = ?'
-        )
-        .run(Date.now(), JSON.stringify(updatedThread), nowIso, updatedThread.id);
-      return updatedThread;
+      const writeLocal = () => {
+        this.db
+          .prepare(
+            'UPDATE conversations SET sort_time = ?, data_json = ?, updated_at = ? WHERE id = ?'
+          )
+          .run(sortTime, JSON.stringify(updatedThread), nowIso, updatedThread.id);
+      };
+
+      if (this.enableCloudSqlSync) {
+        const promise = (async () => {
+          await syncConversationToCloudSql(updatedThread, sortTime);
+          writeLocal();
+          return updatedThread;
+        })();
+        return Object.assign(promise, updatedThread);
+      }
+
+      writeLocal();
+      return Object.assign(Promise.resolve(updatedThread), updatedThread);
     }
 
     const listing = params.listing!;
-    const convId = `conv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const convId = `conv-${sortTime}-${Math.random().toString(36).slice(2, 7)}`;
     const advertiserId = listing.userId || 'user-part-1';
     const advertiserName = listing.contact?.name || 'Annonceur Darna';
     const participantIds = Array.from(new Set([params.sender.id, advertiserId]));
@@ -1614,19 +1681,31 @@ export class DarnaPersistentDb {
       messages: [firstMessage],
     };
 
-    this.db
-      .prepare(
-        'INSERT INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
-      )
-      .run(convId, listing.id, Date.now(), JSON.stringify(newThread), nowIso, nowIso);
+    const writeLocalNew = () => {
+      this.db
+        .prepare(
+          'INSERT INTO conversations (id, listing_id, sort_time, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+        )
+        .run(convId, listing.id, sortTime, JSON.stringify(newThread), nowIso, nowIso);
+    };
 
-    return newThread;
+    if (this.enableCloudSqlSync) {
+      const promise = (async () => {
+        await syncConversationToCloudSql(newThread, sortTime);
+        writeLocalNew();
+        return newThread;
+      })();
+      return Object.assign(promise, newThread);
+    }
+
+    writeLocalNew();
+    return Object.assign(Promise.resolve(newThread), newThread);
   }
 
   public markConversationRead(
     conversationId: string,
     userId: string
-  ): ConversationThread | null {
+  ): (Promise<ConversationThread> & ConversationThread) | null {
     const thread = this.getConversationById(conversationId);
     if (!thread) return null;
     const isParticipant =
@@ -1635,7 +1714,10 @@ export class DarnaPersistentDb {
       thread.initiatorId === userId;
     if (!isParticipant) return null;
 
+    this.assertCloudSqlWritable();
     const nowIso = new Date().toISOString();
+    const sortTime =
+      new Date(thread.lastMessageAt || nowIso).getTime() || Date.now();
     const unreadCountByUser = { ...thread.unreadCountByUser, [userId]: 0 };
     const messages = thread.messages.map((m) =>
       m.senderId !== userId ? { ...m, read: true } : m
@@ -1645,10 +1727,52 @@ export class DarnaPersistentDb {
       unreadCountByUser,
       messages,
     };
+
+    const writeLocalRead = () => {
+      this.db
+        .prepare('UPDATE conversations SET data_json = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(updated), nowIso, conversationId);
+    };
+
+    if (this.enableCloudSqlSync) {
+      const promise = (async () => {
+        await syncConversationToCloudSql(updated, sortTime);
+        writeLocalRead();
+        return updated;
+      })();
+      return Object.assign(promise, updated);
+    }
+
+    writeLocalRead();
+    return Object.assign(Promise.resolve(updated), updated);
+  }
+
+  private writeUploadedImageToSqlite(params: {
+    id: string;
+    userId: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+    buffer: Buffer;
+    createdAt: string;
+  }): void {
     this.db
-      .prepare('UPDATE conversations SET data_json = ?, updated_at = ? WHERE id = ?')
-      .run(JSON.stringify(updated), nowIso, conversationId);
-    return updated;
+      .prepare(
+        `INSERT OR REPLACE INTO uploaded_images
+         (id, user_id, mime_type, width, height, size_bytes, binary_data, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        params.id,
+        params.userId,
+        params.mimeType,
+        params.width,
+        params.height,
+        params.sizeBytes,
+        params.buffer,
+        params.createdAt
+      );
   }
 
   public saveUploadedImage(params: {
@@ -1660,7 +1784,15 @@ export class DarnaPersistentDb {
     buffer: Buffer;
     sizeBytes?: number;
     createdAt?: string;
-  }): {
+  }): Promise<{
+    id: string;
+    url: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+    createdAt: string;
+  }> & {
     id: string;
     url: string;
     mimeType: string;
@@ -1669,6 +1801,7 @@ export class DarnaPersistentDb {
     sizeBytes: number;
     createdAt: string;
   } {
+    this.assertCloudSqlWritable();
     const createdAtIso = params.createdAt || new Date().toISOString();
     const ext =
       params.mimeType === 'image/jpeg'
@@ -1684,24 +1817,7 @@ export class DarnaPersistentDb {
         ? Math.max(0, Math.floor(params.sizeBytes))
         : params.buffer.length;
 
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO uploaded_images
-         (id, user_id, mime_type, width, height, size_bytes, binary_data, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        cleanId,
-        params.userId,
-        params.mimeType,
-        params.width,
-        params.height,
-        sizeBytes,
-        params.buffer,
-        createdAtIso
-      );
-
-    return {
+    const resultMeta = {
       id: cleanId,
       url: `/api/uploads/images/${cleanId}.${ext}`,
       mimeType: params.mimeType,
@@ -1710,6 +1826,29 @@ export class DarnaPersistentDb {
       sizeBytes,
       createdAt: createdAtIso,
     };
+
+    const rowPayload = {
+      id: cleanId,
+      userId: params.userId,
+      mimeType: params.mimeType,
+      width: params.width,
+      height: params.height,
+      sizeBytes,
+      buffer: params.buffer,
+      createdAt: createdAtIso,
+    };
+
+    if (this.enableCloudSqlSync) {
+      const promise = (async () => {
+        await syncUploadedImageToCloudSql(rowPayload);
+        this.writeUploadedImageToSqlite(rowPayload);
+        return resultMeta;
+      })();
+      return Object.assign(promise, resultMeta);
+    }
+
+    this.writeUploadedImageToSqlite(rowPayload);
+    return Object.assign(Promise.resolve(resultMeta), resultMeta);
   }
 
   public getUserUploadedImageStats(userId: string): {
@@ -1726,6 +1865,21 @@ export class DarnaPersistentDb {
       count: Number(row?.cnt || 0),
       totalBytes: Number(row?.total_bytes || 0),
     };
+  }
+
+  public async getUserUploadedImageStatsAsync(userId: string): Promise<{
+    count: number;
+    totalBytes: number;
+  }> {
+    const localStats = this.getUserUploadedImageStats(userId);
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgStats = await getUserUploadedImageStatsFromCloudSql(userId);
+      return {
+        count: Math.max(localStats.count, pgStats.count),
+        totalBytes: Math.max(localStats.totalBytes, pgStats.totalBytes),
+      };
+    }
+    return localStats;
   }
 
   private extractUploadedImageIdFromUrl(rawUrl: unknown): string | null {
@@ -1788,6 +1942,7 @@ export class DarnaPersistentDb {
       .all() as { id: string; created_at: string }[];
 
     let deletedCount = 0;
+    const deletedIds: string[] = [];
     const deleteStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
 
     for (const row of rows) {
@@ -1798,11 +1953,94 @@ export class DarnaPersistentDb {
       if (!Number.isNaN(createdMs) && nowMs - createdMs > maxAgeMs) {
         const res = deleteStmt.run(row.id);
         deletedCount += Number(res.changes);
+        deletedIds.push(row.id);
       }
+    }
+
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      void this.cleanupOrphanedUploadedImagesInCloudSql(maxAgeMs, nowMs, deletedIds).catch(
+        () => {}
+      );
     }
 
     console.log(`[ImageCleanup] ${deletedCount} image(s) supprimée(s).`);
     return deletedCount;
+  }
+
+  public async cleanupOrphanedUploadedImagesAsync(
+    maxAgeMs: number = 48 * 60 * 60 * 1000,
+    nowMs: number = Date.now()
+  ): Promise<number> {
+    const referencedIds = this.getAllReferencedUploadedImageIds();
+    const rows = this.db
+      .prepare('SELECT id, created_at FROM uploaded_images')
+      .all() as { id: string; created_at: string }[];
+
+    const idsToDelete = new Set<string>();
+    const deleteStmt = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?');
+
+    for (const row of rows) {
+      if (referencedIds.has(row.id)) continue;
+      const createdMs = Date.parse(row.created_at);
+      if (!Number.isNaN(createdMs) && nowMs - createdMs > maxAgeMs) {
+        deleteStmt.run(row.id);
+        idsToDelete.add(row.id);
+      }
+    }
+
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const pgMeta = await getAllUploadedImageMetadataFromCloudSql();
+      for (const item of pgMeta) {
+        if (referencedIds.has(item.id)) continue;
+        const createdMs = Date.parse(item.createdAt);
+        if (!Number.isNaN(createdMs) && nowMs - createdMs > maxAgeMs) {
+          idsToDelete.add(item.id);
+          deleteStmt.run(item.id);
+        }
+      }
+      if (idsToDelete.size > 0) {
+        await deleteUploadedImagesFromCloudSql(Array.from(idsToDelete));
+      }
+    }
+
+    const deletedCount = idsToDelete.size;
+    console.log(`[ImageCleanup] ${deletedCount} image(s) supprimée(s).`);
+    return deletedCount;
+  }
+
+  private async cleanupOrphanedUploadedImagesInCloudSql(
+    maxAgeMs: number,
+    nowMs: number,
+    alreadyIdentifiedIds: string[] = []
+  ): Promise<number> {
+    if (!this.enableCloudSqlSync || !isCloudSqlConfigured()) return 0;
+    const referencedIds = this.getAllReferencedUploadedImageIds();
+    const pgMeta = await getAllUploadedImageMetadataFromCloudSql();
+    const idsToDelete = new Set<string>(alreadyIdentifiedIds);
+    for (const item of pgMeta) {
+      if (referencedIds.has(item.id)) continue;
+      const createdMs = Date.parse(item.createdAt);
+      if (!Number.isNaN(createdMs) && nowMs - createdMs > maxAgeMs) {
+        idsToDelete.add(item.id);
+      }
+    }
+    if (idsToDelete.size > 0) {
+      await deleteUploadedImagesFromCloudSql(Array.from(idsToDelete));
+    }
+    return idsToDelete.size;
+  }
+
+  /**
+   * Removes an image ONLY from the local SQLite cache (used to test or force
+   * on-demand re-fetching from PostgreSQL without deleting the authoritative PostgreSQL row).
+   */
+  public evictUploadedImageFromLocalCache(idOrFilename: string): boolean {
+    const raw = String(idOrFilename || '').trim();
+    if (!raw) return false;
+    const baseId = raw.replace(/\.[a-z0-9]+$/i, '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!baseId) return false;
+    const res = this.db.prepare('DELETE FROM uploaded_images WHERE id = ?').run(baseId);
+    return Number(res.changes) > 0;
   }
 
   public getUploadedImage(idOrFilename: string): {
@@ -1849,6 +2087,42 @@ export class DarnaPersistentDb {
       buffer: Buffer.from(row.binary_data),
       createdAt: row.created_at,
     };
+  }
+
+  /**
+   * Reads an uploaded image from the local SQLite cache first.
+   * If not present in SQLite and PostgreSQL sync is enabled, fetches the image
+   * on-demand from PostgreSQL, caches it back into local SQLite, and returns it.
+   */
+  public async getUploadedImageAsync(idOrFilename: string): Promise<{
+    id: string;
+    userId: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+    buffer: Buffer;
+    createdAt: string;
+  } | null> {
+    const cached = this.getUploadedImage(idOrFilename);
+    if (cached) {
+      return cached;
+    }
+
+    const raw = String(idOrFilename || '').trim();
+    if (!raw) return null;
+    const baseId = raw.replace(/\.[a-z0-9]+$/i, '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!baseId) return null;
+
+    if (this.enableCloudSqlSync && isCloudSqlConfigured()) {
+      const remote = await getUploadedImageFromCloudSql(baseId);
+      if (remote && remote.buffer && remote.buffer.length > 0) {
+        this.writeUploadedImageToSqlite(remote);
+        return remote;
+      }
+    }
+
+    return null;
   }
 
   public close(): void {

@@ -1,5 +1,19 @@
 import { relations } from 'drizzle-orm';
-import { integer, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import {
+  bigint,
+  customType,
+  integer,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+} from 'drizzle-orm/pg-core';
+
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return 'bytea';
+  },
+});
 
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
@@ -73,6 +87,26 @@ export const transactions = pgTable('transactions', {
   updatedAt: timestamp('updated_at').defaultNow(),
 });
 
+export const uploadedImages = pgTable('uploaded_images', {
+  id: text('id').primaryKey(),
+  userId: text('user_id').notNull(),
+  mimeType: text('mime_type').notNull(),
+  width: integer('width').notNull(),
+  height: integer('height').notNull(),
+  sizeBytes: integer('size_bytes').notNull(),
+  binaryData: bytea('binary_data').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const conversations = pgTable('conversations', {
+  id: text('id').primaryKey(),
+  listingId: text('listing_id').notNull(),
+  sortTime: bigint('sort_time', { mode: 'number' }).notNull(),
+  dataJson: text('data_json').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
 export const usersRelations = relations(users, ({ many }) => ({
   listings: many(listings),
   transactions: many(transactions),
@@ -99,3 +133,4 @@ export const transactionsRelations = relations(transactions, ({ one }) => ({
     references: [users.uid],
   }),
 }));
+

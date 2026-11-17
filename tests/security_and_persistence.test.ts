@@ -3862,7 +3862,343 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       fs.unlinkSync(startupDbPath);
     }
   });
+
+  it('29. Persists uploaded_images and conversations in PostgreSQL (Cloud SQL): recovers uploaded image on-demand after local SQLite cache deletion, counts PostgreSQL quota, deletes from PostgreSQL on cleanup/listing delete, and restores conversations after a simulated restart', async () => {
+    const sharp = (await import('sharp')).default;
+    const {
+      getUploadedImageFromCloudSql,
+      fetchAllCloudSqlState,
+    } = await import('../src/db/users.ts');
+    const schema = await import('../src/db/schema.ts');
+
+    // Verify Drizzle schema exports uploadedImages (with bytea binary_data) and conversations
+    assert.ok(schema.uploadedImages, 'schema.ts must export uploadedImages pgTable');
+    assert.ok(schema.conversations, 'schema.ts must export conversations pgTable');
+
+    const dbPathInstance1 = path.join(os.tmpdir(), `darna-pg-inst1-${Date.now()}.sqlite`);
+    const dbPathInstance2 = path.join(os.tmpdir(), `darna-pg-inst2-${Date.now()}.sqlite`);
+
+    const inst1 = createDarnaApiApp(dbPathInstance1, { enableCloudSqlSync: true });
+    const server1 = http.createServer(inst1.app);
+    await new Promise<void>((resolve) => server1.listen(0, '127.0.0.1', resolve));
+    const addr1 = server1.address() as { port: number };
+    const url1 = `http://127.0.0.1:${addr1.port}`;
+
+    let server2: http.Server | null = null;
+    let inst2: ReturnType<typeof createDarnaApiApp> | null = null;
+
+    try {
+      const pngBuf = await sharp({
+        create: {
+          width: 24,
+          height: 24,
+          channels: 3,
+          background: { r: 193, g: 92, b: 61 },
+        },
+      })
+        .png()
+        .toBuffer();
+      const pngDataUri = `data:image/png;base64,${pngBuf.toString('base64')}`;
+
+      const sellerId = `user-pg-seller-${Date.now()}`;
+      const buyerId = `user-pg-buyer-${Date.now()}`;
+
+      await inst1.db.createUser(
+        {
+          id: sellerId,
+          firstName: 'Kenza',
+          lastName: 'SellerPg',
+          name: 'Kenza SellerPg',
+          email: `kenza.${Date.now()}@darna.ma`,
+          phone: '0661998801',
+          role: 'professionnel',
+          advertiserType: 'professionnel',
+          verified: true,
+          emailVerified: true,
+          favorites: [],
+          subscription: {
+            planId: 'agence',
+            planName: 'Pack Agence Illimité',
+            status: 'active',
+            maxListings: 100,
+            startedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+          },
+          createdAt: new Date().toISOString().split('T')[0],
+        },
+        'SellerPgPass2026!'
+      );
+      await inst1.db.createUser(
+        {
+          id: buyerId,
+          firstName: 'Mehdi',
+          lastName: 'BuyerPg',
+          name: 'Mehdi BuyerPg',
+          email: `mehdi.${Date.now()}@darna.ma`,
+          phone: '0661998802',
+          role: 'particulier',
+          advertiserType: 'particulier',
+          verified: true,
+          emailVerified: true,
+          favorites: [],
+          createdAt: new Date().toISOString().split('T')[0],
+        },
+        'BuyerPgPass2026!'
+      );
+
+      const sellerToken = await inst1.db.createSession(sellerId);
+      const buyerToken = await inst1.db.createSession(buyerId);
+
+      // 1A. Verify PostgreSQL failure during image upload returns 503 (never a silent success)
+      inst1.db.setSimulateCloudSqlFailure(true);
+      try {
+        const failUploadRes = await fetch(`${url1}/api/uploads/image`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${sellerToken}`,
+            'X-Forwarded-For': '198.51.199.1',
+          },
+          body: JSON.stringify({ dataUri: pngDataUri }),
+        });
+        assert.equal(
+          failUploadRes.status,
+          503,
+          'POST /api/uploads/image must return 503 when PostgreSQL synchronization fails'
+        );
+      } finally {
+        inst1.db.setSimulateCloudSqlFailure(false);
+      }
+
+      // 1B. Upload image when PostgreSQL is healthy -> written to both SQLite AND PostgreSQL
+      const uploadRes = await fetch(`${url1}/api/uploads/image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sellerToken}`,
+          'X-Forwarded-For': '198.51.199.2',
+        },
+        body: JSON.stringify({ dataUri: pngDataUri }),
+      });
+      assert.equal(uploadRes.status, 200);
+      const uploadedData = await uploadRes.json();
+      assert.equal(uploadedData.success, true);
+      const uploadedId: string = uploadedData.id;
+      const uploadedUrl: string = uploadedData.url;
+
+      // Verify image exists in PostgreSQL
+      const pgStoredBeforeEvict = await getUploadedImageFromCloudSql(uploadedId);
+      assert.ok(
+        pgStoredBeforeEvict && pgStoredBeforeEvict.buffer.length > 0,
+        'Uploaded image must be stored in PostgreSQL uploaded_images table'
+      );
+
+      // Verify fetchAllCloudSqlState does NOT load all uploaded_images at startup
+      const fullState = await fetchAllCloudSqlState();
+      assert.ok(fullState, 'fetchAllCloudSqlState must return state from PostgreSQL');
+      assert.equal(
+        'uploadedImages' in (fullState as Record<string, unknown>),
+        false,
+        'fetchAllCloudSqlState must NOT load all uploaded_images at startup'
+      );
+
+      // 1C. Evict the image from local SQLite cache (simulating ephemeral disk loss on Cloud Run)
+      const evicted = inst1.db.evictUploadedImageFromLocalCache(uploadedId);
+      assert.equal(evicted, true);
+      assert.equal(
+        inst1.db.getUploadedImage(uploadedId),
+        null,
+        'Image must be absent from local SQLite cache after eviction'
+      );
+
+      // Verify per-user quota still counts PostgreSQL data even when local SQLite cache is empty!
+      const quotaFromPg = await inst1.db.getUserUploadedImageStatsAsync(sellerId);
+      assert.equal(
+        quotaFromPg.count,
+        1,
+        'Per-user quota must count images stored in PostgreSQL even when local SQLite cache is empty'
+      );
+      assert.ok(quotaFromPg.totalBytes > 0);
+
+      // 1D. GET /api/uploads/images/:filename fetches the image on-demand from PostgreSQL,
+      // puts it back in local SQLite cache, and serves it
+      const getImgRes = await fetch(`${url1}${uploadedUrl}`);
+      assert.equal(
+        getImgRes.status,
+        200,
+        'GET /api/uploads/images/:filename must recover the image from PostgreSQL when missing from SQLite'
+      );
+      const servedBuf = Buffer.from(await getImgRes.arrayBuffer());
+      assert.equal(
+        servedBuf.length,
+        pgStoredBeforeEvict!.buffer.length,
+        'Served image bytes must match PostgreSQL bytea data'
+      );
+      assert.ok(
+        inst1.db.getUploadedImage(uploadedId),
+        'GET /api/uploads/images/:filename must re-populate local SQLite cache after fetching from PostgreSQL'
+      );
+
+      // 2. Create a listing referencing the uploaded image and start a conversation
+      const listingRes = await fetch(`${url1}/api/listings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sellerToken}`,
+        },
+        body: JSON.stringify({
+          title: 'Villa Persistante Cloud SQL',
+          description: 'Test persistance PostgreSQL photos et conversations',
+          category: 'villa',
+          transactionType: 'vente',
+          price: 4200000,
+          surface: 320,
+          rooms: 6,
+          city: 'Casablanca',
+          district: 'Anfa',
+          images: [uploadedUrl],
+        }),
+      });
+      assert.equal(listingRes.status, 201);
+      const { listing: pgListing } = await listingRes.json();
+
+      // 2A. Buyer starts a conversation on the listing
+      const convStartRes = await fetch(`${url1}/api/conversations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${buyerToken}`,
+        },
+        body: JSON.stringify({
+          listingId: pgListing.id,
+          text: 'Bonjour Kenza, cette villa à Anfa est-elle toujours disponible à la vente ?',
+        }),
+      });
+      assert.equal(convStartRes.status, 201);
+      const { conversation: startedConv } = await convStartRes.json();
+      assert.ok(startedConv.id);
+
+      // 2B. Seller replies in the conversation
+      const convReplyRes = await fetch(`${url1}/api/conversations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${sellerToken}`,
+        },
+        body: JSON.stringify({
+          conversationId: startedConv.id,
+          text: 'Bonjour Mehdi, oui tout à fait. Souhaitez-vous planifier une visite samedi ?',
+        }),
+      });
+      assert.equal(convReplyRes.status, 201);
+
+      // 2C. Buyer marks the conversation as read
+      const markReadRes = await fetch(`${url1}/api/conversations/${startedConv.id}/read`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${buyerToken}`,
+        },
+      });
+      assert.equal(markReadRes.status, 200);
+      const { conversation: readConv } = await markReadRes.json();
+      assert.equal(readConv.unreadCountByUser[buyerId], 0);
+      assert.equal(
+        readConv.messages.filter((m: { senderId: string }) => m.senderId !== buyerId).every((m: { read: boolean }) => m.read === true),
+        true
+      );
+
+      // 2D. Simulate a Cloud Run restart on a brand-new empty SQLite file (Instance #2)
+      inst2 = createDarnaApiApp(dbPathInstance2, { enableCloudSqlSync: true });
+      server2 = http.createServer(inst2.app);
+      await new Promise<void>((resolve) => server2!.listen(0, '127.0.0.1', resolve));
+      const addr2 = server2.address() as { port: number };
+      const url2 = `http://127.0.0.1:${addr2.port}`;
+
+      // Before any image request on Instance #2, local SQLite cache on Instance #2 does NOT have the image
+      assert.equal(
+        inst2.db.getUploadedImage(uploadedId),
+        null,
+        'New instance must not preload uploaded_images into SQLite at startup'
+      );
+
+      // Requesting the image on Instance #2 fetches it from PostgreSQL and caches it locally
+      const getImgInst2Res = await fetch(`${url2}${uploadedUrl}`);
+      assert.equal(
+        getImgInst2Res.status,
+        200,
+        'New instance after restart must serve uploaded image from PostgreSQL'
+      );
+      assert.ok(
+        inst2.db.getUploadedImage(uploadedId),
+        'New instance must cache the image in local SQLite after serving it'
+      );
+
+      // Requesting conversations on Instance #2 hydrates conversations from PostgreSQL
+      const getConvsInst2Res = await fetch(`${url2}/api/conversations`, {
+        headers: {
+          Authorization: `Bearer ${buyerToken}`,
+        },
+      });
+      assert.equal(getConvsInst2Res.status, 200);
+      const convsInst2Data = await getConvsInst2Res.json();
+      const recoveredConv = (convsInst2Data.conversations || []).find(
+        (c: { id: string }) => c.id === startedConv.id
+      );
+      assert.ok(
+        recoveredConv,
+        'Conversation must be recovered from PostgreSQL after a simulated Cloud Run restart'
+      );
+      assert.equal(recoveredConv.messages.length, 2);
+      assert.equal(
+        recoveredConv.messages[0].text,
+        'Bonjour Kenza, cette villa à Anfa est-elle toujours disponible à la vente ?'
+      );
+      assert.equal(
+        recoveredConv.messages[1].text,
+        'Bonjour Mehdi, oui tout à fait. Souhaitez-vous planifier une visite samedi ?'
+      );
+      assert.equal(
+        recoveredConv.unreadCountByUser[buyerId],
+        0,
+        'Read status must also be preserved in PostgreSQL across restarts'
+      );
+
+      // 3. Deleting the listing must also delete its image from PostgreSQL
+      const delListingRes = await fetch(`${url2}/api/listings/${pgListing.id}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${sellerToken}`,
+        },
+      });
+      assert.equal(delListingRes.status, 200);
+      const pgStoredAfterDelete = await getUploadedImageFromCloudSql(uploadedId);
+      assert.equal(
+        pgStoredAfterDelete,
+        null,
+        'Deleting a listing must also delete its unshared images from PostgreSQL uploaded_images'
+      );
+    } finally {
+      await new Promise<void>((resolve) => server1.close(() => resolve()));
+      inst1.db.close();
+      if (server2) {
+        await new Promise<void>((resolve) => server2!.close(() => resolve()));
+      }
+      if (inst2) {
+        inst2.db.close();
+      }
+      for (const p of [dbPathInstance1, dbPathInstance2]) {
+        if (fs.existsSync(p)) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  });
 });
+
 
 
 

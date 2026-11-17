@@ -1854,26 +1854,31 @@ export function createDarnaApiApp(
     res.json({ success: true, listings: visibleListings });
   });
 
-  app.get(['/api/uploads/images/:filename', '/uploads/images/:filename'], (req, res) => {
+  app.get(['/api/uploads/images/:filename', '/uploads/images/:filename'], async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    const stored = db.getUploadedImage(req.params.filename);
-    if (
-      !stored ||
-      !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
-      stored.buffer.length === 0 ||
-      stored.buffer.length > MAX_LISTING_IMAGE_BYTES
-    ) {
-      return res.status(404).send('Image introuvable');
-    }
+    try {
+      const stored = await db.getUploadedImageAsync(req.params.filename);
+      if (
+        !stored ||
+        !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
+        stored.buffer.length === 0 ||
+        stored.buffer.length > MAX_LISTING_IMAGE_BYTES
+      ) {
+        return res.status(404).send('Image introuvable');
+      }
 
-    res.setHeader('Content-Type', stored.mimeType);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    return res.status(200).send(stored.buffer);
+      res.setHeader('Content-Type', stored.mimeType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      return res.status(200).send(stored.buffer);
+    } catch (err) {
+      console.error('Error in GET /api/uploads/images/:filename:', err);
+      return res.status(503).send('Service temporairement indisponible');
+    }
   });
 
-  app.get('/api/listings/:id/cover.jpg', (req, res) => {
+  app.get('/api/listings/:id/cover.jpg', async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
     const listing = db.getListingById(req.params.id);
@@ -1890,20 +1895,25 @@ export function createDarnaApiApp(
       firstImage.startsWith('/api/uploads/images/') ||
       firstImage.startsWith('/uploads/images/')
     ) {
-      const stored = db.getUploadedImage(path.basename(firstImage));
-      if (
-        !stored ||
-        !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
-        stored.buffer.length === 0 ||
-        stored.buffer.length > MAX_LISTING_IMAGE_BYTES
-      ) {
-        return res.status(404).send('Image invalide ou introuvable');
+      try {
+        const stored = await db.getUploadedImageAsync(path.basename(firstImage));
+        if (
+          !stored ||
+          !ALLOWED_LISTING_IMAGE_MIMES.has(stored.mimeType) ||
+          stored.buffer.length === 0 ||
+          stored.buffer.length > MAX_LISTING_IMAGE_BYTES
+        ) {
+          return res.status(404).send('Image invalide ou introuvable');
+        }
+        res.setHeader('Content-Type', stored.mimeType);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        return res.status(200).send(stored.buffer);
+      } catch (err) {
+        console.error('Error in GET /api/listings/:id/cover.jpg:', err);
+        return res.status(503).send('Service temporairement indisponible');
       }
-      res.setHeader('Content-Type', stored.mimeType);
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      return res.status(200).send(stored.buffer);
     }
 
     if (firstImage.startsWith('data:')) {
@@ -2036,6 +2046,11 @@ export function createDarnaApiApp(
       };
     }
 
+    let outBuffer: Buffer;
+    let outMime = mimeType;
+    let outWidth = 0;
+    let outHeight = 0;
+
     try {
       const pipeline = sharp(rawBuffer, {
         failOn: 'error',
@@ -2063,8 +2078,6 @@ export function createDarnaApiApp(
         withoutEnlargement: true,
       });
 
-      let outBuffer: Buffer;
-      let outMime = mimeType;
       if (detectedFormat === 'jpeg') {
         outMime = 'image/jpeg';
         outBuffer = await resized.jpeg({ quality: 86, mozjpeg: true }).toBuffer();
@@ -2080,35 +2093,8 @@ export function createDarnaApiApp(
       }
 
       const outMeta = await sharp(outBuffer).metadata();
-      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
-      const maxUserImageBytes = Number(
-        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
-      );
-      const currentQuota = db.getUserUploadedImageStats(userId);
-      if (
-        currentQuota.count >= maxUserImageCount ||
-        currentQuota.totalBytes + outBuffer.length > maxUserImageBytes ||
-        currentQuota.totalBytes + rawBuffer.length > maxUserImageBytes
-      ) {
-        return {
-          valid: false,
-          code: 'IMAGE_QUOTA_EXCEEDED',
-          message:
-            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
-        };
-      }
-
-      const imgId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const saved = db.saveUploadedImage({
-        id: imgId,
-        userId,
-        mimeType: outMime,
-        width: outMeta.width || metadata.width,
-        height: outMeta.height || metadata.height,
-        buffer: outBuffer,
-      });
-
-      return { valid: true, saved };
+      outWidth = outMeta.width || metadata.width;
+      outHeight = outMeta.height || metadata.height;
     } catch {
       return {
         valid: false,
@@ -2117,6 +2103,36 @@ export function createDarnaApiApp(
           'Impossible de décoder cette image. Veuillez fournir une vraie photo JPEG, PNG, WebP ou GIF.',
       };
     }
+
+    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+    const maxUserImageBytes = Number(
+      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+    );
+    const currentQuota = await db.getUserUploadedImageStatsAsync(userId);
+    if (
+      currentQuota.count >= maxUserImageCount ||
+      currentQuota.totalBytes + outBuffer.length > maxUserImageBytes ||
+      currentQuota.totalBytes + rawBuffer.length > maxUserImageBytes
+    ) {
+      return {
+        valid: false,
+        code: 'IMAGE_QUOTA_EXCEEDED',
+        message:
+          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+      };
+    }
+
+    const imgId = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const saved = await db.saveUploadedImage({
+      id: imgId,
+      userId,
+      mimeType: outMime,
+      width: outWidth,
+      height: outHeight,
+      buffer: outBuffer,
+    });
+
+    return { valid: true, saved };
   }
 
   /**
@@ -2179,7 +2195,7 @@ export function createDarnaApiApp(
         trimmed.startsWith('/api/uploads/images/') ||
         trimmed.startsWith('/uploads/images/')
       ) {
-        const existingImg = db.getUploadedImage(path.basename(trimmed));
+        const existingImg = await db.getUploadedImageAsync(path.basename(trimmed));
         if (!existingImg) {
           return {
             valid: false,
@@ -2289,132 +2305,142 @@ export function createDarnaApiApp(
    */
   app.post('/api/uploads/image', async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    const viewer = getAuthUser(req);
-    if (!viewer) {
-      return res.status(401).json({
-        success: false,
-        code: 'UNAUTHORIZED',
-        message: 'Créez un compte ou connectez-vous pour téléverser vos photos personnelles.',
-      });
-    }
-
-    if (viewer.emailVerified !== true) {
-      return res.status(403).json({
-        success: false,
-        code: 'EMAIL_NOT_VERIFIED',
-        message:
-          'Votre adresse e-mail doit être vérifiée avant de pouvoir téléverser des photos.',
-      });
-    }
-
-    const uploadHourlyLimit = Number(process.env.IMAGE_UPLOAD_HOURLY_LIMIT || 30);
-    const uploadRateWindowMs = Number(process.env.IMAGE_UPLOAD_WINDOW_MS || 60 * 60 * 1000);
-    const rateCheck = consumeDualRateLimit(
-      imageUploadUserLimiter,
-      imageUploadIpLimiter,
-      viewer.id,
-      getClientIp(req),
-      uploadHourlyLimit,
-      uploadRateWindowMs
-    );
-    if (!rateCheck.allowed) {
-      return res.status(429).json({
-        success: false,
-        code: 'RATE_LIMIT_EXCEEDED',
-        message:
-          'Limite de téléversement atteinte (maximum 30 envois par heure par utilisateur et par adresse IP). Veuillez patienter avant de réessayer.',
-      });
-    }
-
-    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
-    const maxUserImageBytes = Number(
-      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
-    );
-    const currentQuota = db.getUserUploadedImageStats(viewer.id);
-    if (
-      currentQuota.count >= maxUserImageCount ||
-      currentQuota.totalBytes >= maxUserImageBytes
-    ) {
-      return res.status(413).json({
-        success: false,
-        code: 'IMAGE_QUOTA_EXCEEDED',
-        message:
-          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
-      });
-    }
-
-    const rawInput =
-      typeof req.body?.dataUri === 'string'
-        ? req.body.dataUri
-        : typeof req.body?.dataUrl === 'string'
-          ? req.body.dataUrl
-          : '';
-    const rawDataUri = rawInput.trim();
-    const parsed = parseAllowedBase64Image(rawDataUri);
-    if (!parsed.valid || !parsed.buffer || !parsed.mimeType) {
-      if (parsed.reason === 'too_large') {
-        return res.status(400).json({
+    try {
+      const viewer = getAuthUser(req);
+      if (!viewer) {
+        return res.status(401).json({
           success: false,
-          code: 'IMAGE_TOO_LARGE',
-          message: 'La taille décodée de chaque photo ne doit pas dépasser 5 Mo.',
+          code: 'UNAUTHORIZED',
+          message: 'Créez un compte ou connectez-vous pour téléverser vos photos personnelles.',
         });
       }
-      return res.status(400).json({
-        success: false,
-        code: 'INVALID_IMAGE_TYPE',
-        message:
-          'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
-      });
-    }
 
-    if (currentQuota.totalBytes + parsed.buffer.length > maxUserImageBytes) {
-      return res.status(413).json({
-        success: false,
-        code: 'IMAGE_QUOTA_EXCEEDED',
-        message:
-          'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
-      });
-    }
+      if (viewer.emailVerified !== true) {
+        return res.status(403).json({
+          success: false,
+          code: 'EMAIL_NOT_VERIFIED',
+          message:
+            'Votre adresse e-mail doit être vérifiée avant de pouvoir téléverser des photos.',
+        });
+      }
 
-    const sanitized = await sanitizeAndStoreImageBuffer(
-      parsed.buffer,
-      parsed.mimeType,
-      viewer.id
-    );
-    if (!sanitized.valid || !sanitized.saved) {
-      if (sanitized.code === 'IMAGE_QUOTA_EXCEEDED') {
+      const uploadHourlyLimit = Number(process.env.IMAGE_UPLOAD_HOURLY_LIMIT || 30);
+      const uploadRateWindowMs = Number(process.env.IMAGE_UPLOAD_WINDOW_MS || 60 * 60 * 1000);
+      const rateCheck = consumeDualRateLimit(
+        imageUploadUserLimiter,
+        imageUploadIpLimiter,
+        viewer.id,
+        getClientIp(req),
+        uploadHourlyLimit,
+        uploadRateWindowMs
+      );
+      if (!rateCheck.allowed) {
+        return res.status(429).json({
+          success: false,
+          code: 'RATE_LIMIT_EXCEEDED',
+          message:
+            'Limite de téléversement atteinte (maximum 30 envois par heure par utilisateur et par adresse IP). Veuillez patienter avant de réessayer.',
+        });
+      }
+
+      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 200);
+      const maxUserImageBytes = Number(
+        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 300 * 1024 * 1024
+      );
+      const currentQuota = await db.getUserUploadedImageStatsAsync(viewer.id);
+      if (
+        currentQuota.count >= maxUserImageCount ||
+        currentQuota.totalBytes >= maxUserImageBytes
+      ) {
         return res.status(413).json({
           success: false,
           code: 'IMAGE_QUOTA_EXCEEDED',
           message:
-            sanitized.message ||
             'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
         });
       }
-      return res.status(400).json({
+
+      const rawInput =
+        typeof req.body?.dataUri === 'string'
+          ? req.body.dataUri
+          : typeof req.body?.dataUrl === 'string'
+            ? req.body.dataUrl
+            : '';
+      const rawDataUri = rawInput.trim();
+      const parsed = parseAllowedBase64Image(rawDataUri);
+      if (!parsed.valid || !parsed.buffer || !parsed.mimeType) {
+        if (parsed.reason === 'too_large') {
+          return res.status(400).json({
+            success: false,
+            code: 'IMAGE_TOO_LARGE',
+            message: 'La taille décodée de chaque photo ne doit pas dépasser 5 Mo.',
+          });
+        }
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_IMAGE_TYPE',
+          message:
+            'Format d’image non autorisé. Seuls les formats image/jpeg, image/png, image/webp et image/gif sont acceptés.',
+        });
+      }
+
+      if (currentQuota.totalBytes + parsed.buffer.length > maxUserImageBytes) {
+        return res.status(413).json({
+          success: false,
+          code: 'IMAGE_QUOTA_EXCEEDED',
+          message:
+            'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+        });
+      }
+
+      const sanitized = await sanitizeAndStoreImageBuffer(
+        parsed.buffer,
+        parsed.mimeType,
+        viewer.id
+      );
+      if (!sanitized.valid || !sanitized.saved) {
+        if (sanitized.code === 'IMAGE_QUOTA_EXCEEDED') {
+          return res.status(413).json({
+            success: false,
+            code: 'IMAGE_QUOTA_EXCEEDED',
+            message:
+              sanitized.message ||
+              'Quota de stockage dépassé : vous êtes limité à 200 images et 300 Mo cumulés maximum par utilisateur.',
+          });
+        }
+        return res.status(400).json({
+          success: false,
+          code: sanitized.code || 'INVALID_IMAGE_CONTENT',
+          message:
+            sanitized.message ||
+            'Impossible de décoder cette image. Veuillez sélectionner une vraie photo JPEG, PNG, WebP ou GIF.',
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        id: sanitized.saved.id,
+        url: sanitized.saved.url,
+        imageUrl: sanitized.saved.url,
+        dataUri: sanitized.saved.url,
+        dataUrl: sanitized.saved.url,
+        mimeType: sanitized.saved.mimeType,
+        width: sanitized.saved.width,
+        height: sanitized.saved.height,
+        sizeBytes: sanitized.saved.sizeBytes,
+        exifStripped: true,
+        isDemo: false,
+        isPersonalUpload: true,
+      });
+    } catch (err) {
+      console.error('Error in POST /api/uploads/image:', err);
+      return res.status(503).json({
         success: false,
-        code: sanitized.code || 'INVALID_IMAGE_CONTENT',
+        code: 'DATABASE_SYNC_FAILED',
         message:
-          sanitized.message ||
-          'Impossible de décoder cette image. Veuillez sélectionner une vraie photo JPEG, PNG, WebP ou GIF.',
+          "La synchronisation PostgreSQL a échoué lors de l'enregistrement de l'image. Aucune donnée n'a été validée.",
       });
     }
-
-    return res.status(200).json({
-      success: true,
-      id: sanitized.saved.id,
-      url: sanitized.saved.url,
-      imageUrl: sanitized.saved.url,
-      dataUri: sanitized.saved.url,
-      dataUrl: sanitized.saved.url,
-      mimeType: sanitized.saved.mimeType,
-      width: sanitized.saved.width,
-      height: sanitized.saved.height,
-      sizeBytes: sanitized.saved.sizeBytes,
-      exifStripped: true,
-      isDemo: false,
-      isPersonalUpload: true,
-    });
   });
 
   app.post('/api/listings', async (req, res) => {
@@ -2423,18 +2449,6 @@ export function createDarnaApiApp(
       return res.status(401).json({
         success: false,
         message: 'Créez un compte ou connectez-vous pour continuer.',
-      });
-    }
-
-    const processedImages = await processAndSanitizeListingImages(
-      req.body?.images,
-      viewer.id
-    );
-    if (!processedImages.valid) {
-      return res.status(400).json({
-        success: false,
-        code: processedImages.code || 'INVALID_IMAGE_TYPE',
-        message: processedImages.message,
       });
     }
 
@@ -2451,6 +2465,17 @@ export function createDarnaApiApp(
     }
 
     try {
+      const processedImages = await processAndSanitizeListingImages(
+        req.body?.images,
+        viewer.id
+      );
+      if (!processedImages.valid) {
+        return res.status(400).json({
+          success: false,
+          code: processedImages.code || 'INVALID_IMAGE_TYPE',
+          message: processedImages.message,
+        });
+      }
       const cleanedBody = stripClientPromotionAndPaymentFields(req.body);
       const titleCheck = detectContactInPublicText(cleanedBody.title || '');
       const descCheck = detectContactInPublicText(cleanedBody.description || '');
@@ -3862,7 +3887,7 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
     });
   });
 
-  app.post('/api/conversations', (req, res) => {
+  app.post('/api/conversations', async (req, res) => {
     const viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({
@@ -3986,38 +4011,50 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
             'Limite atteinte : vous ne pouvez pas démarrer plus de 5 nouvelles conversations par heure. Veuillez patienter avant de réessayer.',
         });
       }
+    }
+
+    try {
+      const conversation = await db.sendConversationMessage({
+        listing,
+        sender: viewer,
+        text: rawText,
+        conversationId,
+      });
+
+      if (!existingConv) {
+        consumeUserRateLimit(
+          conversationNewThreadUserLimiter,
+          viewer.id,
+          maxNewConversationsPerHour,
+          oneHourMs,
+          true
+        );
+      }
       consumeUserRateLimit(
-        conversationNewThreadUserLimiter,
+        conversationMessageUserLimiter,
         viewer.id,
-        maxNewConversationsPerHour,
+        maxMessagesPerHour,
         oneHourMs,
         true
       );
+
+      return res.status(201).json({
+        success: true,
+        conversation,
+        message: 'Message envoyé avec succès.',
+      });
+    } catch (err) {
+      console.error('Error in POST /api/conversations:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message:
+          "La synchronisation PostgreSQL a échoué lors de l'envoi du message. Veuillez réessayer.",
+      });
     }
-
-    consumeUserRateLimit(
-      conversationMessageUserLimiter,
-      viewer.id,
-      maxMessagesPerHour,
-      oneHourMs,
-      true
-    );
-
-    const conversation = db.sendConversationMessage({
-      listing,
-      sender: viewer,
-      text: rawText,
-      conversationId,
-    });
-
-    return res.status(201).json({
-      success: true,
-      conversation,
-      message: 'Message envoyé avec succès.',
-    });
   });
 
-  app.post('/api/conversations/:id/read', (req, res) => {
+  app.post('/api/conversations/:id/read', async (req, res) => {
     const viewer = getAuthUser(req);
     if (!viewer) {
       return res.status(401).json({
@@ -4040,18 +4077,40 @@ Ton ton est accueillant, professionnel et très ancré dans le quotidien marocai
         message: 'Conversation introuvable.',
       });
     }
-    const updated = db.markConversationRead(req.params.id, viewer.id);
-    if (!updated) {
+    const isParticipant =
+      existingConv.participantIds.includes(viewer.id) ||
+      existingConv.advertiserId === viewer.id ||
+      existingConv.initiatorId === viewer.id;
+    if (!isParticipant) {
       return res.status(403).json({
         success: false,
         code: 'FORBIDDEN_CONVERSATION_ACCESS',
         message: 'Accès non autorisé à cette conversation.',
       });
     }
-    return res.json({
-      success: true,
-      conversation: updated,
-    });
+
+    try {
+      const updated = await db.markConversationRead(req.params.id, viewer.id);
+      if (!updated) {
+        return res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN_CONVERSATION_ACCESS',
+          message: 'Accès non autorisé à cette conversation.',
+        });
+      }
+      return res.json({
+        success: true,
+        conversation: updated,
+      });
+    } catch (err) {
+      console.error('Error in POST /api/conversations/:id/read:', err);
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_SYNC_FAILED',
+        message:
+          'La synchronisation PostgreSQL a échoué lors de la mise à jour de la conversation.',
+      });
+    }
   });
 
   // Strict JSON 404 handler for all /api/* routes so unmatched API endpoints never fall through
@@ -4217,7 +4276,7 @@ self.addEventListener('fetch', () => {});\n`;
     }
   );
 
-  function buildIndexHtmlForRequest(req: express.Request, rawHtml: string): string {
+  async function buildIndexHtmlForRequest(req: express.Request, rawHtml: string): Promise<string> {
     const baseHttpsUrl = getBaseHttpsUrl(req);
     const defaultOgImageUrl = `${baseHttpsUrl}/og-default.png`;
     const annonceId =
@@ -4283,7 +4342,7 @@ self.addEventListener('fetch', () => {});\n`;
       firstImg.startsWith('/api/uploads/images/') ||
       firstImg.startsWith('/uploads/images/')
     ) {
-      const stored = db.getUploadedImage(path.basename(firstImg));
+      const stored = await db.getUploadedImageAsync(path.basename(firstImg));
       rawOgImage = stored
         ? `${baseHttpsUrl}/api/listings/${encodeURIComponent(listing.id)}/cover.jpg`
         : defaultOgImageUrl;
@@ -4379,7 +4438,7 @@ self.addEventListener('fetch', () => {});\n`;
         html = await viteServer.transformIndexHtml(req.originalUrl, html);
       }
 
-      const rendered = buildIndexHtmlForRequest(req, html);
+      const rendered = await buildIndexHtmlForRequest(req, html);
       return res
         .status(200)
         .setHeader('Content-Type', 'text/html; charset=utf-8')
