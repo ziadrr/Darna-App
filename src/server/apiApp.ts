@@ -346,6 +346,9 @@ export function createDarnaApiApp(
 
   const helmetProd = helmet({
     frameguard: false,
+    referrerPolicy: {
+      policy: 'strict-origin-when-cross-origin',
+    },
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
@@ -369,6 +372,9 @@ export function createDarnaApiApp(
 
   const helmetDev = helmet({
     frameguard: false,
+    referrerPolicy: {
+      policy: 'strict-origin-when-cross-origin',
+    },
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {

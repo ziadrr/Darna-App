@@ -53,14 +53,50 @@ interface MoroccoMapProps {
   zoom?: number;
 }
 
+const ESRI_STREET_FALLBACK_TILE_URL =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
+
+let cartoWatermarkDetected = false;
+
+/**
+ * Checks whether CARTO Voyager is returning its 2,049-byte "API KEY REQUIRED" watermark PNG
+ * (HTTP 200 with ETag "wm-...") instead of real map tiles.
+ */
+async function detectCartoWatermarkTile(tileUrl?: string): Promise<boolean> {
+  if (cartoWatermarkDetected) return true;
+  if (typeof fetch !== 'function') return false;
+  const probeUrl =
+    tileUrl || 'https://a.basemaps.cartocdn.com/rastertiles/voyager/6/30/25.png';
+  try {
+    const res = await fetch(probeUrl, { method: 'GET', mode: 'cors' });
+    if (!res.ok) return true;
+    const etag = (res.headers.get('etag') || '').toLowerCase();
+    if (etag.includes('wm-')) {
+      cartoWatermarkDetected = true;
+      return true;
+    }
+    const blob = await res.blob();
+    // CARTO's "API KEY REQUIRED" watermark tile is 2,049 bytes (real tiles are 8KB–45KB)
+    if (blob.size > 0 && blob.size <= 2500) {
+      cartoWatermarkDetected = true;
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Attaches a primary tile layer (CARTO Voyager or Relief) with automatic fallback
- * to OpenStreetMap on `tileerror`, and notifies `onUnavailableChange(true)` if both fail.
+ * to OpenStreetMap on `tileerror` or when CARTO returns its "API KEY REQUIRED" watermark tile,
+ * and notifies `onUnavailableChange(true)` if all providers fail.
  */
 function attachTileLayerWithFallback(
   map: L.Map,
   style: 'street' | 'topo',
-  onUnavailableChange: (unavailable: boolean) => void
+  onUnavailableChange: (unavailable: boolean) => void,
+  onActiveLayerChange?: (layer: L.TileLayer) => void
 ): L.TileLayer {
   onUnavailableChange(false);
 
@@ -80,13 +116,10 @@ function attachTileLayerWithFallback(
         };
 
   let switchedToOsmFallback = false;
+  let checkedWatermark = false;
   const primaryLayer = L.tileLayer(primaryUrl, primaryOptions);
 
-  primaryLayer.on('tileload', () => {
-    onUnavailableChange(false);
-  });
-
-  primaryLayer.on('tileerror', () => {
+  const switchToOsmFallback = () => {
     if (switchedToOsmFallback) return;
     switchedToOsmFallback = true;
 
@@ -98,6 +131,7 @@ function attachTileLayerWithFallback(
       // ignore removal error if map was destroyed
     }
 
+    let switchedToEsriFallback = false;
     const fallbackOsmLayer = L.tileLayer(OSM_FALLBACK_TILE_URL, {
       attribution: OSM_FALLBACK_ATTRIBUTION,
       detectRetina: true,
@@ -110,13 +144,74 @@ function attachTileLayerWithFallback(
     });
 
     fallbackOsmLayer.on('tileerror', () => {
-      onUnavailableChange(true);
+      if (switchedToEsriFallback) {
+        onUnavailableChange(true);
+        return;
+      }
+      switchedToEsriFallback = true;
+      try {
+        if (map.hasLayer(fallbackOsmLayer)) {
+          map.removeLayer(fallbackOsmLayer);
+        }
+      } catch {
+        // ignore removal error if map was destroyed
+      }
+
+      const esriFallbackLayer = L.tileLayer(ESRI_STREET_FALLBACK_TILE_URL, {
+        attribution: TOPO_ATTRIBUTION,
+        detectRetina: true,
+        maxZoom: 19,
+      });
+
+      esriFallbackLayer.on('tileload', () => {
+        onUnavailableChange(false);
+      });
+
+      esriFallbackLayer.on('tileerror', () => {
+        onUnavailableChange(true);
+      });
+
+      esriFallbackLayer.addTo(map);
+      if (onActiveLayerChange) onActiveLayerChange(esriFallbackLayer);
     });
 
     fallbackOsmLayer.addTo(map);
+    if (onActiveLayerChange) onActiveLayerChange(fallbackOsmLayer);
+  };
+
+  primaryLayer.on('tileload', (evt: L.TileEvent) => {
+    onUnavailableChange(false);
+    if (style === 'street' && !checkedWatermark && !switchedToOsmFallback) {
+      checkedWatermark = true;
+      const loadedSrc = (evt?.tile as HTMLImageElement | undefined)?.src;
+      detectCartoWatermarkTile(loadedSrc).then((isWatermark) => {
+        if (isWatermark) {
+          switchToOsmFallback();
+        }
+      });
+    }
   });
 
+  primaryLayer.on('tileerror', () => {
+    switchToOsmFallback();
+  });
+
+  if (style === 'street' && cartoWatermarkDetected) {
+    switchToOsmFallback();
+    return primaryLayer;
+  }
+
   primaryLayer.addTo(map);
+  if (onActiveLayerChange) onActiveLayerChange(primaryLayer);
+
+  if (style === 'street') {
+    detectCartoWatermarkTile().then((isWatermark) => {
+      if (isWatermark) {
+        switchToOsmFallback();
+      }
+    });
+  }
+
   return primaryLayer;
 }
 
@@ -131,6 +226,8 @@ export const MoroccoMap: React.FC<MoroccoMapProps> = ({
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
+  const prevMapStyleRef = useRef<'street' | 'topo'>('street');
+  const lastFittedListingsKeyRef = useRef<string>('');
   const [previewListing, setPreviewListing] = useState<Listing | null>(null);
   const [activeCityId, setActiveCityId] = useState<string>('all');
   const [mapStyle, setMapStyle] = useState<'street' | 'topo'>('street');
@@ -200,7 +297,10 @@ export const MoroccoMap: React.FC<MoroccoMapProps> = ({
     tileLayerRef.current = attachTileLayerWithFallback(
       map,
       mapStyle,
-      setTileUnavailable
+      setTileUnavailable,
+      (activeLayer) => {
+        tileLayerRef.current = activeLayer;
+      }
     );
 
     const clusterFactory = (
@@ -339,6 +439,8 @@ export const MoroccoMap: React.FC<MoroccoMapProps> = ({
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map) return;
+    if (prevMapStyleRef.current === mapStyle) return;
+    prevMapStyleRef.current = mapStyle;
 
     if (tileLayerRef.current) {
       try {
@@ -351,7 +453,10 @@ export const MoroccoMap: React.FC<MoroccoMapProps> = ({
     tileLayerRef.current = attachTileLayerWithFallback(
       map,
       mapStyle,
-      setTileUnavailable
+      setTileUnavailable,
+      (activeLayer) => {
+        tileLayerRef.current = activeLayer;
+      }
     );
   }, [mapStyle]);
 
@@ -437,8 +542,16 @@ export const MoroccoMap: React.FC<MoroccoMapProps> = ({
       markersGroup.addLayer(marker);
     });
 
-    // Fit initial or filtered bounds when no single marker preview is locking the camera
-    if (validListings.length > 0 && !previewListing && activeCityId === 'all') {
+    // Fit initial or filtered bounds only when the filtered listing set changes
+    const listingsKey = validListings
+      .map((l) => `${l.id}:${l.latitude}:${l.longitude}`)
+      .join('|');
+    if (
+      validListings.length > 0 &&
+      activeCityId === 'all' &&
+      listingsKey !== lastFittedListingsKeyRef.current
+    ) {
+      lastFittedListingsKeyRef.current = listingsKey;
       fitMapToListings(map, validListings);
     }
   }, [listings, selectedListing, previewListing, activeCityId, fitMapToListings]);
@@ -756,7 +869,41 @@ export const SingleLocationMap: React.FC<SingleLocationMapProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const markerRef = useRef<L.Marker | null>(null);
+  const onChangeCoordsRef = useRef(onChangeCoordinates);
+  onChangeCoordsRef.current = onChangeCoordinates;
+  const prevCoordsRef = useRef<{ lat: number; lng: number }>({
+    lat: latitude,
+    lng: longitude,
+  });
   const [tileUnavailable, setTileUnavailable] = useState<boolean>(false);
+
+  const buildPinIcon = useCallback((labelTitle: string) => {
+    return L.divIcon({
+      className: 'darna-single-pin-icon',
+      html: `
+        <div style="
+          background-color: #C15C3D;
+          color: white;
+          font-weight: 700;
+          font-size: 11px;
+          min-height: 40px;
+          padding: 6px 12px;
+          border-radius: 9999px;
+          box-shadow: 0 6px 16px rgba(0,0,0,0.3);
+          border: 2.5px solid white;
+          white-space: nowrap;
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        ">
+          <span>📍</span>
+          <span>${(labelTitle || 'Emplacement').slice(0, 26)}</span>
+        </div>
+      `,
+      iconSize: [150, 40],
+      iconAnchor: [75, 20],
+    });
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -781,45 +928,25 @@ export const SingleLocationMap: React.FC<SingleLocationMapProps> = ({
 
     attachTileLayerWithFallback(map, 'street', setTileUnavailable);
 
-    const pinIcon = L.divIcon({
-      className: 'darna-single-pin-icon',
-      html: `
-        <div style="
-          background-color: #C15C3D;
-          color: white;
-          font-weight: 700;
-          font-size: 11px;
-          min-height: 40px;
-          padding: 6px 12px;
-          border-radius: 9999px;
-          box-shadow: 0 6px 16px rgba(0,0,0,0.3);
-          border: 2.5px solid white;
-          white-space: nowrap;
-          display: inline-flex;
-          align-items: center;
-          gap: 5px;
-        ">
-          <span>📍</span>
-          <span>${title.slice(0, 26)}</span>
-        </div>
-      `,
-      iconSize: [150, 40],
-      iconAnchor: [75, 20],
-    });
-
     const marker = L.marker([latitude, longitude], {
-      icon: pinIcon,
+      icon: buildPinIcon(title),
       draggable: interactivePicker,
     }).addTo(map);
 
-    if (interactivePicker && onChangeCoordinates) {
+    if (interactivePicker) {
       marker.on('dragend', () => {
         const pos = marker.getLatLng();
-        onChangeCoordinates(Number(pos.lat.toFixed(5)), Number(pos.lng.toFixed(5)));
+        onChangeCoordsRef.current?.(
+          Number(pos.lat.toFixed(5)),
+          Number(pos.lng.toFixed(5))
+        );
       });
       map.on('click', (e: L.LeafletMouseEvent) => {
         marker.setLatLng(e.latlng);
-        onChangeCoordinates(Number(e.latlng.lat.toFixed(5)), Number(e.latlng.lng.toFixed(5)));
+        onChangeCoordsRef.current?.(
+          Number(e.latlng.lat.toFixed(5)),
+          Number(e.latlng.lng.toFixed(5))
+        );
       });
     }
 
@@ -851,7 +978,25 @@ export const SingleLocationMap: React.FC<SingleLocationMapProps> = ({
       mapRef.current = null;
       markerRef.current = null;
     };
-  }, [latitude, longitude, title, interactivePicker]);
+  }, [interactivePicker, buildPinIcon]);
+
+  // Update marker position and label without tearing down the Leaflet map instance
+  useEffect(() => {
+    const map = mapRef.current;
+    const marker = markerRef.current;
+    if (!map || !marker) return;
+
+    marker.setIcon(buildPinIcon(title));
+
+    if (
+      prevCoordsRef.current.lat !== latitude ||
+      prevCoordsRef.current.lng !== longitude
+    ) {
+      prevCoordsRef.current = { lat: latitude, lng: longitude };
+      marker.setLatLng([latitude, longitude]);
+      map.setView([latitude, longitude], map.getZoom(), { animate: false });
+    }
+  }, [latitude, longitude, title, buildPinIcon]);
 
   return (
     <div className="rounded-2xl overflow-hidden border border-stone-200 shadow-xs bg-stone-100 relative">

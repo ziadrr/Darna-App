@@ -5016,6 +5016,11 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         prodCsp.includes('https://*.basemaps.cartocdn.com'),
         'Production CSP img-src must include https://*.basemaps.cartocdn.com'
       );
+      assert.equal(
+        prodHealthRes.headers.get('referrer-policy'),
+        'strict-origin-when-cross-origin',
+        'Referrer-Policy must be strict-origin-when-cross-origin so OpenStreetMap tile servers receive the origin Referer'
+      );
     } finally {
       if (savedNodeEnv === undefined) {
         delete process.env.NODE_ENV;
@@ -5025,7 +5030,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     }
 
     // 2. Verify CARTO Voyager tile config, detectRetina, subdomains 'abcd', OpenStreetMap + CARTO attribution,
-    // tileerror fallback to OpenStreetMap, discrete "Fond de carte indisponible" message, and Plan/Relief toggle
+    // tileerror + CARTO watermark fallback to OpenStreetMap, discrete "Fond de carte indisponible" message, and Plan/Relief toggle
     assert.equal(
       CARTO_VOYAGER_TILE_URL,
       'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
@@ -5040,10 +5045,11 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       mapSrc.includes('detectRetina: true') &&
         mapSrc.includes("subdomains: 'abcd'") &&
         mapSrc.includes("on('tileerror'") &&
+        mapSrc.includes('detectCartoWatermarkTile') &&
         mapSrc.includes('Fond de carte indisponible') &&
         mapSrc.includes('Plan') &&
         mapSrc.includes('Relief'),
-      'MoroccoMap.tsx must use CARTO Voyager with detectRetina, subdomains abcd, tileerror fallback to OpenStreetMap, "Fond de carte indisponible" fallback message, and Plan/Relief choice'
+      'MoroccoMap.tsx must use CARTO Voyager with detectRetina, subdomains abcd, tileerror + watermark fallback to OpenStreetMap, "Fond de carte indisponible" fallback message, and Plan/Relief choice'
     );
 
     // 3. Verify markers: "6 500 MAD" price pills, >= 40px touch size, distinct colors for location vs vente,
