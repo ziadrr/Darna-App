@@ -3918,6 +3918,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     const dbPathInstance2 = path.join(os.tmpdir(), `darna-pg-inst2-${Date.now()}.sqlite`);
 
     const inst1 = createDarnaApiApp(dbPathInstance1, { enableCloudSqlSync: true });
+    await inst1.db.hydrateOnce();
     const server1 = http.createServer(inst1.app);
     await new Promise<void>((resolve) => server1.listen(0, '127.0.0.1', resolve));
     const addr1 = server1.address() as { port: number };
@@ -4150,6 +4151,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
 
       // 2D. Simulate a Cloud Run restart on a brand-new empty SQLite file (Instance #2)
       inst2 = createDarnaApiApp(dbPathInstance2, { enableCloudSqlSync: true });
+      await inst2.db.hydrateOnce();
       server2 = http.createServer(inst2.app);
       await new Promise<void>((resolve) => server2!.listen(0, '127.0.0.1', resolve));
       const addr2 = server2.address() as { port: number };
@@ -4865,31 +4867,53 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         'Ignoring DEMO_MODE in production must log an explicit warning'
       );
 
-      const prodRegEmail = `prod.nodemo.${Date.now()}@darna.ma`;
-      const regProdIgnoredRes = await fetch(`${baseUrl}/api/auth/register`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Forwarded-For': '198.51.131.52',
-        },
-        body: JSON.stringify({
-          firstName: 'Tariq',
-          lastName: 'Prod',
-          email: prodRegEmail,
-          password: 'ProdPassword31!',
-          phone: '0661003152',
-          advertiserType: 'particulier',
-          termsAccepted: true,
-        }),
+      const prodDemoDbPath = path.join(os.tmpdir(), `darna-prod-demo-31-${Date.now()}.sqlite`);
+      const prodAppInst = createDarnaApiApp(prodDemoDbPath, {
+        allowLocalFallbackInProd: true,
+        enableCloudSqlSync: false,
       });
-      assert.equal(regProdIgnoredRes.status, 201);
-      const regProdIgnoredData = await regProdIgnoredRes.json();
-      assert.equal(
-        regProdIgnoredData.user.emailVerified,
-        false,
-        'In production without DEMO_MODE_ALLOW_PRODUCTION=true, new accounts must have emailVerified=false'
-      );
-      assert.equal(regProdIgnoredData.demoMode, false);
+      const prodServer = http.createServer(prodAppInst.app);
+      await new Promise<void>((resolve) => prodServer.listen(0, '127.0.0.1', resolve));
+      const prodAddr = prodServer.address() as { port: number };
+      const prodUrl = `http://127.0.0.1:${prodAddr.port}`;
+
+      try {
+        const prodRegEmail = `prod.nodemo.${Date.now()}@darna.ma`;
+        const regProdIgnoredRes = await fetch(`${prodUrl}/api/auth/register`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forwarded-For': '198.51.131.52',
+          },
+          body: JSON.stringify({
+            firstName: 'Tariq',
+            lastName: 'Prod',
+            email: prodRegEmail,
+            password: 'ProdPassword31!',
+            phone: '0661003152',
+            advertiserType: 'particulier',
+            termsAccepted: true,
+          }),
+        });
+        assert.equal(regProdIgnoredRes.status, 201);
+        const regProdIgnoredData = await regProdIgnoredRes.json();
+        assert.equal(
+          regProdIgnoredData.user.emailVerified,
+          false,
+          'In production without DEMO_MODE_ALLOW_PRODUCTION=true, new accounts must have emailVerified=false'
+        );
+        assert.equal(regProdIgnoredData.demoMode, false);
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+        prodAppInst.db.close();
+        if (fs.existsSync(prodDemoDbPath)) {
+          try {
+            fs.unlinkSync(prodDemoDbPath);
+          } catch {
+            // ignore
+          }
+        }
+      }
 
       // 4D. When NODE_ENV=production AND DEMO_MODE=true AND DEMO_MODE_ALLOW_PRODUCTION=true -> DEMO_MODE is active
       process.env.DEMO_MODE_ALLOW_PRODUCTION = 'true';
@@ -4898,6 +4922,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         true,
         'When NODE_ENV=production and DEMO_MODE_ALLOW_PRODUCTION=true, DEMO_MODE=true must be active'
       );
+      process.env.NODE_ENV = savedDemoEnv.NODE_ENV || 'test';
 
       // Check App.tsx contains the Mode démo banner and suppresses EmailVerificationModal when isDemoMode is true
       const appSrc = fs.readFileSync(path.join(process.cwd(), 'src/App.tsx'), 'utf8');

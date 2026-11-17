@@ -24,7 +24,7 @@ const initPromise = (async () => {
     import('./src/server/apiApp.ts'),
     !isProduction ? import('vite') : Promise.resolve(null),
   ]);
-  const { app } = createDarnaApiApp();
+  const { app, db } = createDarnaApiApp();
 
   if (!isProduction && viteModule) {
     const vite = await viteModule.createServer({
@@ -44,7 +44,30 @@ const initPromise = (async () => {
     });
   }
 
+  // Expose app immediately so /api/health never blocks during boot hydration
   innerHandler = app;
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      Promise.all([db.ensureCloudSqlSchemaChecked(), db.hydrateOnce()]),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error('Timeout (15s) lors de l’hydratation initiale Cloud SQL')),
+          15_000
+        );
+        if (typeof timeoutHandle.unref === 'function') {
+          timeoutHandle.unref();
+        }
+      }),
+    ]);
+  } catch (err) {
+    console.error('[CloudSQL] Échec de l’hydratation initiale au démarrage:', err);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 })();
 
 initPromise.catch((err) => {

@@ -440,59 +440,48 @@ export function createDarnaApiApp(
     });
   });
 
-  // Ensure Cloud SQL PostgreSQL state is hydrated before serving /api requests.
-  // In production, never fall back silently to a local SQLite database if PostgreSQL is unconfigured.
-  app.use('/api', async (_req, res, next) => {
+  // Check memorized Cloud SQL readiness before serving /api requests.
+  // Never trigger per-request hydration or blocking queries in middleware.
+  app.use('/api', (req, res, next) => {
     if (
+      req.path === '/health' ||
+      req.path === '/health/' ||
+      req.path === '/system/status' ||
+      req.path === '/system/status/'
+    ) {
+      return next();
+    }
+
+    const isProdRequired =
       process.env.NODE_ENV === 'production' &&
       !customDbPath &&
-      !options?.allowLocalFallbackInProd &&
-      !isCloudSqlConfigured()
-    ) {
+      !options?.allowLocalFallbackInProd;
+
+    if (isProdRequired && !isCloudSqlConfigured()) {
       return res.status(503).json({
         success: false,
         code: 'POSTGRESQL_REQUIRED_IN_PRODUCTION',
         message:
-          "En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré. Le repli silencieux sur une base locale est interdit.",
+          'En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré. Le repli silencieux sur une base locale est interdit.',
       });
     }
 
-    try {
-      await Promise.race([
-        db.ensureCloudSqlHydrated(),
-        new Promise((resolve) => setTimeout(resolve, 4000)),
-      ]);
-    } catch (err: any) {
-      console.error('Failed to hydrate Cloud SQL state:', err);
-      if (
-        process.env.NODE_ENV === 'production' ||
-        String(err?.message || '').includes('POSTGRESQL_REQUIRED_IN_PRODUCTION')
-      ) {
-        return res.status(503).json({
-          success: false,
-          code: 'DATABASE_SYNC_FAILED',
-          message:
-            'Impossible de synchroniser avec PostgreSQL (Cloud SQL). Le repli sur une base locale est interdit en production.',
-        });
-      }
+    if (isProdRequired && !db.isCloudSqlReady()) {
+      return res.status(503).json({
+        success: false,
+        code: 'DATABASE_UNAVAILABLE',
+        message:
+          'Base de données PostgreSQL (Cloud SQL) temporairement indisponible ou en cours d’initialisation.',
+      });
     }
+
     next();
   });
 
   app.get(
     ['/api/system/status', '/api/system/status/', '/api/health', '/api/health/'],
-    async (_req, res) => {
-      const cloudSqlConfigured = isCloudSqlConfigured();
-      if (cloudSqlConfigured) {
-        try {
-          await Promise.race([
-            db.ensureCloudSqlSchemaChecked(),
-            new Promise((resolve) => setTimeout(resolve, 2500)),
-          ]);
-        } catch {
-          // Non-fatal in health endpoint
-        }
-      }
+    (_req, res) => {
+      const cloudSqlState = db.getCloudSqlState();
       const emailConfigured = isEmailServiceConfigured();
       return res.json({
         success: true,
@@ -500,11 +489,14 @@ export function createDarnaApiApp(
         nodeEnv: process.env.NODE_ENV || 'development',
         demoMode: isDemoModeEnabled(false),
         cloudSql: {
-          configured: cloudSqlConfigured,
-          missingTables: db.getMissingCloudSqlTables(),
+          configured: cloudSqlState.configured,
+          ready: cloudSqlState.ready,
+          lastHydratedAt: cloudSqlState.lastHydratedAt,
+          lastError: cloudSqlState.lastError,
+          missingTables: cloudSqlState.missingTables,
         },
         persistence: {
-          postgresqlConfigured: cloudSqlConfigured,
+          postgresqlConfigured: cloudSqlState.configured,
           postgresqlSyncEnabled: db.isCloudSqlSyncEnabled(),
           productionLocalFallbackAllowed: false,
           storageEngine: db.isCloudSqlSyncEnabled() ? 'postgresql_cloudsql' : 'sqlite_local',

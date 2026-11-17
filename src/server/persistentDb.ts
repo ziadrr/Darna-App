@@ -57,9 +57,11 @@ export class DarnaPersistentDb {
   public readonly dbFilePath: string;
   private readonly isCustomTestDb: boolean;
   private readonly enableCloudSqlSync: boolean;
+  private readonly allowLocalFallbackInProd: boolean;
   private simulateCloudSqlFailure = false;
   private cloudSqlHydrated = false;
-  private lastCloudSqlSyncAt = 0;
+  private lastHydratedAt: string | null = null;
+  private lastHydrationError: string | null = null;
   private cloudSqlHydratingPromise: Promise<void> | null = null;
   private imageCleanupInterval: ReturnType<typeof setInterval> | null = null;
   private missingCloudSqlTables: string[] = [];
@@ -76,7 +78,8 @@ export class DarnaPersistentDb {
     }
   ) {
     const isProd = process.env.NODE_ENV === 'production';
-    if (isProd && !customDbPath && !options?.allowLocalFallbackInProd && !isCloudSqlConfigured()) {
+    this.allowLocalFallbackInProd = Boolean(options?.allowLocalFallbackInProd);
+    if (isProd && !customDbPath && !this.allowLocalFallbackInProd && !isCloudSqlConfigured()) {
       throw new Error(
         'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré. Le repli silencieux sur une base locale est interdit.'
       );
@@ -180,6 +183,60 @@ export class DarnaPersistentDb {
     return [...this.missingCloudSqlTables];
   }
 
+  public isCloudSqlReady(): boolean {
+    if (this.simulateCloudSqlFailure) {
+      return false;
+    }
+    if (this.enableCloudSqlSync) {
+      return this.cloudSqlHydrated;
+    }
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !this.allowLocalFallbackInProd &&
+      !this.isCustomTestDb &&
+      !isCloudSqlConfigured()
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  public getCloudSqlState(): {
+    configured: boolean;
+    ready: boolean;
+    lastHydratedAt: string | null;
+    lastError: string | null;
+    missingTables: string[];
+  } {
+    const configured = isCloudSqlConfigured();
+    return {
+      configured,
+      ready: this.enableCloudSqlSync
+        ? this.cloudSqlHydrated && !this.simulateCloudSqlFailure
+        : configured
+          ? this.cloudSqlHydrated && !this.simulateCloudSqlFailure
+          : false,
+      lastHydratedAt: this.lastHydratedAt,
+      lastError: this.lastHydrationError,
+      missingTables: this.getMissingCloudSqlTables(),
+    };
+  }
+
+  private sanitizeHydrationError(rawError: unknown): string {
+    let msg = rawError instanceof Error ? rawError.message : String(rawError || 'Unknown error');
+    for (const secret of [
+      process.env.SQL_HOST,
+      process.env.SQL_USER,
+      process.env.SQL_PASSWORD,
+      process.env.SQL_DB_NAME,
+    ]) {
+      if (secret && secret.trim()) {
+        msg = msg.split(secret).join('[REDACTED]');
+      }
+    }
+    return msg;
+  }
+
   /**
    * Allows testing PostgreSQL connection failure behavior deterministically.
    * When enabled, all write operations reject before modifying local SQLite.
@@ -206,7 +263,13 @@ export class DarnaPersistentDb {
         'CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible, écriture annulée.'
       );
     }
-    if (process.env.NODE_ENV === 'production' && !this.enableCloudSqlSync && !isCloudSqlConfigured()) {
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !this.enableCloudSqlSync &&
+      !this.allowLocalFallbackInProd &&
+      !this.isCustomTestDb &&
+      !isCloudSqlConfigured()
+    ) {
       throw new Error(
         'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré.'
       );
@@ -214,22 +277,32 @@ export class DarnaPersistentDb {
   }
 
   /**
-   * Synchronizes state from Cloud SQL PostgreSQL (when configured) so that restarts
-   * and multi-instance deployments always read authoritative PostgreSQL data.
+   * Hydrates state from Cloud SQL PostgreSQL at most once at boot using a single
+   * shared promise (`cloudSqlHydratingPromise`) and memorized readiness state.
    */
-  public async ensureCloudSqlHydrated(forceRefresh = false): Promise<void> {
+  public async hydrateOnce(): Promise<void> {
     if (this.simulateCloudSqlFailure) {
-      throw new Error('CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible.');
+      const err = new Error('CLOUD_SQL_CONNECTION_FAILURE: Connexion PostgreSQL indisponible.');
+      this.lastHydrationError = err.message;
+      throw err;
     }
-    if (process.env.NODE_ENV === 'production' && !this.enableCloudSqlSync && !isCloudSqlConfigured()) {
-      throw new Error(
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !this.enableCloudSqlSync &&
+      !this.allowLocalFallbackInProd &&
+      !this.isCustomTestDb &&
+      !isCloudSqlConfigured()
+    ) {
+      const err = new Error(
         'POSTGRESQL_REQUIRED_IN_PRODUCTION: En production, PostgreSQL (Cloud SQL) doit obligatoirement être configuré.'
       );
+      this.lastHydrationError = err.message;
+      throw err;
     }
-    if (!this.enableCloudSqlSync) return;
-    const now = Date.now();
-    // Refresh from Cloud SQL across requests for multi-instance consistency (150ms coalescing window)
-    if (this.cloudSqlHydrated && !forceRefresh && now - this.lastCloudSqlSyncAt < 150) {
+    if (!this.enableCloudSqlSync) {
+      return;
+    }
+    if (this.cloudSqlHydrated) {
       return;
     }
     if (this.cloudSqlHydratingPromise) {
@@ -239,7 +312,9 @@ export class DarnaPersistentDb {
     this.cloudSqlHydratingPromise = (async () => {
       try {
         const state = await fetchAllCloudSqlState();
-        if (!state) return;
+        if (!state) {
+          throw new Error('CLOUD_SQL_HYDRATION_FAILED: Aucun état retourné par PostgreSQL.');
+        }
 
         const nowIso = new Date().toISOString();
 
@@ -274,8 +349,6 @@ export class DarnaPersistentDb {
           const allListings = this.getAllListings();
           await Promise.all(allListings.map((l) => syncListingToCloudSql(l)));
         } else if (state.listings.length > 0) {
-          // Reconcile listings so deletions on another instance are reflected
-          this.db.prepare('DELETE FROM listings').run();
           for (const l of state.listings) {
             const sortTime = new Date(l.createdAt || nowIso).getTime() || Date.now();
             this.db
@@ -325,7 +398,6 @@ export class DarnaPersistentDb {
             )
           );
         } else if (state.users.length > 0) {
-          this.db.prepare('DELETE FROM users').run();
           for (const u of state.users) {
             this.db
               .prepare(
@@ -343,8 +415,6 @@ export class DarnaPersistentDb {
           }
         }
 
-        // Reconcile sessions from Cloud SQL (so session revocations apply across all instances)
-        this.db.prepare('DELETE FROM sessions').run();
         for (const s of state.sessions) {
           this.db
             .prepare(
@@ -354,7 +424,6 @@ export class DarnaPersistentDb {
         }
 
         if (state.resetTokens) {
-          this.db.prepare('DELETE FROM password_reset_tokens').run();
           for (const rt of state.resetTokens) {
             this.db
               .prepare(
@@ -364,7 +433,6 @@ export class DarnaPersistentDb {
           }
         }
 
-        this.db.prepare('DELETE FROM transactions').run();
         for (const tx of state.transactions) {
           const rawKey = tx.idempotencyKey || tx.id;
           const scopedKey = rawKey.startsWith(`${tx.userId}:`) ? rawKey : `${tx.userId}:${rawKey}`;
@@ -396,7 +464,6 @@ export class DarnaPersistentDb {
               )
             );
           } else if (state.conversations.length > 0) {
-            this.db.prepare('DELETE FROM conversations').run();
             for (const conv of state.conversations) {
               const sortTime =
                 new Date(conv.lastMessageAt || nowIso).getTime() || Date.now();
@@ -423,13 +490,22 @@ export class DarnaPersistentDb {
         }
 
         this.cloudSqlHydrated = true;
-        this.lastCloudSqlSyncAt = Date.now();
+        this.lastHydratedAt = nowIso;
+        this.lastHydrationError = null;
+      } catch (err) {
+        this.cloudSqlHydrated = false;
+        this.lastHydrationError = this.sanitizeHydrationError(err);
+        throw err;
       } finally {
         this.cloudSqlHydratingPromise = null;
       }
     })();
 
     return this.cloudSqlHydratingPromise;
+  }
+
+  public async ensureCloudSqlHydrated(): Promise<void> {
+    return this.hydrateOnce();
   }
 
   private initSchema(): void {
