@@ -15,6 +15,7 @@ import { User, AdvertiserType } from '../types';
 export interface AuthSuccessMeta {
   isNewRegistration?: boolean;
   verificationEmailSent?: boolean;
+  demoMode?: boolean;
 }
 
 interface AuthModalProps {
@@ -124,7 +125,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             `Le serveur a répondu avec une erreur (code HTTP ${res.status}). Réessaie dans quelques secondes.`
         );
       } else {
-        onAuthSuccess(data.user, data.token, { isNewRegistration: false });
+        onAuthSuccess(data.user, data.token, {
+          isNewRegistration: false,
+          demoMode: Boolean(data.demoMode),
+        });
       }
     } catch (err) {
       console.error(res.status, url, err);
@@ -189,6 +193,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         onAuthSuccess(data.user, data.token, {
           isNewRegistration: true,
           verificationEmailSent: Boolean(data.verificationEmailSent),
+          demoMode: Boolean(data.demoMode),
         });
       }
     } catch (err) {

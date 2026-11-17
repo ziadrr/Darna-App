@@ -106,8 +106,15 @@ export class DarnaPersistentDb {
     this.seedInitialDataIfEmpty();
     this.cleanupOrphanedUploadedImages();
 
-    if (isCloudSqlConfigured() || Array.isArray(this.simulatedCloudSqlTables)) {
+    if (Array.isArray(this.simulatedCloudSqlTables)) {
       void this.checkCloudSqlSchemaTables(this.simulatedCloudSqlTables);
+    } else if (isCloudSqlConfigured()) {
+      const schemaTimer = setTimeout(() => {
+        void this.checkCloudSqlSchemaTables();
+      }, 300);
+      if (typeof schemaTimer.unref === 'function') {
+        schemaTimer.unref();
+      }
     }
 
     const cleanupIntervalMs = Number(

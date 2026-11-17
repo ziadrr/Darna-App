@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { X, Sparkles, Image as ImageIcon, Loader2, Check, ArrowRight, Wand2 } from 'lucide-react';
+import { handleListingImageError } from '../utils/rentalLogic';
 
 interface AiImageStudioModalProps {
   isOpen: boolean;
@@ -250,6 +251,7 @@ export const AiImageStudioModal: React.FC<AiImageStudioModalProps> = ({
                 <img
                   src={generatedImage}
                   alt="Visuel généré par IA"
+                  onError={handleListingImageError}
                   className="w-full max-h-72 object-cover"
                 />
                 <div className="absolute bottom-3 right-3 bg-black/70 backdrop-blur-md px-3 py-1 rounded-full text-[11px] text-white font-medium">

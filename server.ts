@@ -1,5 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -19,12 +20,14 @@ bootApp.listen(PORT, '0.0.0.0', () => {
 });
 
 const initPromise = (async () => {
-  const { createDarnaApiApp } = await import('./src/server/apiApp.ts');
+  const [{ createDarnaApiApp }, viteModule] = await Promise.all([
+    import('./src/server/apiApp.ts'),
+    !isProduction ? import('vite') : Promise.resolve(null),
+  ]);
   const { app } = createDarnaApiApp();
 
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
+  if (!isProduction && viteModule) {
+    const vite = await viteModule.createServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
@@ -51,7 +54,28 @@ initPromise.catch((err) => {
 bootApp.use(async (req, res, next) => {
   try {
     if (!innerHandler) {
-      await initPromise;
+      const isRootProbe =
+        (req.method === 'GET' || req.method === 'HEAD') &&
+        (req.path === '/' || req.path === '/index.html') &&
+        !req.query?.annonce;
+
+      if (isRootProbe) {
+        await Promise.race([
+          initPromise,
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+        if (!innerHandler) {
+          const fallbackHtmlPath = isProduction
+            ? path.join(__dirname, 'dist', 'index.html')
+            : path.join(__dirname, 'index.html');
+          if (fs.existsSync(fallbackHtmlPath)) {
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            return res.status(200).send(fs.readFileSync(fallbackHtmlPath, 'utf8'));
+          }
+        }
+      } else {
+        await initPromise;
+      }
     }
     if (innerHandler) {
       return innerHandler(req, res, next);
@@ -61,3 +85,4 @@ bootApp.use(async (req, res, next) => {
     next(err);
   }
 });
+

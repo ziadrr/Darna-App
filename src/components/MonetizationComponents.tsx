@@ -22,7 +22,11 @@ import {
   User,
   PaymentTransaction
 } from '../types';
-import { isListingBoostActive } from '../utils/rentalLogic';
+import {
+  isListingBoostActive,
+  handleListingImageError,
+  FALLBACK_LISTING_IMAGE_URL,
+} from '../utils/rentalLogic';
 
 interface SubscriptionPlansViewProps {
   plans: SubscriptionPlan[];
@@ -489,8 +493,9 @@ export const BoostListingModal: React.FC<BoostListingModalProps> = ({
           {/* Selected listing summary */}
           <div className="p-3.5 rounded-2xl bg-stone-50 border border-stone-200 flex items-center gap-3">
             <img
-              src={listing.images?.[0]}
+              src={listing.images?.[0] || FALLBACK_LISTING_IMAGE_URL}
               alt={listing.title}
+              onError={handleListingImageError}
               className="w-14 h-14 rounded-xl object-cover shrink-0"
             />
             <div className="min-w-0 flex-1">

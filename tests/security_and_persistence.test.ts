@@ -2716,10 +2716,15 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     });
     assert.equal(validUploadRes.status, 200, 'POST /api/uploads/image must accept valid personal PNG');
     const uploadedPhoto = await validUploadRes.json();
-    assert.equal(uploadedPhoto.mimeType, 'image/png');
+    assert.deepEqual(
+      Object.keys(uploadedPhoto).sort(),
+      ['height', 'id', 'success', 'url', 'width'],
+      'POST /api/uploads/image must return only { success, id, url, width, height } without dataUri'
+    );
+    assert.equal(uploadedPhoto.success, true);
     assert.equal(uploadedPhoto.width, 1);
     assert.equal(uploadedPhoto.height, 1);
-    assert.equal(uploadedPhoto.isPersonalUpload, true);
+    assert.equal('dataUri' in uploadedPhoto, false);
     assert.ok(
       typeof uploadedPhoto.url === 'string' &&
         uploadedPhoto.url.startsWith('/api/uploads/images/'),
@@ -4418,7 +4423,881 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       }
     }
   });
+
+  it('31. Enforces image URL ownership on POST/PUT /api/listings, minimal /api/uploads/image response, per-photo progress/error/retry in PostListingWizard, DEMO_MODE (with production guard & no admin promotion without real verification), and onError fallback on all listing images', async () => {
+    const sharp = (await import('sharp')).default;
+    const { isDemoModeEnabled } = await import('../src/server/apiApp.ts');
+    const {
+      FALLBACK_LISTING_IMAGE_URL,
+      handleListingImageError,
+      formatPhotoUploadErrorMessage,
+    } = await import('../src/utils/rentalLogic.ts');
+
+    const pngBuf = await sharp({
+      create: {
+        width: 20,
+        height: 15,
+        channels: 3,
+        background: { r: 30, g: 61, b: 52 },
+      },
+    })
+      .png()
+      .toBuffer();
+    const pngDataUri = `data:image/png;base64,${pngBuf.toString('base64')}`;
+
+    // =========================================================================
+    // 1 & 2. Minimal /api/uploads/image response + Ownership check on POST & PUT /api/listings + Base64 compatibility
+    // =========================================================================
+    const ownerAId = 'user-img-owner-a-31';
+    const ownerBId = 'user-img-owner-b-31';
+    await dbInstance.createUser(
+      {
+        id: ownerAId,
+        firstName: 'Amine',
+        lastName: 'OwnerA',
+        name: 'Amine OwnerA',
+        email: 'amine.ownera31@darna.ma',
+        phone: '0661003101',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 50,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'OwnerAPass31!'
+    );
+    await dbInstance.createUser(
+      {
+        id: ownerBId,
+        firstName: 'Brahim',
+        lastName: 'OwnerB',
+        name: 'Brahim OwnerB',
+        email: 'brahim.ownerb31@darna.ma',
+        phone: '0661003102',
+        role: 'professionnel',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        subscription: {
+          planId: 'agence',
+          planName: 'Pack Agence Illimité',
+          status: 'active',
+          maxListings: 50,
+          startedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        },
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'OwnerBPass31!'
+    );
+
+    const adminUserId = 'user-img-admin-31';
+    await dbInstance.createUser(
+      {
+        id: adminUserId,
+        firstName: 'Admin',
+        lastName: 'Darna31',
+        name: 'Admin Darna31',
+        email: 'admin.img31@darna.ma',
+        phone: '0661003199',
+        role: 'admin',
+        advertiserType: 'professionnel',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'AdminPass31!'
+    );
+
+    const tokenA = await dbInstance.createSession(ownerAId);
+    const tokenB = await dbInstance.createSession(ownerBId);
+    const adminToken31 = await dbInstance.createSession(adminUserId);
+
+    // User A uploads an image -> response must contain strictly { success, id, url, width, height }
+    const uploadARes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+        'X-Forwarded-For': '198.51.131.1',
+      },
+      body: JSON.stringify({ dataUri: pngDataUri }),
+    });
+    assert.equal(uploadARes.status, 200);
+    const uploadAData = await uploadARes.json();
+    assert.deepEqual(
+      Object.keys(uploadAData).sort(),
+      ['height', 'id', 'success', 'url', 'width'],
+      '/api/uploads/image must return strictly { success, id, url, width, height }'
+    );
+    assert.equal('dataUri' in uploadAData, false, '/api/uploads/image must never return dataUri');
+    assert.equal(uploadAData.success, true);
+    assert.equal(uploadAData.width, 20);
+    assert.equal(uploadAData.height, 15);
+    assert.ok(uploadAData.url.startsWith('/api/uploads/images/'));
+
+    // User B uploads their own image
+    const uploadBRes = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenB}`,
+        'X-Forwarded-For': '198.51.131.2',
+      },
+      body: JSON.stringify({ dataUri: pngDataUri }),
+    });
+    assert.equal(uploadBRes.status, 200);
+    const uploadBData = await uploadBRes.json();
+
+    // POST /api/listings with non-existent /api/uploads/images/non-existent.png -> 400
+    const postMissingImgRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Image Inexistante',
+        description: 'Test image absente',
+        category: 'appartement',
+        price: 6000,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: ['/api/uploads/images/img-does-not-exist-999.png'],
+      }),
+    });
+    assert.equal(
+      postMissingImgRes.status,
+      400,
+      'POST /api/listings must return 400 when /api/uploads/images/... does not exist'
+    );
+
+    // POST /api/listings by User B trying to use User A's uploaded image -> 400
+    const postStolenImgRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenB}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Image Volée',
+        description: 'Tentative utilisation image appartenant à User A',
+        category: 'appartement',
+        price: 6000,
+        city: 'Casablanca',
+        district: 'Maârif',
+        images: [uploadAData.url],
+      }),
+    });
+    assert.equal(
+      postStolenImgRes.status,
+      400,
+      'POST /api/listings must return 400 when /api/uploads/images/... belongs to another user'
+    );
+
+    // POST /api/listings by User A using User A's own image URL -> 201
+    const postOwnImgRes = await fetch(`${baseUrl}/api/listings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        title: 'Annonce Image Propriétaire A',
+        description: 'Publication avec URL /api/uploads/images/... appartenant à A',
+        category: 'appartement',
+        price: 6500,
+        city: 'Casablanca',
+        district: 'Gauthier',
+        images: [uploadAData.url],
+      }),
+    });
+    assert.equal(
+      postOwnImgRes.status,
+      201,
+      'POST /api/listings must accept /api/uploads/images/... when owned by the connected user'
+    );
+    const { listing: listingA } = await postOwnImgRes.json();
+    assert.deepEqual(listingA.images, [uploadAData.url]);
+
+    // PUT /api/listings/:id by User A trying to attach User B's image -> 400
+    const putStolenImgRes = await fetch(`${baseUrl}/api/listings/${listingA.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        images: [uploadBData.url],
+      }),
+    });
+    assert.equal(
+      putStolenImgRes.status,
+      400,
+      'PUT /api/listings/:id must return 400 when /api/uploads/images/... belongs to another user'
+    );
+
+    // PUT /api/listings/:id by User A trying to attach a non-existent image -> 400
+    const putMissingImgRes = await fetch(`${baseUrl}/api/listings/${listingA.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        images: ['/api/uploads/images/img-missing-put-999.jpg'],
+      }),
+    });
+    assert.equal(
+      putMissingImgRes.status,
+      400,
+      'PUT /api/listings/:id must return 400 when /api/uploads/images/... does not exist'
+    );
+
+    // Admin can attach any existing uploaded image on POST and PUT
+    const putAdminImgRes = await fetch(`${baseUrl}/api/listings/${listingA.id}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken31}`,
+      },
+      body: JSON.stringify({
+        images: [uploadBData.url],
+      }),
+    });
+    assert.equal(
+      putAdminImgRes.status,
+      200,
+      'Admin must be allowed to use any existing /api/uploads/images/... URL on PUT /api/listings/:id'
+    );
+
+    // Backward compatibility with existing base64 listings (and direct base64 payloads)
+    const legacyBase64ListingId = 'listing-legacy-base64-31';
+    const rawBase64Listing = dbInstance.getListingById('darna-casa-01')!;
+    await dbInstance.createListing({
+      ...rawBase64Listing,
+      id: legacyBase64ListingId,
+      userId: ownerAId,
+      title: 'Annonce Legacy Base64',
+      images: [pngDataUri],
+    });
+    const getLegacyRes = await fetch(`${baseUrl}/api/listings/${legacyBase64ListingId}`);
+    assert.equal(getLegacyRes.status, 200);
+    const getLegacyCoverRes = await fetch(
+      `${baseUrl}/api/listings/${legacyBase64ListingId}/cover.jpg`
+    );
+    assert.equal(
+      getLegacyCoverRes.status,
+      200,
+      'Existing base64 listings must remain compatible with cover.jpg and GET /api/listings/:id'
+    );
+
+    // =========================================================================
+    // 3. PostListingWizard: URL storage, per-photo progress, specific error messages & retry button
+    // =========================================================================
+    const wizardSrc = fs.readFileSync(
+      path.join(process.cwd(), 'src/components/PostListingWizard.tsx'),
+      'utf8'
+    );
+    assert.ok(
+      wizardSrc.includes('const serverImageUrl: string = data.url;') &&
+        !wizardSrc.includes('const sanitizedUri =') &&
+        wizardSrc.includes('handleRetryPhotoUpload') &&
+        wizardSrc.includes('Réessayer'),
+      'PostListingWizard.tsx must keep data.url from /api/uploads/image and render a Réessayer button'
+    );
+
+    assert.match(
+      formatPhotoUploadErrorMessage(403, 'EMAIL_NOT_VERIFIED', undefined, 'salon.jpg'),
+      /E-mail non vérifié/i
+    );
+    assert.match(
+      formatPhotoUploadErrorMessage(413, 'IMAGE_QUOTA_EXCEEDED', undefined, 'cuisine.jpg'),
+      /Quota atteint/i
+    );
+    assert.match(
+      formatPhotoUploadErrorMessage(429, 'RATE_LIMIT_EXCEEDED', undefined, 'chambre.jpg'),
+      /Trop de demandes/i
+    );
+    assert.match(
+      formatPhotoUploadErrorMessage(503, 'DATABASE_SYNC_FAILED', undefined, 'terrasse.jpg'),
+      /Serveur indisponible/i
+    );
+    assert.match(
+      formatPhotoUploadErrorMessage(0, undefined, undefined, 'jardin.jpg'),
+      /Serveur indisponible/i
+    );
+
+    // =========================================================================
+    // 4. DEMO_MODE: default false, auto-verifies new accounts, shows banner, blocks admin promotion without real verification, and ignores DEMO_MODE in production unless DEMO_MODE_ALLOW_PRODUCTION=true
+    // =========================================================================
+    const savedDemoEnv = {
+      DEMO_MODE: process.env.DEMO_MODE,
+      DEMO_MODE_ALLOW_PRODUCTION: process.env.DEMO_MODE_ALLOW_PRODUCTION,
+      NODE_ENV: process.env.NODE_ENV,
+      ADMIN_EMAILS: process.env.ADMIN_EMAILS,
+    };
+
+    const capturedWarnings: string[] = [];
+    const origConsoleWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      capturedWarnings.push(args.map((a) => String(a)).join(' '));
+      origConsoleWarn(...args);
+    };
+
+    try {
+      // 4A. Default: DEMO_MODE is false
+      delete process.env.DEMO_MODE;
+      delete process.env.DEMO_MODE_ALLOW_PRODUCTION;
+      process.env.NODE_ENV = 'test';
+      assert.equal(isDemoModeEnabled(false), false, 'DEMO_MODE must default to false');
+
+      // 4B. DEMO_MODE=true in non-production: new accounts are created with emailVerified=true,
+      // demoMode=true is returned, and even an email in ADMIN_EMAILS is NOT promoted to admin!
+      process.env.DEMO_MODE = 'true';
+      const demoAdminCandidateEmail = `admin.candidate.${Date.now()}@darna.ma`;
+      process.env.ADMIN_EMAILS = demoAdminCandidateEmail;
+
+      assert.equal(isDemoModeEnabled(false), true, 'DEMO_MODE=true must be active in non-production');
+
+      const regDemoRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.131.50',
+        },
+        body: JSON.stringify({
+          firstName: 'Salma',
+          lastName: 'Demo',
+          email: demoAdminCandidateEmail,
+          password: 'DemoPassword31!',
+          phone: '0661003150',
+          advertiserType: 'particulier',
+          termsAccepted: true,
+        }),
+      });
+      assert.equal(regDemoRes.status, 201);
+      const regDemoData = await regDemoRes.json();
+      assert.equal(
+        regDemoData.demoMode,
+        true,
+        'POST /api/auth/register must return demoMode=true when DEMO_MODE=true'
+      );
+      assert.equal(
+        regDemoData.user.emailVerified,
+        true,
+        'New accounts created when DEMO_MODE=true must have emailVerified=true'
+      );
+      assert.equal(
+        regDemoData.verificationEmailSent,
+        false,
+        'Verification email must not be sent on registration when DEMO_MODE=true'
+      );
+      assert.notEqual(
+        regDemoData.user.role,
+        'admin',
+        'Promotion to admin must be IMPOSSIBLE via DEMO_MODE=true alone without real email verification'
+      );
+
+      // Verify admin endpoint rejects this demo-verified user with 403
+      const demoAdminAttemptRes = await fetch(`${baseUrl}/api/users`, {
+        headers: {
+          Authorization: `Bearer ${regDemoData.token}`,
+        },
+      });
+      assert.equal(
+        demoAdminAttemptRes.status,
+        403,
+        'User registered in DEMO_MODE=true with an ADMIN_EMAILS address must NOT have admin access before real email verification'
+      );
+
+      // Verify that real email verification (6-digit code) is still required to promote an ADMIN_EMAILS user to admin
+      const realVerifyToken = await dbInstance.createEmailVerificationToken(
+        regDemoData.user.id,
+        demoAdminCandidateEmail
+      );
+      const realVerifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${regDemoData.token}`,
+          'X-Forwarded-For': '198.51.131.51',
+        },
+        body: JSON.stringify({
+          email: demoAdminCandidateEmail,
+          verificationToken: realVerifyToken,
+        }),
+      });
+      assert.equal(realVerifyRes.status, 200);
+      const realVerifyData = await realVerifyRes.json();
+      assert.equal(
+        realVerifyData.user.role,
+        'admin',
+        'Real 6-digit email verification must promote an authorized ADMIN_EMAILS account to admin'
+      );
+
+      // 4C. In production (NODE_ENV=production), DEMO_MODE=true is ignored with a warning unless DEMO_MODE_ALLOW_PRODUCTION=true
+      process.env.NODE_ENV = 'production';
+      process.env.DEMO_MODE = 'true';
+      delete process.env.DEMO_MODE_ALLOW_PRODUCTION;
+      capturedWarnings.length = 0;
+
+      assert.equal(
+        isDemoModeEnabled(true),
+        false,
+        'When NODE_ENV=production and DEMO_MODE_ALLOW_PRODUCTION is not true, DEMO_MODE=true must be ignored'
+      );
+      assert.ok(
+        capturedWarnings.some(
+          (w) => w.includes('DEMO_MODE=true') && w.includes('DEMO_MODE_ALLOW_PRODUCTION')
+        ),
+        'Ignoring DEMO_MODE in production must log an explicit warning'
+      );
+
+      const prodRegEmail = `prod.nodemo.${Date.now()}@darna.ma`;
+      const regProdIgnoredRes = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '198.51.131.52',
+        },
+        body: JSON.stringify({
+          firstName: 'Tariq',
+          lastName: 'Prod',
+          email: prodRegEmail,
+          password: 'ProdPassword31!',
+          phone: '0661003152',
+          advertiserType: 'particulier',
+          termsAccepted: true,
+        }),
+      });
+      assert.equal(regProdIgnoredRes.status, 201);
+      const regProdIgnoredData = await regProdIgnoredRes.json();
+      assert.equal(
+        regProdIgnoredData.user.emailVerified,
+        false,
+        'In production without DEMO_MODE_ALLOW_PRODUCTION=true, new accounts must have emailVerified=false'
+      );
+      assert.equal(regProdIgnoredData.demoMode, false);
+
+      // 4D. When NODE_ENV=production AND DEMO_MODE=true AND DEMO_MODE_ALLOW_PRODUCTION=true -> DEMO_MODE is active
+      process.env.DEMO_MODE_ALLOW_PRODUCTION = 'true';
+      assert.equal(
+        isDemoModeEnabled(true),
+        true,
+        'When NODE_ENV=production and DEMO_MODE_ALLOW_PRODUCTION=true, DEMO_MODE=true must be active'
+      );
+
+      // Check App.tsx contains the Mode démo banner and suppresses EmailVerificationModal when isDemoMode is true
+      const appSrc = fs.readFileSync(path.join(process.cwd(), 'src/App.tsx'), 'utf8');
+      assert.ok(
+        appSrc.includes('data-testid="demo-mode-banner"') &&
+          appSrc.includes('Mode démo') &&
+          appSrc.includes('!isDemoMode'),
+        'App.tsx must display a Mode démo banner and suppress EmailVerificationModal when DEMO_MODE is active'
+      );
+    } finally {
+      console.warn = origConsoleWarn;
+      for (const [k, v] of Object.entries(savedDemoEnv)) {
+        if (v === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = v;
+        }
+      }
+    }
+
+    // =========================================================================
+    // 5. Fallback image onError on all listing <img> elements
+    // =========================================================================
+    assert.equal(FALLBACK_LISTING_IMAGE_URL, '/og-default.png');
+    const fakeImgTarget = {
+      src: 'https://example.com/broken-image.jpg',
+      dataset: {} as DOMStringMap,
+    };
+    handleListingImageError({ currentTarget: fakeImgTarget as unknown as HTMLImageElement });
+    assert.equal(
+      fakeImgTarget.src,
+      '/og-default.png',
+      'handleListingImageError must replace broken image src with /og-default.png'
+    );
+    assert.equal(fakeImgTarget.dataset.fallbackApplied, 'true');
+
+    const imgComponentFiles = [
+      'src/components/ListingCard.tsx',
+      'src/components/ListingDetailModal.tsx',
+      'src/components/PostListingWizard.tsx',
+      'src/components/UserProfileModal.tsx',
+      'src/components/MoroccoMap.tsx',
+      'src/components/AdminDashboard.tsx',
+      'src/components/MonetizationComponents.tsx',
+      'src/components/ConversationsBannerAndModal.tsx',
+    ];
+    for (const relPath of imgComponentFiles) {
+      const content = fs.readFileSync(path.join(process.cwd(), relPath), 'utf8');
+      assert.ok(
+        content.includes('onError={handleListingImageError}'),
+        `${relPath} must attach onError={handleListingImageError} on its listing <img> tags`
+      );
+    }
+  });
+
+  it('32. MoroccoMap clarity & mobile/desktop UX: local Leaflet CSS & icons (unpkg removed from HTML & CSP), CARTO Voyager + CSP + OSM tileerror fallback + unavailable message, clustered MAD price pills (>=40px, location vs vente, selected foreground), >=65vh mobile layout + fitBounds/minZoom/maxBounds, two-finger gesture handling, and invalidateSize on view switch/resize', async () => {
+    const {
+      CARTO_VOYAGER_TILE_URL,
+      CARTO_VOYAGER_ATTRIBUTION,
+      OSM_FALLBACK_TILE_URL,
+      MOROCCO_MIN_ZOOM,
+      MOROCCO_MAX_BOUNDS,
+      formatMapMarkerPriceMAD,
+      getMapMarkerColors,
+    } = await import('../src/utils/rentalLogic.ts');
+
+    // 1. Verify index.html no longer references unpkg.com and MoroccoMap.tsx imports local Leaflet CSS & default marker icons
+    const indexHtml = fs.readFileSync(path.join(process.cwd(), 'index.html'), 'utf8');
+    assert.equal(
+      indexHtml.includes('unpkg.com'),
+      false,
+      'index.html must not load Leaflet CSS from unpkg.com'
+    );
+
+    const mapSrc = fs.readFileSync(
+      path.join(process.cwd(), 'src/components/MoroccoMap.tsx'),
+      'utf8'
+    );
+    assert.ok(
+      mapSrc.includes("import 'leaflet/dist/leaflet.css'"),
+      "MoroccoMap.tsx must import 'leaflet/dist/leaflet.css'"
+    );
+    assert.ok(
+      mapSrc.includes('leaflet/dist/images/marker-icon.png') &&
+        mapSrc.includes('leaflet/dist/images/marker-icon-2x.png') &&
+        mapSrc.includes('leaflet/dist/images/marker-shadow.png') &&
+        mapSrc.includes('L.Icon.Default.mergeOptions'),
+      'MoroccoMap.tsx must configure default marker icons from the local leaflet package'
+    );
+
+    // Verify CSP in both dev and production removes https://unpkg.com and includes https://*.basemaps.cartocdn.com in img-src
+    const savedNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'development';
+      const devHealthRes = await fetch(`${baseUrl}/api/health`);
+      const devCsp = devHealthRes.headers.get('content-security-policy') || '';
+      assert.equal(
+        devCsp.includes('unpkg.com'),
+        false,
+        'Development CSP must no longer include https://unpkg.com'
+      );
+      assert.ok(
+        devCsp.includes('https://*.basemaps.cartocdn.com'),
+        'Development CSP img-src must include https://*.basemaps.cartocdn.com'
+      );
+
+      process.env.NODE_ENV = 'production';
+      const prodHealthRes = await fetch(`${baseUrl}/api/health`);
+      const prodCsp = prodHealthRes.headers.get('content-security-policy') || '';
+      assert.equal(
+        prodCsp.includes('unpkg.com'),
+        false,
+        'Production CSP must no longer include https://unpkg.com'
+      );
+      assert.ok(
+        prodCsp.includes('https://*.basemaps.cartocdn.com'),
+        'Production CSP img-src must include https://*.basemaps.cartocdn.com'
+      );
+    } finally {
+      if (savedNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = savedNodeEnv;
+      }
+    }
+
+    // 2. Verify CARTO Voyager tile config, detectRetina, subdomains 'abcd', OpenStreetMap + CARTO attribution,
+    // tileerror fallback to OpenStreetMap, discrete "Fond de carte indisponible" message, and Plan/Relief toggle
+    assert.equal(
+      CARTO_VOYAGER_TILE_URL,
+      'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+    );
+    assert.ok(
+      CARTO_VOYAGER_ATTRIBUTION.includes('OpenStreetMap') &&
+        CARTO_VOYAGER_ATTRIBUTION.includes('CARTO'),
+      'Attribution must include both OpenStreetMap and CARTO'
+    );
+    assert.ok(OSM_FALLBACK_TILE_URL.includes('tile.openstreetmap.org'));
+    assert.ok(
+      mapSrc.includes('detectRetina: true') &&
+        mapSrc.includes("subdomains: 'abcd'") &&
+        mapSrc.includes("on('tileerror'") &&
+        mapSrc.includes('Fond de carte indisponible') &&
+        mapSrc.includes('Plan') &&
+        mapSrc.includes('Relief'),
+      'MoroccoMap.tsx must use CARTO Voyager with detectRetina, subdomains abcd, tileerror fallback to OpenStreetMap, "Fond de carte indisponible" fallback message, and Plan/Relief choice'
+    );
+
+    // 3. Verify markers: "6 500 MAD" price pills, >= 40px touch size, distinct colors for location vs vente,
+    // leaflet.markercluster grouping, and selected marker brought to foreground (zIndexOffset)
+    assert.equal(formatMapMarkerPriceMAD(6500), '6 500 MAD');
+    assert.equal(formatMapMarkerPriceMAD(1250000), '1 250 000 MAD');
+
+    const rentalMarker = getMapMarkerColors('location', false);
+    const saleMarker = getMapMarkerColors('vente', false);
+    const selectedMarker = getMapMarkerColors('location', true);
+
+    assert.notEqual(
+      rentalMarker.backgroundColor,
+      saleMarker.backgroundColor,
+      'Rental and sale markers must have distinct colors'
+    );
+    assert.ok(
+      selectedMarker.zIndexOffset > saleMarker.zIndexOffset &&
+        selectedMarker.zIndexOffset > rentalMarker.zIndexOffset,
+      'Selected marker must have highest zIndexOffset to appear in the foreground'
+    );
+    assert.ok(
+      mapSrc.includes('min-height: 40px') &&
+        mapSrc.includes("import 'leaflet.markercluster'") &&
+        mapSrc.includes('markerClusterGroup') &&
+        mapSrc.includes('zIndexOffset: markerTheme.zIndexOffset'),
+      'MoroccoMap.tsx must enforce >=40px marker height, leaflet.markercluster grouping, and foreground zIndexOffset'
+    );
+
+    // 4. Verify layout (mobile >= 65vh full width with list below, desktop grid), fitBounds, minZoom 5, and maxBounds around Morocco
+    assert.equal(MOROCCO_MIN_ZOOM, 5);
+    assert.equal(MOROCCO_MAX_BOUNDS.length, 2);
+    assert.ok(
+      mapSrc.includes('min-h-[65vh]') &&
+        mapSrc.includes('grid-cols-1 lg:grid-cols-3') &&
+        mapSrc.includes('fitBounds') &&
+        mapSrc.includes('minZoom: MOROCCO_MIN_ZOOM') &&
+        mapSrc.includes('maxBounds: moroccoBounds'),
+      'MoroccoMap.tsx must have >=65vh mobile height, desktop 3-column grid, fitBounds, minZoom 5, and maxBounds around Morocco'
+    );
+
+    // 5. Verify gesture handling on mobile (leaflet-gesture-handling + two-finger touch handling)
+    assert.ok(
+      mapSrc.includes("import 'leaflet-gesture-handling'") &&
+        mapSrc.includes('gestureHandling: true') &&
+        mapSrc.includes('Utilisez deux doigts pour déplacer la carte'),
+      'MoroccoMap.tsx must use leaflet-gesture-handling and two-finger touch handling so mobile scroll is not hijacked'
+    );
+
+    // 6. Verify invalidateSize on view switch ("Liste" -> "Carte") and window resize
+    assert.ok(
+      mapSrc.includes('invalidateSize') &&
+        mapSrc.includes("window.addEventListener('resize'") &&
+        mapSrc.includes('ResizeObserver') &&
+        mapSrc.includes('IntersectionObserver'),
+      'MoroccoMap.tsx must call invalidateSize on view switch and window resize'
+    );
+  });
+
+  it('33. PostListingWizard.tsx: 6-step split, no auto-advance/scroll on option choice, scroll-to-top + heading focus on step change, background scroll lock + overscroll/overflow-anchor, and smooth scroll only to first invalid field on Next', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const {
+      POST_LISTING_WIZARD_STEPS,
+      getWizardProgressPercentage,
+      validateWizardStep,
+      resetWizardStepScrollAndFocus,
+      scrollToFirstInvalidField,
+      lockBackgroundPageScroll,
+    } = await import('../src/utils/rentalLogic.ts');
+
+    const wizardPath = path.resolve(process.cwd(), 'src/components/PostListingWizard.tsx');
+    const wizardSrc = fs.readFileSync(wizardPath, 'utf-8');
+
+    // 1. Verify Step 1 is split into two screens ("Offre et type de bien", then "Localisation et titre") with 6-step progress bar
+    assert.equal(POST_LISTING_WIZARD_STEPS.length, 6, 'Wizard must have 6 steps');
+    assert.equal(POST_LISTING_WIZARD_STEPS[0].label, 'Offre et type de bien');
+    assert.equal(POST_LISTING_WIZARD_STEPS[1].label, 'Localisation et titre');
+    assert.equal(POST_LISTING_WIZARD_STEPS[2].label, 'Détails & Prix');
+    assert.equal(POST_LISTING_WIZARD_STEPS[3].label, 'Photos & IA');
+    assert.equal(POST_LISTING_WIZARD_STEPS[4].label, 'Contact & Confidentialité');
+    assert.equal(POST_LISTING_WIZARD_STEPS[5].label, 'Aperçu');
+
+    assert.equal(getWizardProgressPercentage(1), 17);
+    assert.equal(getWizardProgressPercentage(3), 50);
+    assert.equal(getWizardProgressPercentage(6), 100);
+
+    assert.ok(
+      wizardSrc.includes('wizard-step-1-offer-and-type') &&
+        wizardSrc.includes('wizard-step-2-location-and-title') &&
+        wizardSrc.includes('wizard-progress-bar') &&
+        wizardSrc.includes('role="progressbar"'),
+      'PostListingWizard.tsx must render separate Step 1 (Offre et type de bien) and Step 2 (Localisation et titre) screens and an updated progress bar'
+    );
+
+    // 2. Verify selecting an option (À louer / À vendre, type de bien, etc.) NEVER scrolls or changes step
+    const txHandlerMatch = wizardSrc.match(
+      /const handleTransactionTypeChange\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n  \};/
+    );
+    assert.ok(txHandlerMatch, 'handleTransactionTypeChange must exist');
+    assert.ok(
+      !txHandlerMatch[0].includes('setStep') &&
+        !txHandlerMatch[0].includes('goToStep') &&
+        !txHandlerMatch[0].includes('scrollIntoView') &&
+        !txHandlerMatch[0].includes('scrollTo'),
+      'handleTransactionTypeChange must never change step or scroll'
+    );
+
+    const catHandlerMatch = wizardSrc.match(
+      /const handleCategoryChange\s*=\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n  \};/
+    );
+    assert.ok(catHandlerMatch, 'handleCategoryChange must exist');
+    assert.ok(
+      !catHandlerMatch[0].includes('setStep') &&
+        !catHandlerMatch[0].includes('goToStep') &&
+        !catHandlerMatch[0].includes('scrollIntoView') &&
+        !catHandlerMatch[0].includes('scrollTo'),
+      'handleCategoryChange must never change step or scroll'
+    );
+
+    // 3. Verify every step change (next, prev, step pill click) resets scroll container to top and focuses step heading with preventScroll: true
+    let scrollToArgs: any = null;
+    let focusArgs: any = null;
+    const mockScrollContainer = {
+      scrollTop: 420,
+      scrollTo: (opts: any) => {
+        scrollToArgs = opts;
+      },
+    };
+    const mockStepHeading = {
+      focus: (opts?: FocusOptions) => {
+        focusArgs = opts;
+      },
+    };
+
+    resetWizardStepScrollAndFocus(mockScrollContainer, mockStepHeading);
+    assert.equal(mockScrollContainer.scrollTop, 0, 'scrollContainer.scrollTop must be reset to 0');
+    assert.deepEqual(scrollToArgs, { top: 0, left: 0, behavior: 'auto' });
+    assert.deepEqual(
+      focusArgs,
+      { preventScroll: true },
+      'Step heading must receive focus with preventScroll: true'
+    );
+    assert.ok(
+      wizardSrc.includes('ref={stepTitleRef}') &&
+        wizardSrc.includes('tabIndex={-1}') &&
+        wizardSrc.includes('data-testid="wizard-step-heading"'),
+      'Step heading must be a focusable non-input element (tabIndex={-1}) so mobile keyboard never opens'
+    );
+
+    // 4. Verify background page scroll lock while modal is open (restored on close without jump) and overscroll-behavior: contain + overflow-anchor: none
+    let restoredScroll: [number, number] | null = null;
+    const mockDoc: any = {
+      documentElement: {
+        scrollTop: 350,
+        scrollLeft: 0,
+        style: { overscrollBehavior: '' },
+      },
+      body: {
+        style: {
+          overflow: '',
+          position: '',
+          top: '',
+          left: '',
+          right: '',
+          width: '',
+        },
+      },
+    };
+    const mockWin: any = {
+      scrollY: 350,
+      scrollX: 0,
+      scrollTo: (x: number, y: number) => {
+        restoredScroll = [x, y];
+      },
+    };
+
+    const unlock = lockBackgroundPageScroll(mockDoc, mockWin);
+    assert.equal(mockDoc.body.style.overflow, 'hidden');
+    assert.equal(mockDoc.body.style.position, 'fixed');
+    assert.equal(mockDoc.body.style.top, '-350px');
+    assert.equal(mockDoc.documentElement.style.overscrollBehavior, 'none');
+
+    unlock();
+    assert.equal(mockDoc.body.style.overflow, '');
+    assert.equal(mockDoc.body.style.position, '');
+    assert.equal(mockDoc.body.style.top, '');
+    assert.deepEqual(
+      restoredScroll,
+      [0, 350],
+      'Closing wizard must restore exact previous scrollY without jump'
+    );
+
+    assert.ok(
+      wizardSrc.includes('overscroll-contain') &&
+        wizardSrc.includes('[overscroll-behavior:contain]') &&
+        wizardSrc.includes('[overflow-anchor:none]'),
+      'Form scroll container must include overscroll-behavior: contain and overflow-anchor: none'
+    );
+
+    // 5. Verify smooth scroll ONLY happens on invalid field when clicking "Étape suivante"
+    const baseValidInput = {
+      transactionType: 'location' as const,
+      category: 'appartement',
+      city: 'Casablanca',
+      district: 'Maârif',
+      title: 'Bel appartement 2 chambres au Maârif',
+      price: 6500,
+      surface: 80,
+      description: 'Très bel appartement lumineux et calme proche des commodités.',
+      images: ['/api/uploads/images/img-test.jpg'],
+      showPhone: false,
+      showWhatsApp: false,
+      contactPhone: '0661234567',
+      phoneConsentAccepted: false,
+      legalConsentAccepted: true,
+    };
+
+    assert.equal(validateWizardStep(1, baseValidInput).length, 0);
+
+    const step2InvalidErrors = validateWizardStep(2, { ...baseValidInput, title: 'Court'.slice(0, 3) });
+    assert.equal(step2InvalidErrors.length, 1);
+    assert.equal(step2InvalidErrors[0].field, 'title');
+
+    let scrolledField: string | null = null;
+    let scrolledOptions: ScrollIntoViewOptions | undefined;
+    const fakeContainer = {
+      querySelector: (selector: string) => {
+        if (selector === '[data-field="title"]') {
+          return {
+            scrollIntoView: (opts?: ScrollIntoViewOptions) => {
+              scrolledField = 'title';
+              scrolledOptions = opts;
+            },
+          } as any;
+        }
+        return null;
+      },
+    };
+
+    const didScroll = scrollToFirstInvalidField(fakeContainer, step2InvalidErrors);
+    assert.equal(didScroll, true);
+    assert.equal(scrolledField, 'title');
+    assert.deepEqual(scrolledOptions, { behavior: 'smooth', block: 'center' });
+
+    // Ensure scrollIntoView is not called anywhere directly in PostListingWizard.tsx outside scrollToFirstInvalidField
+    assert.equal(
+      wizardSrc.includes('.scrollIntoView('),
+      false,
+      'PostListingWizard.tsx must only scroll via scrollToFirstInvalidField when validation fails'
+    );
+  });
 });
+
 
 
 

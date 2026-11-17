@@ -33,6 +33,8 @@ import {
   getTransactionBadgeLabel,
   hasDemoImages,
   getConfiguredAppOrigin,
+  handleListingImageError,
+  FALLBACK_LISTING_IMAGE_URL,
 } from '../utils/rentalLogic';
 import { AudioTourPlayer } from './AudioTourPlayer';
 import { SingleLocationMap } from './MoroccoMap';
@@ -276,8 +278,9 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
             className="relative rounded-2xl overflow-hidden bg-stone-900 aspect-[16/10] sm:aspect-[16/9] shadow-md"
           >
             <img
-              src={images[activePhotoIdx] || images[0]}
+              src={images[activePhotoIdx] || images[0] || FALLBACK_LISTING_IMAGE_URL}
               alt={`${listing.title} - photo ${activePhotoIdx + 1}`}
+              onError={handleListingImageError}
               className="w-full h-full object-cover transition-all duration-500"
             />
             {isDemoOrStock && (
@@ -622,8 +625,9 @@ export const ListingDetailModal: React.FC<ListingDetailModalProps> = ({
                     className="p-2.5 rounded-2xl border border-stone-200 hover:border-[#C15C3D] bg-stone-50/60 hover:bg-white cursor-pointer transition-all flex sm:flex-col gap-3"
                   >
                     <img
-                      src={sim.images?.[0]}
+                      src={sim.images?.[0] || FALLBACK_LISTING_IMAGE_URL}
                       alt={sim.title}
+                      onError={handleListingImageError}
                       className="w-20 h-20 sm:w-full sm:h-28 rounded-xl object-cover shrink-0"
                     />
                     <div className="min-w-0 flex-1">

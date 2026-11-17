@@ -12,7 +12,7 @@ import {
   LogIn,
 } from 'lucide-react';
 import { ConversationThread, User } from '../types';
-import { formatMAD } from '../utils/rentalLogic';
+import { formatMAD, handleListingImageError } from '../utils/rentalLogic';
 
 interface ConversationsBannerProps {
   currentUser: User | null;
@@ -125,6 +125,7 @@ export const ConversationsBanner: React.FC<ConversationsBannerProps> = ({
                     <img
                       src={conv.listingImage}
                       alt={conv.listingTitle}
+                      onError={handleListingImageError}
                       className="w-12 h-12 rounded-xl object-cover shrink-0 border border-white/20"
                     />
                   ) : (
@@ -280,6 +281,7 @@ export const ConversationsModal: React.FC<ConversationsModalProps> = ({
                         <img
                           src={conv.listingImage}
                           alt={conv.listingTitle}
+                          onError={handleListingImageError}
                           className="w-12 h-12 rounded-xl object-cover shrink-0 border border-stone-200"
                         />
                       ) : (

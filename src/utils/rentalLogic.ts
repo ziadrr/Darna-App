@@ -52,6 +52,25 @@ export function hasDemoImages(listing: Partial<Listing> | null | undefined): boo
 }
 
 /**
+ * Default replacement image URL when a listing image fails to load
+ */
+export const FALLBACK_LISTING_IMAGE_URL = '/og-default.png';
+
+/**
+ * Shared onError handler for all listing <img> elements to swap broken URLs with FALLBACK_LISTING_IMAGE_URL
+ */
+export function handleListingImageError(e: { currentTarget: HTMLImageElement }): void {
+  const img = e.currentTarget;
+  if (img && !img.src.endsWith(FALLBACK_LISTING_IMAGE_URL)) {
+    img.onerror = null;
+    if (img.dataset) {
+      img.dataset.fallbackApplied = 'true';
+    }
+    img.src = FALLBACK_LISTING_IMAGE_URL;
+  }
+}
+
+/**
  * Return the configured public origin for share links
  */
 export function getConfiguredAppOrigin(): string {
@@ -657,3 +676,399 @@ export function getSimilarListings(target: Listing, allListings: Listing[], limi
     })
     .slice(0, limit);
 }
+
+/**
+ * Formats specific per-file error messages for photo uploads in the listing deposit wizard.
+ */
+export function formatPhotoUploadErrorMessage(
+  status: number,
+  code?: string,
+  serverMessage?: string,
+  fileName?: string
+): string {
+  const prefix = fileName ? `« ${fileName} » : ` : '';
+  if (status === 403 || code === 'EMAIL_NOT_VERIFIED') {
+    return `${prefix}E-mail non vérifié — veuillez vérifier votre adresse e-mail avant de téléverser des photos.`;
+  }
+  if (status === 413 || code === 'IMAGE_QUOTA_EXCEEDED') {
+    return `${prefix}Quota atteint — vous avez atteint la limite de 60 photos ou 100 Mo cumulés.`;
+  }
+  if (status === 429 || code === 'RATE_LIMIT_EXCEEDED') {
+    return `${prefix}Trop de demandes — limite de 30 envois par heure atteinte. Veuillez patienter avant de réessayer.`;
+  }
+  if (
+    status === 0 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    status >= 500 ||
+    code === 'DATABASE_SYNC_FAILED'
+  ) {
+    return `${prefix}Serveur indisponible — le service de stockage est temporairement injoignable. Cliquez sur « Réessayer ».`;
+  }
+  if (code === 'IMAGE_TOO_LARGE') {
+    return `${prefix}La taille décodée de cette photo dépasse la limite autorisée de 5 Mo.`;
+  }
+  if (code === 'INVALID_IMAGE_TYPE' || code === 'INVALID_IMAGE_CONTENT') {
+    return (
+      serverMessage ||
+      `${prefix}Format d’image non autorisé. Utilisez uniquement JPEG, PNG, WebP ou GIF.`
+    );
+  }
+  return (
+    serverMessage ||
+    `${prefix}Échec du téléversement sécurisé (code HTTP ${status}). Cliquez sur « Réessayer ».`
+  );
+}
+
+/**
+ * Map tile layer URLs, attributions, and Morocco bounding constants
+ */
+export const CARTO_VOYAGER_TILE_URL =
+  'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
+export const CARTO_VOYAGER_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>';
+
+export const OSM_FALLBACK_TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+export const OSM_FALLBACK_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+
+export const TOPO_TILE_URL =
+  'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}';
+export const TOPO_ATTRIBUTION =
+  'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, GeoBase';
+
+export const MOROCCO_MIN_ZOOM = 5;
+export const MOROCCO_MAX_BOUNDS: [[number, number], [number, number]] = [
+  [20.0, -18.5],
+  [37.5, -0.5],
+];
+
+/**
+ * Formats a listing price as a compact, high-contrast map marker pill label (e.g. "6 500 MAD")
+ */
+export function formatMapMarkerPriceMAD(price: number): string {
+  const safePrice = Math.max(0, Math.round(Number(price) || 0));
+  const formatted = new Intl.NumberFormat('fr-FR', {
+    style: 'decimal',
+    maximumFractionDigits: 0,
+  })
+    .format(safePrice)
+    .replace(/[\u202F\u00A0]/g, ' ');
+  return `${formatted} MAD`;
+}
+
+/**
+ * Returns high-contrast colors and z-index priority for map markers (distinct for location vs vente, and foreground for selected)
+ */
+export function getMapMarkerColors(
+  transactionType: TransactionType = 'location',
+  isSelected: boolean = false
+): {
+  backgroundColor: string;
+  borderColor: string;
+  textColor: string;
+  zIndexOffset: number;
+  badgeLabel: string;
+} {
+  if (isSelected) {
+    return {
+      backgroundColor: '#1E3D34',
+      borderColor: '#FBBF24',
+      textColor: '#FFFFFF',
+      zIndexOffset: 1000,
+      badgeLabel: 'Sélectionnée',
+    };
+  }
+  if (transactionType === 'vente') {
+    return {
+      backgroundColor: '#0F4C81',
+      borderColor: '#FFFFFF',
+      textColor: '#FFFFFF',
+      zIndexOffset: 100,
+      badgeLabel: 'Vente',
+    };
+  }
+  return {
+    backgroundColor: '#C15C3D',
+    borderColor: '#FFFFFF',
+    textColor: '#FFFFFF',
+    zIndexOffset: 0,
+    badgeLabel: 'Location',
+  };
+}
+
+/**
+ * 6-step configuration for PostListingWizard after splitting Step 1 into
+ * "Offre et type de bien" (Step 1) and "Localisation et titre" (Step 2).
+ */
+export type WizardStepNumber = 1 | 2 | 3 | 4 | 5 | 6;
+
+export interface WizardStepConfig {
+  num: WizardStepNumber;
+  label: string;
+  heading: string;
+  progressWidthClass: string;
+}
+
+export const POST_LISTING_WIZARD_STEPS: ReadonlyArray<WizardStepConfig> = [
+  {
+    num: 1,
+    label: 'Offre et type de bien',
+    heading: 'Étape 1 : Offre et type de bien',
+    progressWidthClass: 'w-1/6',
+  },
+  {
+    num: 2,
+    label: 'Localisation et titre',
+    heading: 'Étape 2 : Localisation et titre',
+    progressWidthClass: 'w-2/6',
+  },
+  {
+    num: 3,
+    label: 'Détails & Prix',
+    heading: 'Étape 3 : Détails et prix du bien',
+    progressWidthClass: 'w-3/6',
+  },
+  {
+    num: 4,
+    label: 'Photos & IA',
+    heading: 'Étape 4 : Photos personnelles du bien',
+    progressWidthClass: 'w-4/6',
+  },
+  {
+    num: 5,
+    label: 'Contact & Confidentialité',
+    heading: 'Étape 5 : Contact et confidentialité',
+    progressWidthClass: 'w-5/6',
+  },
+  {
+    num: 6,
+    label: 'Aperçu',
+    heading: 'Étape 6 : Prévisualisation de votre annonce',
+    progressWidthClass: 'w-full',
+  },
+];
+
+export function getWizardProgressPercentage(step: WizardStepNumber): number {
+  return Math.round((step / POST_LISTING_WIZARD_STEPS.length) * 100);
+}
+
+export interface WizardStepValidationInput {
+  transactionType: TransactionType;
+  category: string;
+  city: string;
+  district: string;
+  title: string;
+  price: number;
+  surface: number;
+  description: string;
+  images: string[];
+  showPhone: boolean;
+  showWhatsApp: boolean;
+  contactPhone: string;
+  phoneConsentAccepted: boolean;
+  legalConsentAccepted: boolean;
+}
+
+/**
+ * Validates a single step of the 6-step listing deposit wizard in top-to-bottom DOM field order.
+ */
+export function validateWizardStep(
+  step: WizardStepNumber,
+  input: WizardStepValidationInput
+): ValidationError[] {
+  const errors: ValidationError[] = [];
+
+  if (step === 1) {
+    if (input.transactionType !== 'location' && input.transactionType !== 'vente') {
+      errors.push({
+        field: 'transactionType',
+        message: "Veuillez choisir le type d'offre (À louer ou À vendre).",
+      });
+    }
+    if (!input.category || !input.category.trim()) {
+      errors.push({
+        field: 'category',
+        message: 'Veuillez sélectionner un type de bien.',
+      });
+    }
+  } else if (step === 2) {
+    if (!input.city || !input.district) {
+      errors.push({
+        field: 'location',
+        message: 'Veuillez sélectionner la ville et le quartier.',
+      });
+    }
+    if (!input.title || input.title.trim().length < 5) {
+      errors.push({
+        field: 'title',
+        message: 'Le titre doit faire au moins 5 caractères.',
+      });
+    } else if (detectContactInPublicText(input.title).hasContactInfo) {
+      errors.push({
+        field: 'title',
+        message:
+          'Pour votre sécurité, ne mettez pas de numéro de téléphone, e-mail ou lien dans le titre public.',
+      });
+    }
+  } else if (step === 3) {
+    if (!input.price || input.price <= 0 || !input.surface || input.surface <= 0) {
+      errors.push({
+        field: 'specs',
+        message: 'Le prix et la superficie doivent être supérieurs à 0.',
+      });
+    }
+    if (!input.description || input.description.trim().length < 20) {
+      errors.push({
+        field: 'description',
+        message: 'La description doit faire au moins 20 caractères.',
+      });
+    } else if (detectContactInPublicText(input.description).hasContactInfo) {
+      errors.push({
+        field: 'description',
+        message:
+          'Veuillez retirer les numéros de téléphone, adresses e-mail ou liens de la description publique.',
+      });
+    }
+  } else if (step === 4) {
+    if (!Array.isArray(input.images) || input.images.length === 0) {
+      errors.push({
+        field: 'images',
+        message: 'Veuillez ajouter au moins une photo.',
+      });
+    }
+  } else if (step === 5) {
+    if (
+      (input.showPhone || input.showWhatsApp) &&
+      (!input.contactPhone || input.contactPhone.trim().length < 8)
+    ) {
+      errors.push({
+        field: 'contactPhone',
+        message: 'Un numéro de téléphone marocain valide est requis.',
+      });
+    }
+    if ((input.showPhone || input.showWhatsApp) && !input.phoneConsentAccepted) {
+      errors.push({
+        field: 'phoneConsent',
+        message:
+          'Vous devez donner votre accord explicite avant de rendre votre numéro visible aux utilisateurs connectés.',
+      });
+    }
+    if (!input.legalConsentAccepted) {
+      errors.push({
+        field: 'legal',
+        message: 'Veuillez accepter les conditions et certifier votre autorisation.',
+      });
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Resets the wizard form scroll container to the very top (scrollTop = 0)
+ * and moves focus to the step heading with preventScroll: true so the mobile virtual keyboard never opens.
+ */
+export function resetWizardStepScrollAndFocus(
+  scrollContainer:
+    | {
+        scrollTop: number;
+        scrollTo?: (options?: ScrollToOptions) => void;
+      }
+    | null
+    | undefined,
+  stepTitleEl:
+    | {
+        focus?: (options?: FocusOptions) => void;
+      }
+    | null
+    | undefined
+): void {
+  if (scrollContainer) {
+    scrollContainer.scrollTop = 0;
+    if (typeof scrollContainer.scrollTo === 'function') {
+      try {
+        scrollContainer.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+      } catch {
+        // scrollTop = 0 is already set above as fallback
+      }
+    }
+  }
+  if (stepTitleEl && typeof stepTitleEl.focus === 'function') {
+    try {
+      stepTitleEl.focus({ preventScroll: true });
+    } catch {
+      stepTitleEl.focus();
+    }
+  }
+}
+
+/**
+ * Smoothly scrolls to the first invalid field inside the wizard scroll container.
+ * This is the ONLY automatic scroll permitted in the listing deposit wizard.
+ */
+export function scrollToFirstInvalidField(
+  scrollContainer: { querySelector?: (selector: string) => Element | null } | null | undefined,
+  errors: ReadonlyArray<ValidationError>
+): boolean {
+  if (!scrollContainer || typeof scrollContainer.querySelector !== 'function') {
+    return false;
+  }
+  if (!errors || errors.length === 0) {
+    return false;
+  }
+  for (const err of errors) {
+    const target = scrollContainer.querySelector(
+      `[data-field="${err.field}"]`
+    ) as (Element & { scrollIntoView?: (arg?: ScrollIntoViewOptions) => void }) | null;
+    if (target && typeof target.scrollIntoView === 'function') {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Locks background page scrolling while the wizard modal is open and restores
+ * the exact scroll position without any visual jump when closed.
+ */
+export function lockBackgroundPageScroll(
+  doc: Document = document,
+  win: Window = window
+): () => void {
+  const scrollY = win.scrollY || win.pageYOffset || doc.documentElement?.scrollTop || 0;
+  const scrollX = win.scrollX || win.pageXOffset || doc.documentElement?.scrollLeft || 0;
+  const body = doc.body;
+  const html = doc.documentElement;
+
+  const prevBodyOverflow = body.style.overflow;
+  const prevBodyPosition = body.style.position;
+  const prevBodyTop = body.style.top;
+  const prevBodyLeft = body.style.left;
+  const prevBodyRight = body.style.right;
+  const prevBodyWidth = body.style.width;
+  const prevHtmlOverscroll = html.style.overscrollBehavior;
+
+  html.style.overscrollBehavior = 'none';
+  body.style.overflow = 'hidden';
+  body.style.position = 'fixed';
+  body.style.top = `-${scrollY}px`;
+  body.style.left = `-${scrollX}px`;
+  body.style.right = '0px';
+  body.style.width = '100%';
+
+  return () => {
+    html.style.overscrollBehavior = prevHtmlOverscroll;
+    body.style.overflow = prevBodyOverflow;
+    body.style.position = prevBodyPosition;
+    body.style.top = prevBodyTop;
+    body.style.left = prevBodyLeft;
+    body.style.right = prevBodyRight;
+    body.style.width = prevBodyWidth;
+    win.scrollTo(scrollX, scrollY);
+  };
+}
+
+

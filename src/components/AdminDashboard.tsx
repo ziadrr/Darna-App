@@ -31,7 +31,13 @@ import {
   BoostOption,
   PaymentTransaction
 } from '../types';
-import { formatMAD, calculateRevenueSummary, getUserListingQuota } from '../utils/rentalLogic';
+import {
+  formatMAD,
+  calculateRevenueSummary,
+  getUserListingQuota,
+  handleListingImageError,
+  FALLBACK_LISTING_IMAGE_URL,
+} from '../utils/rentalLogic';
 
 interface AdminDashboardProps {
   listings: Listing[];
@@ -869,8 +875,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 >
                   <div className="flex gap-4 items-start">
                     <img
-                      src={listing.images[0] || 'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=400&q=80'}
+                      src={listing.images[0] || FALLBACK_LISTING_IMAGE_URL}
                       alt={listing.title}
+                      onError={handleListingImageError}
                       className="w-24 h-24 rounded-xl object-cover shrink-0 border border-stone-200"
                     />
                     <div>
@@ -1091,7 +1098,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             {users.map((u) => (
               <div key={u.id} className="bg-white p-4 rounded-2xl border border-stone-200 shadow-xs space-y-2">
                 <div className="flex items-center gap-3">
-                  <img src={u.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80'} alt={u.name} className="w-10 h-10 rounded-full object-cover" />
+                  <img
+                    src={u.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80'}
+                    alt={u.name}
+                    onError={handleListingImageError}
+                    className="w-10 h-10 rounded-full object-cover"
+                  />
                   <div>
                     <h4 className="font-bold text-xs text-stone-900">{u.name}</h4>
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-stone-100 text-stone-700 uppercase">

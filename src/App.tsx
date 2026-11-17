@@ -98,6 +98,9 @@ export default function App() {
   const [verifyAlreadySentOnRegister, setVerifyAlreadySentOnRegister] = useState(false);
   const [verifyReasonMessage, setVerifyReasonMessage] = useState<string | undefined>(undefined);
   const [pendingPostVerifyAction, setPendingPostVerifyAction] = useState<'post_ad' | null>(null);
+  const [isDemoMode, setIsDemoMode] = useState<boolean>(() =>
+    Boolean((import.meta as any)?.env?.VITE_DEMO_MODE === 'true')
+  );
 
   // Conversations & Internal Messaging State
   const [conversations, setConversations] = useState<ConversationThread[]>([]);
@@ -274,6 +277,7 @@ export default function App() {
       if (data.success) {
         if (Array.isArray(data.plans)) setPlans(data.plans);
         if (Array.isArray(data.boostOptions)) setBoostOptions(data.boostOptions);
+        if (typeof data.demoMode === 'boolean') setIsDemoMode(data.demoMode);
       }
     } catch (err) {
       console.warn('Fallback to default monetization config:', err);
@@ -371,6 +375,9 @@ export default function App() {
       })
         .then((res) => res.json())
         .then((data) => {
+          if (typeof data.demoMode === 'boolean') {
+            setIsDemoMode(data.demoMode);
+          }
           if (data.success && data.user) {
             setCurrentUser(data.user);
             setFavorites(data.user.favorites || []);
@@ -477,13 +484,17 @@ export default function App() {
     setCurrentUser(user);
     setFavorites(user.favorites || []);
     setIsAuthModalOpen(false);
+    const activeDemoMode = typeof meta?.demoMode === 'boolean' ? meta.demoMode : isDemoMode;
+    if (typeof meta?.demoMode === 'boolean') {
+      setIsDemoMode(meta.demoMode);
+    }
 
     const updatedListings = await fetchListings(token);
     await fetchPaymentData(token, user.role);
 
     if (pendingAction) {
       if (pendingAction.type === 'post_ad') {
-        if (!user.emailVerified) {
+        if (!user.emailVerified && !activeDemoMode) {
           setPendingPostVerifyAction('post_ad');
           setVerifyAlreadySentOnRegister(Boolean(meta?.verificationEmailSent));
           setVerifyReasonMessage(
@@ -534,7 +545,7 @@ export default function App() {
         setIsConversationsModalOpen(true);
       }
       setPendingAction(null);
-    } else if (meta?.isNewRegistration && !user.emailVerified) {
+    } else if (meta?.isNewRegistration && !user.emailVerified && !activeDemoMode) {
       setPendingPostVerifyAction(null);
       setVerifyAlreadySentOnRegister(Boolean(meta.verificationEmailSent));
       setVerifyReasonMessage(undefined);
@@ -756,7 +767,7 @@ export default function App() {
       return;
     }
     // Just-in-time email verification when attempting to publish a listing
-    if (!currentUser.emailVerified) {
+    if (!currentUser.emailVerified && !isDemoMode) {
       setPendingPostVerifyAction('post_ad');
       setVerifyAlreadySentOnRegister(false);
       setVerifyReasonMessage(
@@ -1104,6 +1115,19 @@ export default function App() {
         <div className="fixed top-4 right-4 z-50 bg-[#1E3D34] text-white px-5 py-3 rounded-2xl shadow-xl flex items-center gap-3 border border-emerald-500/30 animate-fade-in text-xs sm:text-sm font-semibold">
           <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
           <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Demo Mode Banner */}
+      {isDemoMode && (
+        <div
+          role="status"
+          data-testid="demo-mode-banner"
+          className="bg-amber-400 text-stone-950 px-4 py-2 text-center text-xs font-extrabold border-b border-amber-500 flex items-center justify-center gap-2"
+        >
+          <span>
+            Mode démo : les nouveaux comptes sont créés avec l’e-mail vérifié automatiquement (la promotion en administrateur reste impossible sans vérification réelle d’e-mail).
+          </span>
         </div>
       )}
 
@@ -1988,9 +2012,9 @@ export default function App() {
         onAuthSuccess={handleAuthSuccess}
       />
 
-      {currentUser && (
+      {currentUser && !isDemoMode && (
         <EmailVerificationModal
-          isOpen={isEmailVerifyModalOpen}
+          isOpen={isEmailVerifyModalOpen && !isDemoMode}
           onClose={() => {
             setIsEmailVerifyModalOpen(false);
             setPendingPostVerifyAction(null);

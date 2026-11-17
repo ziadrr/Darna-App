@@ -17,6 +17,8 @@ import {
   getListingTransactionType,
   getTransactionBadgeLabel,
   hasDemoImages,
+  handleListingImageError,
+  FALLBACK_LISTING_IMAGE_URL,
 } from '../utils/rentalLogic';
 
 interface ListingCardProps {
@@ -88,9 +90,10 @@ export const ListingCard: React.FC<ListingCardProps> = ({
         {images.map((imgUrl, idx) => (
           <img
             key={`${listing.id}-img-${idx}`}
-            src={imgUrl}
+            src={imgUrl || FALLBACK_LISTING_IMAGE_URL}
             alt={`${listing.title} - photo ${idx + 1}`}
             loading={idx === 0 ? 'lazy' : 'eager'}
+            onError={handleListingImageError}
             className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ease-in-out ${
               idx === activePhotoIdx ? 'opacity-100 z-[1]' : 'opacity-0 z-0 pointer-events-none'
             }`}

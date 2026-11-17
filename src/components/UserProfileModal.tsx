@@ -27,7 +27,9 @@ import {
 import {
   formatMAD,
   isListingBoostActive,
-  getUserListingQuota
+  getUserListingQuota,
+  handleListingImageError,
+  FALLBACK_LISTING_IMAGE_URL
 } from '../utils/rentalLogic';
 
 interface UserProfileModalProps {
@@ -261,11 +263,9 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
                       >
                         <div className="flex items-center gap-3">
                           <img
-                            src={
-                              listing.images[0] ||
-                              'https://images.unsplash.com/photo-1586023492125-27b2c045efd7?auto=format&fit=crop&w=200&q=80'
-                            }
+                            src={listing.images[0] || FALLBACK_LISTING_IMAGE_URL}
                             alt={listing.title}
+                            onError={handleListingImageError}
                             className="w-16 h-16 rounded-xl object-cover shrink-0 border border-stone-200"
                           />
                           <div>
@@ -527,8 +527,9 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
                   >
                     <div className="flex items-center gap-3">
                       <img
-                        src={listing.images[0]}
+                        src={listing.images[0] || FALLBACK_LISTING_IMAGE_URL}
                         alt={listing.title}
+                        onError={handleListingImageError}
                         className="w-14 h-14 rounded-xl object-cover shrink-0"
                       />
                       <div>

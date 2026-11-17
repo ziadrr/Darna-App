@@ -271,6 +271,31 @@ export function validateListingImages(images: unknown): {
   return { valid: true };
 }
 
+/**
+ * Evaluates whether DEMO_MODE is active.
+ * - Defaults to false.
+ * - If DEMO_MODE=true and NODE_ENV=production without DEMO_MODE_ALLOW_PRODUCTION=true,
+ *   DEMO_MODE is ignored and a security warning is logged.
+ */
+export function isDemoModeEnabled(logWarning = true): boolean {
+  const rawDemo = String(process.env.DEMO_MODE || 'false').trim().toLowerCase();
+  if (rawDemo !== 'true') {
+    return false;
+  }
+  if (
+    process.env.NODE_ENV === 'production' &&
+    String(process.env.DEMO_MODE_ALLOW_PRODUCTION || 'false').trim().toLowerCase() !== 'true'
+  ) {
+    if (logWarning) {
+      console.warn(
+        '[Security] DEMO_MODE=true est ignoré en production (NODE_ENV=production) car DEMO_MODE_ALLOW_PRODUCTION n’est pas défini à true.'
+      );
+    }
+    return false;
+  }
+  return true;
+}
+
 export function createDarnaApiApp(
   customDbPath?: string,
   options?: {
@@ -282,6 +307,7 @@ export function createDarnaApiApp(
   app: express.Express;
   db: DarnaPersistentDb;
 } {
+  isDemoModeEnabled(true);
   const db = new DarnaPersistentDb(customDbPath, options);
   const app = express();
 
@@ -292,11 +318,11 @@ export function createDarnaApiApp(
     "'self'",
     'data:',
     'blob:',
+    'https://*.basemaps.cartocdn.com',
     'https://*.tile.openstreetmap.org',
     'https://tile.openstreetmap.org',
     'https://server.arcgisonline.com',
     'https://images.unsplash.com',
-    'https://unpkg.com',
   ];
 
   const baseConnectSrc = [
@@ -304,6 +330,7 @@ export function createDarnaApiApp(
     'https://*.googleapis.com',
     'https://*.firebaseio.com',
     'https://*.firebaseapp.com',
+    'https://*.basemaps.cartocdn.com',
     'https://*.tile.openstreetmap.org',
     'https://tile.openstreetmap.org',
     'https://server.arcgisonline.com',
@@ -328,7 +355,6 @@ export function createDarnaApiApp(
           "'self'",
           "'unsafe-inline'",
           'https://fonts.googleapis.com',
-          'https://unpkg.com',
         ],
         fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
         imgSrc: sharedImgSrc,
@@ -357,7 +383,6 @@ export function createDarnaApiApp(
           "'self'",
           "'unsafe-inline'",
           'https://fonts.googleapis.com',
-          'https://unpkg.com',
         ],
         fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
         imgSrc: sharedImgSrc,
@@ -467,6 +492,7 @@ export function createDarnaApiApp(
         success: true,
         version: '2026-11-11-v2',
         nodeEnv: process.env.NODE_ENV || 'development',
+        demoMode: isDemoModeEnabled(false),
         cloudSql: {
           configured: cloudSqlConfigured,
           missingTables: db.getMissingCloudSqlTables(),
@@ -927,7 +953,10 @@ export function createDarnaApiApp(
         });
       }
 
-      // Never auto-promote at registration: everyone starts as particulier/professionnel with emailVerified=false
+      // Never auto-promote to admin at registration: everyone starts as particulier/professionnel.
+      // Even when DEMO_MODE=true sets emailVerified=true for regular user testing, admin promotion
+      // remains strictly IMPOSSIBLE without a real cryptographic email verification code.
+      const demoModeActive = isDemoModeEnabled(true);
       const role: User['role'] =
         advertiserType === 'professionnel' ? 'professionnel' : 'particulier';
 
@@ -946,7 +975,7 @@ export function createDarnaApiApp(
         role,
         advertiserType: advertiserType === 'professionnel' ? 'professionnel' : 'particulier',
         verified: false,
-        emailVerified: false,
+        emailVerified: demoModeActive ? true : false,
         favorites: [],
         subscription: {
           planId: defaultPlan.id,
@@ -962,7 +991,7 @@ export function createDarnaApiApp(
       const savedUser = await db.createUser(newUser, String(password));
       const token = await db.createSession(savedUser.id);
 
-      // Automatically send the 6-digit verification code + magic link upon registration when SMTP is configured
+      // Automatically send the 6-digit verification code + magic link upon registration when SMTP is configured and not in demo mode
       let verificationEmailSent = false;
       const smtpConfigured = isEmailServiceConfigured();
       if (!savedUser.emailVerified && smtpConfigured) {
@@ -994,6 +1023,7 @@ export function createDarnaApiApp(
         token,
         verificationEmailSent,
         smtpConfigured,
+        demoMode: demoModeActive,
       });
     } catch (err: any) {
       console.error(
@@ -1047,7 +1077,7 @@ export function createDarnaApiApp(
 
       loginRateLimiter.delete(loginKey);
       const token = await db.createSession(user.id);
-      return res.json({ success: true, user, token });
+      return res.json({ success: true, user, token, demoMode: isDemoModeEnabled(false) });
     } catch (err: any) {
       console.error(
         '[POST /api/auth/login]',
@@ -1775,9 +1805,9 @@ export function createDarnaApiApp(
     try {
       const viewer = getAuthUser(req);
       if (!viewer) {
-        return res.status(401).json({ success: false, user: null });
+        return res.status(401).json({ success: false, user: null, demoMode: isDemoModeEnabled(false) });
       }
-      return res.json({ success: true, user: viewer });
+      return res.json({ success: true, user: viewer, demoMode: isDemoModeEnabled(false) });
     } catch (err) {
       console.error(
         '[GET /api/auth/me]',
@@ -2157,12 +2187,14 @@ export function createDarnaApiApp(
   }
 
   /**
-   * Ensures every image submitted on POST/PUT /api/listings is validated, stripped of EXIF metadata
-   * via sharp if sent as base64, and stored in dedicated image storage rather than kept inline as base64.
+   * Ensures every image submitted on POST/PUT /api/listings is validated:
+   * - If sent as /api/uploads/images/..., verifies the image exists AND belongs to the connected user (or viewer is admin), returning 400 otherwise.
+   * - If sent as base64 data URI (backward compatibility), validates, strips EXIF metadata via sharp, and stores in dedicated storage.
    */
   async function processAndSanitizeListingImages(
     rawImages: unknown,
-    userId: string
+    viewer: User,
+    targetOwnerId?: string
   ): Promise<{
     valid: boolean;
     images?: string[];
@@ -2181,6 +2213,7 @@ export function createDarnaApiApp(
       return { valid: true, images: [] };
     }
 
+    const effectiveStoreUserId = targetOwnerId || viewer.id;
     const processedUrls: string[] = [];
     for (const item of rawImages) {
       const trimmed = String(item || '').trim();
@@ -2199,7 +2232,7 @@ export function createDarnaApiApp(
         const sanitized = await sanitizeAndStoreImageBuffer(
           parsed.buffer,
           parsed.mimeType,
-          userId
+          effectiveStoreUserId
         );
         if (!sanitized.valid || !sanitized.saved) {
           return {
@@ -2222,6 +2255,14 @@ export function createDarnaApiApp(
             valid: false,
             code: 'IMAGE_NOT_FOUND',
             message: 'L’image téléversée référencée est introuvable sur le serveur.',
+          };
+        }
+        if (existingImg.userId !== viewer.id && viewer.role !== 'admin') {
+          return {
+            valid: false,
+            code: 'IMAGE_OWNERSHIP_FORBIDDEN',
+            message:
+              "Vous n'êtes pas autorisé à utiliser une photo appartenant à un autre utilisateur.",
           };
         }
         processedUrls.push(`/api/uploads/images/${path.basename(trimmed)}`);
@@ -2442,16 +2483,8 @@ export function createDarnaApiApp(
         success: true,
         id: sanitized.saved.id,
         url: sanitized.saved.url,
-        imageUrl: sanitized.saved.url,
-        dataUri: sanitized.saved.url,
-        dataUrl: sanitized.saved.url,
-        mimeType: sanitized.saved.mimeType,
         width: sanitized.saved.width,
         height: sanitized.saved.height,
-        sizeBytes: sanitized.saved.sizeBytes,
-        exifStripped: true,
-        isDemo: false,
-        isPersonalUpload: true,
       });
     } catch (err) {
       console.error('Error in POST /api/uploads/image:', err);
@@ -2488,6 +2521,7 @@ export function createDarnaApiApp(
     try {
       const processedImages = await processAndSanitizeListingImages(
         req.body?.images,
+        viewer,
         viewer.id
       );
       if (!processedImages.valid) {
@@ -2568,6 +2602,7 @@ export function createDarnaApiApp(
       if (req.body?.images !== undefined) {
         const processedImages = await processAndSanitizeListingImages(
           req.body.images,
+          viewer,
           existing.userId
         );
         if (!processedImages.valid) {
@@ -2785,6 +2820,7 @@ export function createDarnaApiApp(
     const liveConfigured = false;
     res.json({
       success: true,
+      demoMode: isDemoModeEnabled(false),
       plans: db.getAllPlans(),
       boostOptions: db.getAllBoostOptions(),
       paymentGateway: {
