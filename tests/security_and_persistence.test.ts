@@ -3519,10 +3519,10 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
 
     // -------------------------------------------------------------------------
-    // 3. Per-User Quota: 60 images max and 100 MB cumulative max by default (413 in French)
+    // 3. Per-User Quota: 30 images max and 40 MB cumulative max by default (413 in French)
     //    (overridable via IMAGE_UPLOAD_MAX_USER_COUNT and IMAGE_UPLOAD_MAX_USER_BYTES)
     // -------------------------------------------------------------------------
-    // 3A. 60 images maximum per user by default
+    // 3A. 30 images maximum per user by default
     const countQuotaUserId = 'user-upload-quota-count-28';
     await dbInstance.createUser(
       {
@@ -3543,7 +3543,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
     const countQuotaToken = await dbInstance.createSession(countQuotaUserId);
 
-    for (let i = 1; i <= 60; i++) {
+    for (let i = 1; i <= 30; i++) {
       await dbInstance.saveUploadedImage({
         id: `img-quota-cnt-${i}`,
         userId: countQuotaUserId,
@@ -3553,7 +3553,7 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
         buffer: validTinyPngBuffer,
       });
     }
-    assert.equal(dbInstance.getUserUploadedImageStats(countQuotaUserId).count, 60);
+    assert.equal(dbInstance.getUserUploadedImageStats(countQuotaUserId).count, 30);
 
     const overCountRes = await fetch(`${baseUrl}/api/uploads/image`, {
       method: 'POST',
@@ -3567,22 +3567,22 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(
       overCountRes.status,
       413,
-      '61st image for a user must be rejected with HTTP 413 by default'
+      '31st image for a user must be rejected with HTTP 413 by default'
     );
     const overCountBody = await overCountRes.json();
     assert.match(
       String(overCountBody.message || ''),
-      /quota|60 images|100 Mo/i,
-      '413 count quota message must be in French and mention 60 images and 100 Mo'
+      /30 images et 40 Mo/,
+      '413 count quota message must be in French and mention 30 images and 40 Mo'
     );
     assert.equal(
       dbInstance.getUserUploadedImageStats(countQuotaUserId).count,
-      60,
+      30,
       'Over-quota image must not be saved in uploaded_images'
     );
 
     // Verify IMAGE_UPLOAD_MAX_USER_COUNT override works
-    process.env.IMAGE_UPLOAD_MAX_USER_COUNT = '61';
+    process.env.IMAGE_UPLOAD_MAX_USER_COUNT = '31';
     try {
       const overrideCountRes = await fetch(`${baseUrl}/api/uploads/image`, {
         method: 'POST',
@@ -3596,13 +3596,13 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       assert.equal(
         overrideCountRes.status,
         200,
-        'Setting IMAGE_UPLOAD_MAX_USER_COUNT=61 must allow the 61st image'
+        'Setting IMAGE_UPLOAD_MAX_USER_COUNT=31 must allow the 31st image'
       );
     } finally {
       delete process.env.IMAGE_UPLOAD_MAX_USER_COUNT;
     }
 
-    // 3B. 100 MB cumulative maximum per user by default
+    // 3B. 40 MB cumulative maximum per user by default
     const bytesQuotaUserId = 'user-upload-quota-bytes-28';
     await dbInstance.createUser(
       {
@@ -3623,10 +3623,10 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     );
     const bytesQuotaToken = await dbInstance.createSession(bytesQuotaUserId);
 
-    const max100Mb = 100 * 1024 * 1024;
-    // Seed 1 image with sizeBytes = 100 MB - 10 bytes so the next upload exceeds 100 MB
+    const max100Mb = 40 * 1024 * 1024;
+    // Seed 1 image with sizeBytes = 40 MB - 10 bytes so the next upload exceeds 40 MB
     await dbInstance.saveUploadedImage({
-      id: 'img-quota-bytes-almost-100mb',
+      id: 'img-quota-bytes-almost-40mb',
       userId: bytesQuotaUserId,
       mimeType: 'image/png',
       width: 16,
@@ -3648,13 +3648,13 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
     assert.equal(
       overBytesRes.status,
       413,
-      'Upload exceeding 100 MB cumulative per-user quota must return HTTP 413'
+      'Upload exceeding 40 MB cumulative per-user quota must return HTTP 413'
     );
     const overBytesBody = await overBytesRes.json();
     assert.match(
       String(overBytesBody.message || ''),
-      /quota|100 Mo/i,
-      '413 byte quota message must be in French and mention 100 Mo'
+      /40 Mo/,
+      '413 byte quota message must be in French and mention 40 Mo'
     );
     assert.equal(
       dbInstance.getUserUploadedImageStats(bytesQuotaUserId).count,
@@ -5542,11 +5542,101 @@ describe('Darna Security, Authentication, RBAC, Real SMTP Email & Persistence Su
       }
     }
   });
+
+  it('35. Rejects foreign / http / internal image URLs on POST & PUT /api/listings (INVALID_IMAGE_URL) and only tolerates Unsplash demo photos outside production or in demo mode', async () => {
+    const urlUserId = 'user-image-url-allowlist-35';
+    await dbInstance.createUser(
+      {
+        id: urlUserId,
+        firstName: 'Nadia',
+        lastName: 'UrlCheck',
+        name: 'Nadia UrlCheck',
+        email: 'nadia.urlcheck35@darna.ma',
+        phone: '0661003535',
+        role: 'particulier',
+        advertiserType: 'particulier',
+        verified: true,
+        emailVerified: true,
+        favorites: [],
+        createdAt: new Date().toISOString().split('T')[0],
+      },
+      'UrlCheckPass35!'
+    );
+    const urlToken = await dbInstance.createSession(urlUserId);
+    const basePayload = {
+      title: 'Appartement Agdal test URL images',
+      description: 'Appartement lumineux proche du tramway, quartier Agdal à Rabat.',
+      category: 'appartement',
+      price: 5200,
+      period: 'mois',
+      surface: 70,
+      rooms: 3,
+      bedrooms: 2,
+      bathrooms: 1,
+      city: 'Rabat',
+      district: 'Agdal',
+    };
+    const postListing = (images: string[]) =>
+      fetch(`${baseUrl}/api/listings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${urlToken}` },
+        body: JSON.stringify({ ...basePayload, images }),
+      });
+
+    for (const badUrl of [
+      'http://images.unsplash.com/photo-1522708323590-d24dbb6b0267',
+      'https://tracker.example.com/pixel.jpg',
+      '/api/auth/me.png',
+    ]) {
+      const res = await postListing([badUrl]);
+      assert.equal(res.status, 400, `Image URL ${badUrl} must be rejected`);
+      const body = await res.json();
+      assert.equal(body.code, 'INVALID_IMAGE_URL');
+    }
+
+    const okRes = await postListing(['https://images.unsplash.com/photo-1522708323590-d24dbb6b0267']);
+    assert.equal(okRes.status, 201, 'Unsplash demo photo stays allowed outside production');
+    const created = (await okRes.json()).listing;
+    assert.ok(created?.id);
+
+    const putBad = await fetch(`${baseUrl}/api/listings/${created.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${urlToken}` },
+      body: JSON.stringify({ images: ['https://evil.example.org/photo.webp'] }),
+    });
+    assert.equal(putBad.status, 400);
+    assert.equal((await putBad.json()).code, 'INVALID_IMAGE_URL');
+
+    const { isAllowedDemoImageUrl } = await import('../src/server/apiApp');
+    const prevEnv = {
+      NODE_ENV: process.env.NODE_ENV,
+      DEMO_MODE: process.env.DEMO_MODE,
+      DEMO_MODE_ALLOW_PRODUCTION: process.env.DEMO_MODE_ALLOW_PRODUCTION,
+      SEED_DEMO_DATA: process.env.SEED_DEMO_DATA,
+    };
+    const restore = () => {
+      for (const [k, v] of Object.entries(prevEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    };
+    try {
+      const demoUrl = 'https://images.unsplash.com/photo-1522708323590-d24dbb6b0267';
+      process.env.NODE_ENV = 'production';
+      delete process.env.DEMO_MODE;
+      delete process.env.DEMO_MODE_ALLOW_PRODUCTION;
+      delete process.env.SEED_DEMO_DATA;
+      assert.equal(isAllowedDemoImageUrl(demoUrl), false, 'Unsplash refused in plain production');
+      process.env.DEMO_MODE = 'true';
+      process.env.DEMO_MODE_ALLOW_PRODUCTION = 'true';
+      assert.equal(isAllowedDemoImageUrl(demoUrl), true, 'Unsplash allowed in production demo mode');
+      assert.equal(
+        isAllowedDemoImageUrl('http://images.unsplash.com/photo-1'),
+        false,
+        'Plain http is never allowed'
+      );
+    } finally {
+      restore();
+    }
+  });
 });
-
-
-
-
-
-
-

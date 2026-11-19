@@ -296,6 +296,27 @@ export function isDemoModeEnabled(logWarning = true): boolean {
   return true;
 }
 
+/**
+ * External demo photos (Unsplash) are accepted only outside production, in DEMO_MODE,
+ * or when demo data seeding is explicitly enabled. Never plain http://.
+ */
+export function isAllowedDemoImageUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'images.unsplash.com') {
+    return false;
+  }
+  return (
+    process.env.NODE_ENV !== 'production' ||
+    isDemoModeEnabled(false) ||
+    String(process.env.SEED_DEMO_DATA || '').trim().toLowerCase() === 'true'
+  );
+}
+
 export function createDarnaApiApp(
   customDbPath?: string,
   options?: {
@@ -480,7 +501,20 @@ export function createDarnaApiApp(
       try {
         await db.syncSessionTokenFromCloudSql(authHeader.slice(7).trim());
       } catch (err) {
-        console.error('[CloudSQL] Session token reconciliation error:', err);
+        console.error(
+          '[CloudSQL] Session token reconciliation error:',
+          err instanceof Error ? err.message : 'unknown error'
+        );
+        // Fail closed in production: a session that cannot be checked against PostgreSQL
+        // could have been revoked on another instance, so it must not be trusted.
+        if (isProdRequired) {
+          return res.status(401).json({
+            success: false,
+            code: 'SESSION_CHECK_FAILED',
+            message:
+              'Impossible de vérifier votre session pour le moment. Veuillez réessayer ou vous reconnecter.',
+          });
+        }
       }
     }
 
@@ -846,7 +880,7 @@ export function createDarnaApiApp(
       };
     }
 
-    const existing = db.getUserByEmail(normalizedEmail);
+    const existing = await db.getUserByEmailAsync(normalizedEmail);
     if (existing) {
       // Promote to admin only after verified provider token confirms email ownership
       const isAdmin = isConfiguredAdminEmail(normalizedEmail);
@@ -1165,7 +1199,7 @@ export function createDarnaApiApp(
         });
       }
 
-      const targetUser = viewer || db.getUserByEmail(effectiveEmail)?.user || null;
+      const targetUser = viewer || (await db.getUserByEmailAsync(effectiveEmail))?.user || null;
 
       // Silent send only if the account actually exists; return the exact same response either way
       if (targetUser) {
@@ -1268,7 +1302,7 @@ export function createDarnaApiApp(
         });
       }
 
-      const targetUser = viewer || db.getUserByEmail(effectiveEmail)?.user || null;
+      const targetUser = viewer || (await db.getUserByEmailAsync(effectiveEmail))?.user || null;
       const verifiedUser = targetUser
         ? await db.consumeEmailVerificationToken(
             targetUser.id,
@@ -1346,7 +1380,7 @@ export function createDarnaApiApp(
         return res.redirect('/?email_verified=rate_limited');
       }
 
-      const targetUser = db.getUserByEmail(effectiveEmail)?.user || null;
+      const targetUser = (await db.getUserByEmailAsync(effectiveEmail))?.user || null;
       const verifiedUser = targetUser
         ? await db.consumeEmailVerificationToken(targetUser.id, targetUser.email, rawCode)
         : null;
@@ -1655,7 +1689,7 @@ export function createDarnaApiApp(
         }
 
         const normalizedEmail = String(email).trim().toLowerCase();
-        const userRecord = db.getUserByEmail(normalizedEmail);
+        const userRecord = await db.getUserByEmailAsync(normalizedEmail);
         const rawResetToken = await db.createPasswordResetToken(normalizedEmail);
 
         if (!rawResetToken || !userRecord) {
@@ -2171,9 +2205,9 @@ export function createDarnaApiApp(
       };
     }
 
-    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 60);
+    const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 30);
     const maxUserImageBytes = Number(
-      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 100 * 1024 * 1024
+      process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 40 * 1024 * 1024
     );
     const currentQuota = await db.getUserUploadedImageStatsAsync(userId);
     if (
@@ -2185,7 +2219,7 @@ export function createDarnaApiApp(
         valid: false,
         code: 'IMAGE_QUOTA_EXCEEDED',
         message:
-          'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
+          `Quota de stockage dépassé : vous êtes limité à ${maxUserImageCount} images et ${Math.round(maxUserImageBytes / (1024 * 1024))} Mo cumulés maximum par utilisateur.`,
       };
     }
 
@@ -2210,7 +2244,8 @@ export function createDarnaApiApp(
   async function processAndSanitizeListingImages(
     rawImages: unknown,
     viewer: User,
-    targetOwnerId?: string
+    targetOwnerId?: string,
+    previouslyStoredImages: ReadonlyArray<string> = []
   ): Promise<{
     valid: boolean;
     images?: string[];
@@ -2285,7 +2320,19 @@ export function createDarnaApiApp(
         continue;
       }
 
-      processedUrls.push(trimmed);
+      // Any other URL: only demo Unsplash photos are tolerated (dev / demo mode),
+      // or URLs already stored on this listing (keeps old demo listings editable).
+      if (previouslyStoredImages.includes(trimmed) || isAllowedDemoImageUrl(trimmed)) {
+        processedUrls.push(trimmed);
+        continue;
+      }
+
+      return {
+        valid: false,
+        code: 'INVALID_IMAGE_URL',
+        message:
+          'Seules vos propres photos téléversées sur Darna sont acceptées. Ajoutez vos photos avec le bouton « Ajouter des photos ».',
+      };
     }
 
     return { valid: true, images: processedUrls };
@@ -2377,7 +2424,7 @@ export function createDarnaApiApp(
    * Secure Personal Property Photo Upload Endpoint (POST /api/uploads/image)
    * - Requires authenticated user with emailVerified === true (403 in French otherwise)
    * - Enforces 30 uploads/hour per user AND per IP (429 in French otherwise)
-   * - Enforces per-user quota of 60 images and 100 MB cumulative max (413 in French otherwise)
+   * - Enforces per-user quota of 30 images and 40 MB cumulative max (configurable) (413 in French otherwise)
    * - Accepts only image/jpeg, image/png, image/webp, image/gif up to 5 MB decoded
    * - Verifies real image structure, strips EXIF/GPS metadata via sharp, and stores in uploaded_images
    */
@@ -2421,9 +2468,9 @@ export function createDarnaApiApp(
         });
       }
 
-      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 60);
+      const maxUserImageCount = Number(process.env.IMAGE_UPLOAD_MAX_USER_COUNT || 30);
       const maxUserImageBytes = Number(
-        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 100 * 1024 * 1024
+        process.env.IMAGE_UPLOAD_MAX_USER_BYTES || 40 * 1024 * 1024
       );
       const currentQuota = await db.getUserUploadedImageStatsAsync(viewer.id);
       if (
@@ -2434,7 +2481,7 @@ export function createDarnaApiApp(
           success: false,
           code: 'IMAGE_QUOTA_EXCEEDED',
           message:
-            'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
+            `Quota de stockage dépassé : vous êtes limité à ${maxUserImageCount} images et ${Math.round(maxUserImageBytes / (1024 * 1024))} Mo cumulés maximum par utilisateur.`,
         });
       }
 
@@ -2467,7 +2514,7 @@ export function createDarnaApiApp(
           success: false,
           code: 'IMAGE_QUOTA_EXCEEDED',
           message:
-            'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
+            `Quota de stockage dépassé : vous êtes limité à ${maxUserImageCount} images et ${Math.round(maxUserImageBytes / (1024 * 1024))} Mo cumulés maximum par utilisateur.`,
         });
       }
 
@@ -2483,7 +2530,7 @@ export function createDarnaApiApp(
             code: 'IMAGE_QUOTA_EXCEEDED',
             message:
               sanitized.message ||
-              'Quota de stockage dépassé : vous êtes limité à 60 images et 100 Mo cumulés maximum par utilisateur.',
+              `Quota de stockage dépassé : vous êtes limité à ${maxUserImageCount} images et ${Math.round(maxUserImageBytes / (1024 * 1024))} Mo cumulés maximum par utilisateur.`,
           });
         }
         return res.status(400).json({
@@ -2619,7 +2666,8 @@ export function createDarnaApiApp(
         const processedImages = await processAndSanitizeListingImages(
           req.body.images,
           viewer,
-          existing.userId
+          existing.userId,
+          Array.isArray(existing.images) ? existing.images : []
         );
         if (!processedImages.valid) {
           return res.status(400).json({
