@@ -1248,7 +1248,7 @@ export class DarnaPersistentDb {
     ttlMs = 15 * 60 * 1000
   ): Promise<string | null> {
     this.assertCloudSqlWritable();
-    const record = this.getUserByEmail(email);
+    const record = await this.getUserByEmailAsync(email);
     if (!record) return null;
 
     const rawResetToken = generateSecureToken(24);
